@@ -1,6 +1,6 @@
 [package]
 name = "fsops"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 rust-version = "1.75"
 description = "面向 AI Agent 的 Windows 原生文件操作层：POSIX 语义、紧凑输出、低 token"

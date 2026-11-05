@@ -22,6 +22,28 @@ fsops 同时提供 **MCP 服务**和 **CLI**，把 Windows 上最容易让 Agent
 
 ## 快速开始
 
+### 一行安装（推荐）
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://github.com/tokenis2023/agent-ops/releases/latest/download/install.ps1 | iex"
+```
+
+安装脚本会：
+
+- 下载最新 Windows x64 Release
+- 校验 SHA-256
+- 安装到 `%LOCALAPPDATA%\fsops`
+- 加入用户 `PATH`
+- 自动注册检测到的 Claude Code、Hermes 和 Codex
+
+跳过宿主注册或 PATH 修改：
+
+```powershell
+& ([scriptblock]::Create((irm https://github.com/tokenis2023/agent-ops/releases/latest/download/install.ps1))) -Client none -NoPath
+```
+
+### 手动安装
+
 1. 从 [最新 Release](https://github.com/tokenis2023/agent-ops/releases/latest) 下载 Windows 二进制。
 2. 重命名为 `fsops.exe`，放入 `PATH` 中的固定目录。
 3. 验证：

@@ -2,6 +2,14 @@
 
 本项目使用语义化版本。日期为发布日。
 
+## [0.2.1] - 2026-11-05
+
+### 修复
+
+- 修复 Windows GitHub Runner 使用 cp1252 控制台时，端到端测试输出中文导致的 `UnicodeEncodeError`。
+- CI 设置 `PYTHONUTF8=1`，测试脚本主动将 stdout/stderr 配置为 UTF-8。
+- 新增一行安装、更新和卸载脚本：自动下载 Release、校验 SHA-256、加入 PATH，并注册检测到的 MCP 宿主。
+
 ## [0.2.0] - 2026-11-05
 
 ### 新增

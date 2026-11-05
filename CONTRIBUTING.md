@@ -33,6 +33,7 @@ bash scripts/build.sh all
 - 不提交本机绝对路径、用户名、工具链安装位置或特定仓库路径。
 - 不提交构建产物、测试夹具、崩溃转储和凭据。
 - 注释、文档和提交信息使用中文。
+- PowerShell 脚本必须保存为 UTF-8 BOM；Windows PowerShell 5.1 会把无 BOM 的 UTF-8 当成本地代码页读取，导致中文解析失败。
 
 ## 提交前检查
 

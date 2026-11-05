@@ -10,6 +10,11 @@ import sys
 import tempfile
 from pathlib import Path
 
+# GitHub Windows runner 的默认控制台可能是 cp1252，测试输出含中文会编码失败。
+for stream in (sys.stdout, sys.stderr):
+    if hasattr(stream, "reconfigure"):
+        stream.reconfigure(encoding="utf-8")
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 EXE = PROJECT_ROOT / "target" / "debug" / "fsops.exe"
 root = tempfile.mkdtemp(prefix="fsops-e2e-")
