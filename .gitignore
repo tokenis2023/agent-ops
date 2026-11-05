@@ -1,0 +1,6 @@
+/target
+/dist
+/.planning
+__pycache__/
+*.pyc
+*.fsops-tmp-*

@@ -1,0 +1,247 @@
+//! 文本层：编码识别、换行风格、BOM 保留。
+//!
+//! 中文 Windows 上这一步最关键：文件可能是 GBK、UTF-16LE（记事本旧版默认）、
+//! UTF-8 带 BOM。模型只认 UTF-8 文本，所以读的时候统一转码，
+//! 写回时再按原编码落盘，避免"改一个字符整个文件变乱码"。
+
+use encoding_rs::{Encoding, GBK, UTF_16BE, UTF_16LE, UTF_8};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Eol {
+    Lf,
+    CrLf,
+    Cr,
+    /// 同一文件里混用多种换行
+    Mixed,
+}
+
+impl Eol {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Eol::Lf => "LF",
+            Eol::CrLf => "CRLF",
+            Eol::Cr => "CR",
+            Eol::Mixed => "Mixed",
+        }
+    }
+
+    pub fn bytes(self) -> &'static str {
+        match self {
+            Eol::CrLf => "\r\n",
+            _ => "\n",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Doc {
+    /// 已解码为 UTF-8 的文本
+    pub text: String,
+    pub encoding: &'static str,
+    pub eol: Eol,
+    pub bom: bool,
+    pub size: u64,
+}
+
+/// 识别编码并解码。顺序：BOM → 无 BOM 的 UTF-16 特征 → UTF-8 校验 → GBK → 容错 UTF-8。
+pub fn decode(bytes: &[u8]) -> Doc {
+    let (text, encoding, bom) = if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        (String::from_utf8_lossy(rest).to_string(), "utf-8-bom", true)
+    } else if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        (decode_utf16(rest, true), "utf-16le", true)
+    } else if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        (decode_utf16(rest, false), "utf-16be", true)
+    } else if looks_like_utf16_le(bytes) {
+        (decode_utf16(bytes, true), "utf-16le", false)
+    } else if looks_like_utf16_be(bytes) {
+        (decode_utf16(bytes, false), "utf-16be", false)
+    } else if std::str::from_utf8(bytes).is_ok() {
+        (String::from_utf8_lossy(bytes).to_string(), "utf-8", false)
+    } else {
+        // 非法 UTF-8：优先按 GBK（中文环境），失败再容错
+        let (cow, _, had_errors) = GBK.decode(bytes);
+        if !had_errors && !cow.is_empty() {
+            (cow.to_string(), "gbk", false)
+        } else {
+            // 尝试 GB18030 覆盖面更大
+            let (cow, _, had) = encoding_rs::GB18030.decode(bytes);
+            if !had {
+                (cow.to_string(), "gb18030", false)
+            } else {
+                (
+                    String::from_utf8_lossy(bytes).to_string(),
+                    "utf-8-lossy",
+                    false,
+                )
+            }
+        }
+    };
+
+    let eol = detect_eol(&text);
+    Doc {
+        text,
+        encoding,
+        eol,
+        bom,
+        size: bytes.len() as u64,
+    }
+}
+
+fn decode_utf16(bytes: &[u8], little: bool) -> String {
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| {
+            if little {
+                u16::from_le_bytes([c[0], c[1]])
+            } else {
+                u16::from_be_bytes([c[0], c[1]])
+            }
+        })
+        .collect();
+    String::from_utf16_lossy(&units)
+}
+
+/// 无 BOM 的 UTF-16：ASCII 文本里会出现大量 0x00 间隔字节。
+fn looks_like_utf16_le(b: &[u8]) -> bool {
+    if b.len() < 4 || b.len() % 2 != 0 {
+        return false;
+    }
+    let sample = &b[..b.len().min(200)];
+    let zeros_at_odd = sample
+        .iter()
+        .skip(1)
+        .step_by(2)
+        .filter(|&&x| x == 0)
+        .count();
+    zeros_at_odd * 4 > sample.len() / 2 * 3
+}
+
+fn looks_like_utf16_be(b: &[u8]) -> bool {
+    if b.len() < 4 || b.len() % 2 != 0 {
+        return false;
+    }
+    let sample = &b[..b.len().min(200)];
+    let zeros_at_even = sample.iter().step_by(2).filter(|&&x| x == 0).count();
+    zeros_at_even * 4 > sample.len() / 2 * 3
+}
+
+pub fn detect_eol(text: &str) -> Eol {
+    let mut crlf = 0usize;
+    let mut lf = 0usize;
+    let mut cr = 0usize;
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\r' => {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
+                    crlf += 1;
+                    i += 2;
+                    continue;
+                }
+                cr += 1;
+            }
+            b'\n' => lf += 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    let kinds = [crlf > 0, lf > 0, cr > 0].iter().filter(|&&x| x).count();
+    if kinds > 1 {
+        Eol::Mixed
+    } else if crlf > 0 {
+        Eol::CrLf
+    } else if cr > 0 {
+        Eol::Cr
+    } else {
+        Eol::Lf
+    }
+}
+
+/// 编码回字节；保留 BOM。目标编码无法表示文本时拒绝写入。
+pub fn encode(doc: &Doc, text: &str) -> Result<Vec<u8>, String> {
+    let enc: &'static Encoding = match doc.encoding {
+        "utf-8-bom" => UTF_8,
+        "utf-16le" => UTF_16LE,
+        "utf-16be" => UTF_16BE,
+        "gbk" => GBK,
+        "gb18030" => encoding_rs::GB18030,
+        _ => UTF_8,
+    };
+    let mut out = Vec::with_capacity(text.len() + 3);
+    if doc.bom {
+        match doc.encoding {
+            "utf-16le" => out.extend_from_slice(&[0xFF, 0xFE]),
+            "utf-16be" => out.extend_from_slice(&[0xFE, 0xFF]),
+            _ => out.extend_from_slice(&[0xEF, 0xBB, 0xBF]),
+        }
+    }
+    if enc == UTF_16LE || enc == UTF_16BE {
+        let little = enc == UTF_16LE;
+        for u in text.encode_utf16() {
+            let b = if little {
+                u.to_le_bytes()
+            } else {
+                u.to_be_bytes()
+            };
+            out.extend_from_slice(&b);
+        }
+        return Ok(out);
+    }
+    let (cow, _, had_errors) = enc.encode(text);
+    if had_errors {
+        return Err(format!(
+            "E_ENCODING_LOSS 新文本包含 {} 无法表示的字符，文件未修改",
+            doc.encoding
+        ));
+    }
+    out.extend_from_slice(&cow);
+    Ok(out)
+}
+
+/// 把文本统一成 LF，便于做跨平台的精确匹配。
+pub fn to_lf(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+/// 把 LF 文本转换回目标换行风格。
+pub fn from_lf(text: &str, eol: Eol) -> String {
+    match eol {
+        Eol::CrLf => text.replace('\n', "\r\n"),
+        Eol::Cr => text.replace('\n', "\r"),
+        _ => text.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gbk_文件能正确解码并写回() {
+        let gbk_bytes = b"\xd6\xd0\xce\xc4\r\nabc\r\n"; // "中文\r\nabc\r\n"
+        let doc = decode(gbk_bytes);
+        assert_eq!(doc.encoding, "gbk");
+        assert_eq!(doc.eol, Eol::CrLf);
+        assert!(doc.text.contains("中文"));
+        assert_eq!(encode(&doc, &doc.text).unwrap(), gbk_bytes.to_vec());
+    }
+
+    #[test]
+    fn utf16le_带bom往返一致() {
+        let mut bytes = vec![0xFF, 0xFE];
+        for u in "中文\n".encode_utf16() {
+            bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        let doc = decode(&bytes);
+        assert_eq!(doc.encoding, "utf-16le");
+        assert_eq!(encode(&doc, &doc.text).unwrap(), bytes);
+    }
+
+    #[test]
+    fn 识别混合换行() {
+        assert_eq!(detect_eol("a\r\nb\nc"), Eol::Mixed);
+        assert_eq!(detect_eol("a\nb\n"), Eol::Lf);
+        assert_eq!(detect_eol("a\r\nb\r\n"), Eol::CrLf);
+    }
+}

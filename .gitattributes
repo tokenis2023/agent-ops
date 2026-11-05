@@ -1,0 +1,5 @@
+# 源码统一 LF：Windows 上检出成 CRLF 会让 diff 和匹配测试都变脏
+* text=auto eol=lf
+*.exe binary
+*.png binary
+*.zip binary

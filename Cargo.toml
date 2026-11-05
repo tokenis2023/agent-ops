@@ -1,0 +1,35 @@
+[package]
+name = "fsops"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.75"
+description = "面向 AI Agent 的 Windows 原生文件操作层：POSIX 语义、紧凑输出、低 token"
+license = "MIT"
+repository = "https://github.com/tokenis2023/agent-ops"
+readme = "README.md"
+keywords = ["mcp", "filesystem", "windows", "ai-agent", "tooling"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "fsops"
+path = "src/main.rs"
+
+[lib]
+name = "fsops"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+regex = "1"
+ignore = "0.4"
+globset = "0.4"
+encoding_rs = "0.8"
+blake3 = "1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

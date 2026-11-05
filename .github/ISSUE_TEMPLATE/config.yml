@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 使用指南
+    url: https://github.com/tokenis2023/agent-ops/blob/master/docs/使用指南.md
+    about: 安装、宿主接入、错误码和排障
+  - name: 安全漏洞
+    url: https://github.com/tokenis2023/agent-ops/security/advisories/new
+    about: 请私下报告，不要公开可利用细节

@@ -1,0 +1,53 @@
+name: Bug report
+description: 报告可复现的问题
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈。请先删除路径中的用户名、令牌和敏感文件内容。
+        安全问题请使用 Security Advisory，不要发公开 Issue。
+  - type: input
+    id: version
+    attributes:
+      label: fsops 版本
+      description: 输出 `fsops version`
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: 环境
+      description: Windows 版本、宿主（Claude Code / Codex / Hermes / Cursor / Cline / CLI）及其版本
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 包含实际工具调用参数，但请脱敏
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期结果
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际结果
+      description: 粘贴错误码和完整返回，不要只写“失败”
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 确认
+      options:
+        - label: 已搜索现有 Issue
+          required: true
+        - label: 已移除凭据、用户路径和敏感内容
+          required: true
