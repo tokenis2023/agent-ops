@@ -14,11 +14,11 @@ fsops 同时提供 **MCP 服务**和 **CLI**，把 Windows 上最容易让 Agent
 - 编码：UTF-8、UTF-8 BOM、GBK、GB18030、UTF-16
 - 写入：原子替换、并发指纹、跨进程写锁
 
-它不替代 shell，也不提供删除/移动/复制；它专门替代 Agent 的文件读写、搜索和精确定位层。
+它不替代系统管理：进程、服务、端口、注册表和 ACL 仍交给 Windows 自带工具；除此之外，Agent 的文件读写、搜索、编辑、复制/移动/删除、压缩解压和命令启动都由 fsops 接管。
 
-> **定位边界：** 文件操作交给 fsops；构建、测试、Git、进程和包管理交给 shell。
+> **定位边界：** 文件操作和命令启动走 fsops；进程状态、服务、端口、注册表仍用系统工具。
 >
-> **安全提示：** fsops 没有路径沙箱，权限等于启动它的用户权限。接入前请阅读 [安全声明](SECURITY.md)。
+> **安全提示：** fsops 没有路径沙箱，权限等于启动它的用户权限；`fs_file remove` 必须显式 `confirm=true`。接入前请阅读 [安全声明](SECURITY.md)。
 
 ## 快速开始
 
@@ -99,7 +99,7 @@ patch 插入 `dsh/index.js` 这个 Host 插件。在 Harness 的 **插件 → �
 https://github.com/tokenis2023/agent-ops
 ```
 
-安装后默认启用，提供 6 个 `fs_*` 工具——与 MCP 形态同名、同契约、同错误码。
+安装后默认启用，提供 8 个 `fs_*` 工具——与 MCP 形态同名、同契约、同错误码。
 
 - **二进制来源**：优先用 `%LOCALAPPDATA%\fsops` 或 PATH 上已有的 `fsops.exe`；都没有时按本仓库版本
   从 GitHub Release 下载并校验 SHA-256（该版本还没发 Release 时回退到 latest），缓存在
@@ -142,7 +142,7 @@ node tests/dsh_plugin_smoke.mjs --exe target/debug/fsops.exe
 | 运行时 | 无额外运行时 |
 | MCP | stdio JSON-RPC 2.0 |
 | 宿主 | Claude Code、Codex、Cursor、Windsurf、Cline、Hermes、自研 harness |
-| 构建 | Rust 1.75+；GNU 工具链需 MinGW，MSVC 使用系统链接器 |
+| 构建 | Rust 1.88+；GNU 工具链需 MinGW，MSVC 使用系统链接器 |
 | 测试 | Python 3.10+（仅端到端测试） |
 
 ## 工具面
@@ -157,8 +157,8 @@ node tests/dsh_plugin_smoke.mjs --exe target/debug/fsops.exe
 | `fs_glob` | 按 glob 找文件，尊重 `.gitignore`，带遍历时间预算，可输出 repo map | `pattern`、`path`、`dirs`、`detail`、`limit`、`offset`、`time_budget_ms`、`budget`、`map`、`focus` |
 | `fs_grep` | 正则搜索、四种输出、分页、并行，支持 DOCX/PDF 正文 | `pattern`、`output`、`context`、`max_per_file`、`max_file_size`、`offset`、`parallel` |
 | `fs_stat` | 元信息、编码、换行、hash | `path`/`paths`、`detail=meta/hash/full` |
-| `fs_exec` | 执行程序（argv 数组，不经过 shell），支持后台任务；替代 PowerShell 跑 cargo/git/npm | `program`、`args`、`cwd`、`timeout_ms`、`stdin`、`env`、`shell` |
-| `fs_file` | 文件管理：copy/move/remove/mkdir/convert/archive/extract | `op`、`src`、`dst`、`path`、`confirm`、`overwrite`、`encoding`、`eol` |
+| `fs_exec` | 执行程序（argv 数组，不经过 shell），支持后台任务；替代 PowerShell 跑 cargo/git/npm | `program`、`args`、`cwd`、`timeout_ms`、`stdin`、`env`、`shell`、`background`、`job`、`kill`、`max_output` |
+| `fs_file` | 文件管理：copy/move/remove/mkdir/convert/archive/extract | `op`、`src`、`dst`、`path`、`confirm`、`recursive`、`overwrite`、`encoding`、`eol` |
 
 完整参数、输出和错误码见 **[工具参考](docs/工具参考.md)**。
 
@@ -226,14 +226,13 @@ fs_grep output=files
 
 ### 与 PowerShell 的边界
 
-fsops 可以替代 Agent 对 `Get-Content`、`Set-Content`、`Select-String`、`Get-ChildItem`、`Test-Path` 的依赖，但**不替代**：
+fsops 可以替代 Agent 对 `Get-Content`、`Set-Content`、`Select-String`、`Get-ChildItem`、`Test-Path`、`Copy-Item`、`Move-Item`、`Remove-Item`、`New-Item`、`Compress-Archive`、`Expand-Archive` 的依赖，也能用 `fs_exec` 直接启动 cargo/git/npm/python，不必再拼命令行字符串。**不替代**：
 
 - 进程、服务、端口、注册表、ACL
-- Git、构建、测试、包管理
-- 删除、移动、复制、压缩包
-- 图片和二进制内容
+- Git、构建、测试、包管理的语义（`fs_exec` 只是启动器）
+- 图片和二进制内容解析
 
-推荐分工：**fsops 管文件，shell 管进程和工具链，PowerShell 只做 Windows 原生兜底。**
+推荐分工：**文件和命令启动交给 fsops，进程与服务状态用系统工具，PowerShell 只做 Windows 原生兜底。**
 
 ## 实测
 
@@ -278,7 +277,7 @@ python tests/bench.py /path/to/repo    # 额外在真实代码上跑一轮
 - 无网络请求
 - 无遥测
 - 不跟随目录符号链接
-- 不提供删除/移动/复制
+- `fs_file remove` 必须 `confirm=true`，拒绝盘符根目录；`extract` 拒绝 zip-slip，解压上限 512 MB
 - 写入使用原子替换和跨进程锁
 - Release 附带 SHA-256
 

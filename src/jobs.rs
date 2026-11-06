@@ -198,9 +198,17 @@ pub fn shutdown() {
 
 fn take_delta(buffer: &Arc<Mutex<Vec<u8>>>, cursor: &mut usize) -> (String, usize) {
     let guard = buffer.lock().unwrap();
-    let data = guard.get(*cursor..).unwrap_or(&[]).to_vec();
-    *cursor = guard.len();
-    (crate::text::decode(&data).text, guard.len())
+    let data = guard.get(*cursor..).unwrap_or(&[]);
+    // 进程可能把多字节字符拆在两次读取之间：末尾不完整的 UTF-8 序列留到下次，
+    // 否则 decode 会按 GBK 猜出错误字符，游标推进后再也补不回来。
+    let usable = match std::str::from_utf8(data) {
+        Ok(_) => data.len(),
+        Err(e) if e.error_len().is_none() => e.valid_up_to(),
+        Err(_) => data.len(),
+    };
+    let delta = crate::text::decode(&data[..usable]).text;
+    *cursor += usable;
+    (delta, guard.len())
 }
 
 fn push_delta(text: &mut String, name: &str, delta: &str, dropped: usize) {
@@ -298,6 +306,21 @@ mod tests {
         let text = poll_or_kill(id, &json!({}));
         assert!(text.contains("exit="), "{text}");
         assert!(text.contains("超时"), "{text}");
+    }
+
+    #[test]
+    fn 增量输出不切断多字节字符() {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let mut cursor = 0usize;
+        // "中" 的 UTF-8 是 E4 B8 AD；先写前两个字节，模拟进程一次只刷新半个字符。
+        buffer.lock().unwrap().extend_from_slice(&[0xE4, 0xB8]);
+        let (first, _) = take_delta(&buffer, &mut cursor);
+        assert_eq!(first, "", "不完整字符不应解码成替换字符：{first}");
+        assert_eq!(cursor, 0, "游标必须停在完整字符边界");
+        buffer.lock().unwrap().push(0xAD);
+        let (second, _) = take_delta(&buffer, &mut cursor);
+        assert_eq!(second, "中");
+        assert_eq!(cursor, 3);
     }
 
     #[test]

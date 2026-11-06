@@ -1,5 +1,5 @@
 /**
- * fsops 的 DSH Host 插件：把 6 个 fs_* 工具注册到当前 profile。
+ * fsops 的 DSH Host 插件：把 8 个 fs_* 工具注册到当前 profile。
  *
  * 不重复实现文件语义——每次调用都通过 `fsops call <tool> -`（JSON 走 stdin）
  * 交给同一份 Rust 内核，因此错误码、预算、续读提示和输出格式与 fsops 的
@@ -45,7 +45,7 @@ const TOOL_SPECS = [
     name: 'fs_read',
     readOnly: true,
     description:
-      '读取文件。优先用本工具替代宿主 read_file/cat/head/tail/Get-Content。默认只返回前 12KB 并给出续读方式；支持行范围、多文件、block 代码块展开、DOCX/PDF 正文、自动识别 GBK/UTF-16/BOM 与 CRLF。',
+      '读取文件。优先用本工具替代宿主 read_file/cat/head/tail/Get-Content。默认只返回前 12KB 并给出续读方式；支持行范围、多文件、reads 异构区间、focus 按模式取块、summary 结构摘要、block 代码块展开、DOCX/PDF 正文、自动识别 GBK/UTF-16/BOM 与 CRLF。',
     parameters: {
       path: { type: 'string', description: '文件路径，如 /d/repo/app/src/main.rs' },
       paths: { type: 'array', items: { type: 'string' }, description: '一次读多个文件（最多 20 个）' },
@@ -77,11 +77,17 @@ const TOOL_SPECS = [
             path: { type: 'string' },
             start: { type: 'integer' },
             end: { type: 'integer' },
+            ranges: {
+              type: 'array',
+              items: { type: 'array', items: { type: 'integer' } },
+              description: '该项的多段行区间，优先于 start/end',
+            },
             block: { type: 'boolean' },
             max_line: { type: 'integer' },
+            scan: { type: 'string', enum: ['window', 'full'], description: '仅对 >32MB 文件生效' },
           },
         },
-        description: '一次读多个文件的不同区间，每项 {path,start?,end?,block?,max_line?}；与 path/paths 互斥',
+        description: '一次读多个文件的不同区间，每项 {path,start?,end?,ranges?,block?,max_line?,scan?}；与 path/paths 互斥',
       },
       focus: { type: 'string', description: '正则；只返回命中所在的完整代码块，替代 grep+block 两步' },
       force: { type: 'boolean', description: '绕过未变更短路，强制返回正文' },
@@ -130,7 +136,7 @@ const TOOL_SPECS = [
     name: 'fs_glob',
     readOnly: true,
     description:
-      '按 glob 找文件。优先替代 find/Glob/Get-ChildItem。尊重 .gitignore，自动跳过 node_modules/target 等。默认只给路径，detail=true 附大小与时间。',
+      '按 glob 找文件。优先替代 find/Glob/Get-ChildItem。尊重 .gitignore，自动跳过 node_modules/target 等。默认只给路径，detail=true 附大小与时间；map=true 输出按引用重要性排序的 repo map。',
     parameters: {
       path: { type: 'string', description: '搜索根目录，默认当前目录' },
       pattern: { type: 'string', description: '如 **/*.rs，多个用逗号分隔；省略表示全部' },
@@ -149,7 +155,7 @@ const TOOL_SPECS = [
   {
     name: 'fs_exec',
     description:
-      '执行程序（argv 数组，不经过 shell）。替代 PowerShell 跑 cargo/git/npm/python：没有引号/插值、2>&1、ErrorRecord、$LASTEXITCODE 问题。非零退出不是错误；超时结束整个进程树。',
+      '执行程序（argv 数组，不经过 shell）。替代 PowerShell 跑 cargo/git/npm/python：没有引号/插值、2>&1、ErrorRecord、$LASTEXITCODE 问题。非零退出不是错误；超时结束整个进程树。后台任务 background/job/kill 只在长驻 MCP 服务内有效；DSH 插件每次调用是新进程，会返回 E_NO_JOB。',
     parameters: {
       program: { type: 'string', description: '可执行文件，如 cargo、git、python；走 PATH', required: true },
       args: { type: 'array', items: { type: 'string' }, description: '参数数组，每个参数独立，不拼字符串' },
@@ -181,7 +187,7 @@ const TOOL_SPECS = [
       recursive: { type: 'boolean', description: 'remove 删除目录时必须为 true' },
       confirm: { type: 'boolean', description: 'remove 必须显式传 true' },
       overwrite: { type: 'boolean', description: 'copy/move 覆盖已存在目标' },
-      encoding: { type: 'string', description: 'convert 目标编码：utf-8/gbk/utf-16le/gb18030' },
+      encoding: { type: 'string', description: 'convert 目标编码：utf-8/utf-8-bom/gbk/gb18030/utf-16le/utf-16be' },
       eol: { type: 'string', enum: ['lf', 'crlf'], description: 'convert 目标换行' },
       dry_run: { type: 'boolean', description: '只报告不落盘' },
     },

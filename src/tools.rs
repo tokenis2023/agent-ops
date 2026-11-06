@@ -88,7 +88,8 @@ pub fn tool_defs() -> Vec<Value> {
                             "properties": {
                                 "path": {"type": "string"},
                                 "edits": {"type": "array", "items": edit_item_schema()},
-                                "expect_hash": {"type": "string", "description": "该文件的并发保护指纹"}
+                                "expect_hash": {"type": "string", "description": "该文件的并发保护指纹"},
+                                "normalize_eol": {"type": "boolean", "description": "该文件含混合换行时，显式允许归一为 LF"}
                             },
                             "required": ["path", "edits"]
                         }
@@ -217,7 +218,7 @@ pub fn tool_defs() -> Vec<Value> {
                     "recursive": {"type": "boolean", "description": "remove 删除目录时必须为 true"},
                     "confirm": {"type": "boolean", "description": "remove 必须显式传 true"},
                     "overwrite": {"type": "boolean", "description": "copy/move 覆盖已存在目标"},
-                    "encoding": {"type": "string", "description": "convert 目标编码：utf-8/gbk/utf-16le/utf-16be/gb18030"},
+                    "encoding": {"type": "string", "description": "convert 目标编码：utf-8/utf-8-bom/gbk/gb18030/utf-16le/utf-16be"},
                     "eol": {"type": "string", "enum": ["lf", "crlf"], "description": "convert 目标换行"},
                     "dry_run": {"type": "boolean", "description": "只报告不落盘"}
                 },
@@ -552,6 +553,22 @@ fn validate_args(name: &str, args: &Value) -> Option<String> {
     None
 }
 
+/// 多文件响应里错误可能出现在任意一行；识别 `E_XXX ` 形式的错误码行。
+/// CLI 退出码与 MCP 的 isError 共用这一判定，避免一处认为成功、一处认为失败。
+pub(crate) fn has_error_line(text: &str) -> bool {
+    text.lines().any(|line| {
+        let line = line.trim_start();
+        let Some(rest) = line.strip_prefix("E_") else {
+            return false;
+        };
+        // 错误码形如 E_READ、E_BINARY、E_TIMEOUT：全大写字母/下划线后接空格或结尾。
+        let code_len = rest
+            .find(|c: char| !(c.is_ascii_uppercase() || c == '_'))
+            .unwrap_or(rest.len());
+        code_len > 0 && rest[code_len..].starts_with([' ', ':'])
+    })
+}
+
 pub fn call(name: &str, args: &Value) -> String {
     // 参数类型写错必须报错，不能静默退回默认值。
     if let Some(err) = validate_args(name, args) {
@@ -658,7 +675,15 @@ fn read_items(args: &Value) -> String {
     ];
     let budget = arg_usize(args, "budget", render::DEFAULT_BUDGET);
     let force = arg_bool(args, "force", false);
-    let per_item = (budget / items.len()).max(256);
+    // 预算按项均分；连文件头都放不下时明确拒绝，
+    // 避免 20 项各拿 256B 后总输出反超 budget。
+    let per_item = budget / items.len();
+    if per_item < 120 {
+        return format!(
+            "E_BUDGET {} 项只有 {budget} 字节预算（每项约 {per_item}），放不下文件头；请增大 budget 或分批读取",
+            items.len()
+        );
+    }
     let mut out = String::new();
     for (index, item) in items.iter().enumerate() {
         let Some(obj) = item.as_object() else {

@@ -3,7 +3,7 @@
 //! 目的：让 Agent 不必用 PowerShell 的 Copy-Item/Move-Item/Remove-Item
 //! 去处理路径、覆盖与编码问题。
 
-use crate::paths::FsPath;
+use crate::paths::{display_native, FsPath};
 use serde_json::Value;
 use std::fs;
 use std::io::Write;
@@ -71,7 +71,7 @@ fn archive(args: &Value) -> String {
     }
     if let Some(parent) = dst.native().parent() {
         if let Err(e) = fs::create_dir_all(parent) {
-            return format!("E_IO 创建目录 {} 失败: {e}", parent.display());
+            return format!("E_IO 创建目录 {} 失败: {e}", display_native(parent));
         }
     }
     let file = match std::fs::File::create(dst.native()) {
@@ -173,25 +173,25 @@ fn extract(args: &Value) -> String {
         }
         if let Some(parent) = out_path.parent() {
             if let Err(e) = fs::create_dir_all(parent) {
-                return format!("E_IO 创建目录 {} 失败: {e}", parent.display());
+                return format!("E_IO 创建目录 {} 失败: {e}", display_native(parent));
             }
         }
         if out_path.exists() && !overwrite {
             return format!(
                 "E_EXISTS {} 已存在；覆盖请传 overwrite=true",
-                out_path.display()
+                display_native(&out_path)
             );
         }
         let mut output = match std::fs::File::create(&out_path) {
             Ok(output) => output,
-            Err(e) => return format!("E_IO 创建 {} 失败: {e}", out_path.display()),
+            Err(e) => return format!("E_IO 创建 {} 失败: {e}", display_native(&out_path)),
         };
         match std::io::copy(&mut entry, &mut output) {
             Ok(bytes) => {
                 total += bytes;
                 files += 1;
             }
-            Err(e) => return format!("E_ZIP 解压 {} 失败: {e}", out_path.display()),
+            Err(e) => return format!("E_ZIP 解压 {} 失败: {e}", display_native(&out_path)),
         }
         if total > MAX_EXTRACT_BYTES {
             return format!("E_ZIP 解压体积超过上限 {MAX_EXTRACT_BYTES}B");
@@ -209,8 +209,8 @@ fn collect_files(root: &Path) -> Result<Vec<PathBuf>, String> {
         return Ok(vec![root.to_path_buf()]);
     }
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
-        let entries =
-            fs::read_dir(dir).map_err(|e| format!("E_IO 读取目录 {} 失败: {e}", dir.display()))?;
+        let entries = fs::read_dir(dir)
+            .map_err(|e| format!("E_IO 读取目录 {} 失败: {e}", display_native(dir)))?;
         for entry in entries {
             let entry = entry.map_err(|e| format!("E_IO 读取目录项失败: {e}"))?;
             let path = entry.path();
@@ -258,7 +258,7 @@ fn transfer(args: &Value, is_move: bool) -> String {
     if target.exists() && !overwrite {
         return format!(
             "E_EXISTS dst={} 已存在；覆盖请传 overwrite=true",
-            target.display()
+            display_native(&target)
         );
     }
     let verb = if is_move { "move" } else { "copy" };
@@ -266,12 +266,12 @@ fn transfer(args: &Value, is_move: bool) -> String {
         return format!(
             "ok dry_run: {verb} {} -> {}",
             src.display(),
-            target.display()
+            display_native(&target)
         );
     }
     let result = if is_move {
         match fs::rename(from, &target) {
-            Ok(()) => Ok((0u64, 1usize)),
+            Ok(()) => Ok(stats_of(&target)),
             Err(_) => match copy_tree(from, &target, overwrite) {
                 Ok(stats) => if from.is_dir() {
                     fs::remove_dir_all(from)
@@ -290,20 +290,36 @@ fn transfer(args: &Value, is_move: bool) -> String {
         Ok((bytes, files)) => format!(
             "ok {verb} {} -> {}（{files} 个文件，{bytes}B）",
             src.display(),
-            target.display()
+            display_native(&target)
         ),
         Err(e) => e,
+    }
+}
+
+/// 同盘 rename 不产生拷贝，但输出仍要报实际大小与文件数。
+/// 目录按递归统计，跳过符号链接，口径与 copy_tree/collect_files 一致。
+fn stats_of(path: &Path) -> (u64, usize) {
+    if path.is_dir() {
+        let files = collect_files(path).unwrap_or_default();
+        let bytes = files
+            .iter()
+            .filter_map(|file| fs::metadata(file).ok())
+            .map(|meta| meta.len())
+            .sum();
+        (bytes, files.len())
+    } else {
+        (fs::metadata(path).map(|meta| meta.len()).unwrap_or(0), 1)
     }
 }
 
 fn copy_tree(src: &Path, dst: &Path, overwrite: bool) -> Result<(u64, usize), String> {
     if src.is_dir() {
         fs::create_dir_all(dst)
-            .map_err(|e| format!("E_IO 创建目录 {} 失败: {e}", dst.display()))?;
+            .map_err(|e| format!("E_IO 创建目录 {} 失败: {e}", display_native(dst)))?;
         let mut bytes = 0u64;
         let mut files = 0usize;
-        for entry in
-            fs::read_dir(src).map_err(|e| format!("E_IO 读取目录 {} 失败: {e}", src.display()))?
+        for entry in fs::read_dir(src)
+            .map_err(|e| format!("E_IO 读取目录 {} 失败: {e}", display_native(src)))?
         {
             let entry = entry.map_err(|e| format!("E_IO 读取目录项失败: {e}"))?;
             let (child_bytes, child_files) =
@@ -314,14 +330,19 @@ fn copy_tree(src: &Path, dst: &Path, overwrite: bool) -> Result<(u64, usize), St
         Ok((bytes, files))
     } else {
         if dst.exists() && !overwrite {
-            return Err(format!("E_EXISTS {} 已存在", dst.display()));
+            return Err(format!("E_EXISTS {} 已存在", display_native(dst)));
         }
         if let Some(parent) = dst.parent() {
             fs::create_dir_all(parent)
-                .map_err(|e| format!("E_IO 创建目录 {} 失败: {e}", parent.display()))?;
+                .map_err(|e| format!("E_IO 创建目录 {} 失败: {e}", display_native(parent)))?;
         }
-        fs::copy(src, dst)
-            .map_err(|e| format!("E_IO 复制 {} -> {} 失败: {e}", src.display(), dst.display()))?;
+        fs::copy(src, dst).map_err(|e| {
+            format!(
+                "E_IO 复制 {} -> {} 失败: {e}",
+                display_native(src),
+                display_native(dst)
+            )
+        })?;
         let size = fs::metadata(dst).map(|meta| meta.len()).unwrap_or(0);
         Ok((size, 1))
     }
@@ -421,11 +442,14 @@ fn convert(args: &Value) -> String {
         text = crate::text::from_lf(&crate::text::to_lf(&text), target_eol);
     }
     let final_eol = eol.unwrap_or(doc.eol);
+    // utf-8-bom / utf-16 必须写 BOM：否则 Windows 编辑器会把 UTF-16 当二进制，
+    // 而 utf-8-bom 这个目标编码本身就意味着「要 BOM」。
+    let bom = matches!(encoding, "utf-8-bom" | "utf-16le" | "utf-16be");
     let new_doc = crate::text::Doc {
         text: text.clone(),
         encoding,
         eol: final_eol,
-        bom: false,
+        bom,
         size: bytes.len() as u64,
     };
     let encoded = match crate::text::encode(&new_doc, &text) {
@@ -589,6 +613,84 @@ mod tests {
         assert!(!dir.join("evil.txt").exists(), "不得写到目标目录之外");
         let _ = fs::remove_dir_all(&dir);
     }
+    #[test]
+    fn copy输出统一_posix_路径() {
+        let dir = 目录("copy-posix");
+        let src = dir.join("a.txt");
+        fs::write(&src, "hello").unwrap();
+        let posix = |p: &Path| p.to_string_lossy().replace('\\', "/");
+        let out = run(&json!({"op": "copy", "src": posix(&src), "dst": posix(&dir.join("b.txt"))}));
+        assert!(out.starts_with("ok copy"), "{out}");
+        assert!(
+            !out.contains('\\'),
+            "输出应统一 POSIX，不得出现反斜杠：{out}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn move报告实际字节数() {
+        let dir = 目录("move-bytes");
+        let src = dir.join("a.txt");
+        fs::write(&src, "hello").unwrap();
+        let posix = |p: &Path| p.to_string_lossy().replace('\\', "/");
+        let out = run(&json!({"op": "move", "src": posix(&src), "dst": posix(&dir.join("b.txt"))}));
+        assert!(out.starts_with("ok move"), "{out}");
+        assert!(out.contains("1 个文件，5B"), "move 应报实际大小：{out}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn move目录报告文件数与字节() {
+        let dir = 目录("move-dir");
+        fs::create_dir_all(dir.join("src/sub")).unwrap();
+        fs::write(dir.join("src/a.txt"), "A").unwrap();
+        fs::write(dir.join("src/sub/b.txt"), "BB").unwrap();
+        let posix = |p: &Path| p.to_string_lossy().replace('\\', "/");
+        let out = run(
+            &json!({"op": "move", "src": posix(&dir.join("src")), "dst": posix(&dir.join("dst"))}),
+        );
+        assert!(out.starts_with("ok move"), "{out}");
+        assert!(
+            out.contains("2 个文件，3B"),
+            "目录 move 应统计文件数与字节：{out}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract输出统一_posix_路径() {
+        let dir = 目录("extract-posix");
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join("src/a.txt"), "A").unwrap();
+        let posix = |p: &Path| p.to_string_lossy().replace('\\', "/");
+        let zip_path = dir.join("out.zip");
+        let archive =
+            run(&json!({"op": "archive", "src": posix(&dir.join("src")), "dst": posix(&zip_path)}));
+        assert!(archive.starts_with("ok archive"), "{archive}");
+        let outdir = dir.join("out");
+        let out = run(&json!({"op": "extract", "src": posix(&zip_path), "dst": posix(&outdir)}));
+        assert!(out.starts_with("ok extract"), "{out}");
+        assert!(
+            !out.contains('\\'),
+            "输出应统一 POSIX，不得出现反斜杠：{out}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn convert到utf8_bom会写bom() {
+        let dir = 目录("convert-bom");
+        let file = dir.join("a.txt");
+        fs::write(&file, "hi\n").unwrap();
+        let posix = |p: &Path| p.to_string_lossy().replace('\\', "/");
+        let out = run(&json!({"op": "convert", "path": posix(&file), "encoding": "utf-8-bom"}));
+        assert!(out.starts_with("ok convert"), "{out}");
+        let bytes = fs::read(&file).unwrap();
+        assert_eq!(&bytes[..3], &[0xEF, 0xBB, 0xBF], "应写入 UTF-8 BOM");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn convert_gbk转utf8() {
         let dir = 目录("convert");

@@ -57,20 +57,7 @@ impl FsPath {
 
     /// 展示形式：`/c/code/fsops/src/main.rs`；UNC 保持 `//server/share/...`。
     pub fn display(&self) -> String {
-        let s = self.native.to_string_lossy().replace('\\', "/");
-        if let Some(rest) = s.strip_prefix("//") {
-            return format!("//{rest}");
-        }
-        let bytes = s.as_bytes();
-        if bytes.len() >= 2 && bytes[1] == b':' {
-            let drive = (bytes[0] as char).to_ascii_lowercase();
-            let tail = &s[2..];
-            if tail.is_empty() {
-                return format!("/{drive}");
-            }
-            return format!("/{drive}{tail}");
-        }
-        s
+        display_native(&self.native)
     }
 
     /// 交给 Windows API 的形式：超长或含特殊结尾时加 `\\?\` 前缀。
@@ -104,6 +91,28 @@ impl FsPath {
     pub fn is_dir(&self) -> bool {
         self.wide().is_dir()
     }
+}
+
+/// 把任意原生路径转成展示形式（POSIX）。
+///
+/// `join()` 出来的中间路径没有对应的 `FsPath`，但输出仍应与
+/// `FsPath::display` 完全一致：模型会直接拿输出里的路径做下一次调用，
+/// 反斜杠会让它在 JSON 里多一层转义，或在 POSIX 工具里失效。
+pub fn display_native(path: &Path) -> String {
+    let s = path.to_string_lossy().replace('\\', "/");
+    if let Some(rest) = s.strip_prefix("//") {
+        return format!("//{rest}");
+    }
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' {
+        let drive = (bytes[0] as char).to_ascii_lowercase();
+        let tail = &s[2..];
+        if tail.is_empty() {
+            return format!("/{drive}");
+        }
+        return format!("/{drive}{tail}");
+    }
+    s
 }
 
 fn is_drive_abs(s: &str) -> bool {
@@ -208,6 +217,13 @@ mod tests {
         assert_eq!(c.display(), "/c/repo/x");
         let d = FsPath::parse("d:/repo/y").unwrap();
         assert_eq!(d.display(), "/d/repo/y");
+    }
+
+    #[test]
+    fn 原生路径展示为_posix() {
+        assert_eq!(display_native(Path::new("C:/repo/x.rs")), "/c/repo/x.rs");
+        assert_eq!(display_native(Path::new("D:/code")), "/d/code");
+        assert_eq!(display_native(Path::new("C:/")), "/c/");
     }
 
     #[test]

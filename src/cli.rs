@@ -38,7 +38,7 @@ pub fn run(args: &[String]) -> i32 {
         other => format!("E_UNKNOWN_CMD 未知命令 {other}（用 fsops help 查看）"),
     };
     println!("{out}");
-    if out.starts_with("E_") {
+    if out.starts_with("E_") || crate::tools::has_error_line(&out) {
         2
     } else {
         0

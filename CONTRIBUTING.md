@@ -3,7 +3,7 @@
 ## 环境
 
 - Windows 10/11
-- Rust 1.75 或更新版本
+- Rust 1.88 或更新版本
 - Python 3.10+，仅用于真实 MCP 端到端测试
 - Windows GNU 工具链需要配置 MinGW；MSVC 工具链使用对应链接器
 

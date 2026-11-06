@@ -2,6 +2,19 @@
 
 本项目使用语义化版本。日期为发布日。
 
+## [0.3.0] - 2026-11-06
+
+- 修复 `fs_file copy/move` 的输出把目标路径写成 Windows 反斜杠（`C:\...`），与「输出统一 POSIX」的约定不一致；新增 `paths::display_native`，transfer/extract/collect_files 的全部中间路径输出统一走它。
+- 修复 `fs_file move` 同盘 rename 报 `0B`、目录恒报 `1 个文件`：改为统计目标真实大小与文件数。
+- 修复 `fs_file convert` 到 `utf-8-bom`/`utf-16le`/`utf-16be` 不写 BOM：按目标编码写 BOM，Windows 编辑器不再把 UTF-16 当二进制。
+- 修复 `fs_exec job=<id>` 的增量解码：进程把多字节字符拆在两次读取之间时，不再解出替换字符或整块丢字；只解码到完整 UTF-8 边界。
+- 修复 `fs_read reads` 的预算：严格按项均分，连文件头都放不下时返回 `E_BUDGET`，不再每项强留 256B 导致总输出反超 `budget`。
+- CLI 退出码改用与 MCP `isError` 相同的 `E_` 行判定，多文件响应里夹在正文中的错误也会返回 2。
+- schema 补齐：`fs_edit.files[]` 新增 `normalize_eol`；`fs_file.encoding` 补 `utf-8-bom`。
+- DSH 插件与 MCP 对齐：8 个工具、`reads` 项补 `ranges`/`scan`、`fs_read`/`fs_glob` 描述补齐；明确 `background/job/kill` 在 DSH 下会返回 `E_NO_JOB`。
+- 工具参考补「文件管理与执行」错误码：`E_CONFIRM_REQUIRED`、`E_EXISTS`、`E_IO`、`E_ZIP`、`E_NO_JOB`、`E_JOB_LIMIT`、`E_JOB`、`E_BAD_REPLACEMENT`、`E_INTERNAL`。
+- 文档对齐 0.2.7 的实际能力：README、使用指南、CONTRIBUTING 更新为 8 个工具，补齐 `fs_exec`/`fs_file`，修正 Rust 最低版本（1.88）和「不提供删除/移动/复制」等过时边界；使用指南新增「执行命令」「文件管理」两节。
+
 ## [0.2.7] - 2026-11-06
 
 **减少轮次**
