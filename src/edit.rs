@@ -8,10 +8,18 @@ use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
 pub struct EditSpec {
-    /// 要替换的原文
-    pub old: String,
+    /// 要替换的原文（与 `pattern` 二选一）
+    #[serde(default)]
+    pub old: Option<String>,
     /// 替换成什么；空串 `""` 表示删除（必须显式写出，避免漏参数被当成删除）。
-    pub new: String,
+    #[serde(default)]
+    pub new: Option<String>,
+    /// 正则模式：替换范围内所有匹配，可用 `$1` 引用捕获组。
+    /// 用于“不知道确切原文、只知道形状”的场景，省掉为抄原文而做的一次读取。
+    #[serde(default)]
+    pub pattern: Option<String>,
+    #[serde(default)]
+    pub replacement: Option<String>,
     /// 是否替换所有出现位置（默认只允许唯一匹配）
     #[serde(default)]
     pub all: bool,
@@ -65,11 +73,28 @@ pub fn apply(original: &str, eol: Eol, edits: &[EditSpec]) -> Result<(String, Ed
     };
 
     for (i, e) in edits.iter().enumerate() {
-        if e.old.is_empty() {
+        // 正则模式：不知道确切原文也能改，省掉为抄原文而做的一次读取。
+        if let Some(pat) = &e.pattern {
+            apply_regex(&mut work, e, pat, i + 1, &mut res, &mut touched_lines)?;
+            continue;
+        }
+        let old = e.old.as_deref().ok_or_else(|| {
+            format!(
+                "E_BAD_EDIT 第{}处缺少 old（或用 pattern + replacement）",
+                i + 1
+            )
+        })?;
+        let new = e.new.as_deref().ok_or_else(|| {
+            format!(
+                "E_BAD_EDIT 第{}处缺少 new；删除内容请显式写 \"new\": \"\"",
+                i + 1
+            )
+        })?;
+        if old.is_empty() {
             return Err(format!("E_BAD_EDIT 第{}处 old 为空", i + 1));
         }
-        let needle = text::to_lf(&e.old);
-        let repl = text::to_lf(&e.new);
+        let needle = text::to_lf(old);
+        let repl = text::to_lf(new);
 
         let mut positions: Vec<usize> = find_all(&work, &needle);
         // 行范围限定：只保留落在 [start, end] 内的匹配。
@@ -139,6 +164,106 @@ pub fn apply(original: &str, eol: Eol, edits: &[EditSpec]) -> Result<(String, Ed
 
     let out = text::from_lf(&work, eol);
     Ok((out, res))
+}
+
+/// 正则替换：在 [start,end] 行范围内替换所有匹配，支持 `$1` 捕获组。
+///
+/// 模型常常只知道“要改的形状”（空格、大小写、数字具体值不确定），
+/// 为此先读一遍文件再抄原文是最常见的浪费。
+fn apply_regex(
+    work: &mut String,
+    e: &EditSpec,
+    pat: &str,
+    ordinal: usize,
+    res: &mut EditResult,
+    touched_lines: &mut std::collections::HashSet<usize>,
+) -> Result<(), String> {
+    let replacement = e
+        .replacement
+        .as_deref()
+        .ok_or_else(|| format!("E_BAD_EDIT 第{ordinal}处：pattern 模式需要同时给出 replacement"))?;
+    let re = regex::Regex::new(pat)
+        .map_err(|err| format!("E_BAD_REGEX 第{ordinal}处 pattern 无效: {err}"))?;
+    // 可匹配空位置的正则会命中每一处，等于把文件改烂。
+    if re.is_match("") {
+        return Err(format!(
+            "E_BAD_REGEX 第{ordinal}处 pattern 可匹配空位置（如 ^ $ a* .*）；请写出具体字符"
+        ));
+    }
+
+    let (from, to) = line_span(work, e.start, e.end);
+    let scope = &work[from..to];
+    let hits: Vec<(usize, usize, String, String)> = re
+        .captures_iter(scope)
+        .map(|caps| {
+            let m = caps.get(0).unwrap();
+            let mut expanded = String::new();
+            caps.expand(replacement, &mut expanded);
+            (m.start(), m.end(), m.as_str().to_string(), expanded)
+        })
+        .collect();
+    if hits.is_empty() {
+        return Err(if e.start.is_some() {
+            format!(
+                "E_NO_MATCH 第{ordinal}处：在 {}..={} 行内没有匹配；去掉 start/end 可搜全文",
+                e.start.unwrap_or(1),
+                e.end.map(|v| v.to_string()).unwrap_or("末".into())
+            )
+        } else {
+            // 正则模式的建议不能是“先 fs_read”：用正则就是为了不读。
+            format!(
+                "E_NO_MATCH 第{ordinal}处：正则未匹配任何内容（共 {} 行）；请检查转义，或先用 fs_grep 确认形状",
+                work.split('\n').count().saturating_sub(1)
+            )
+        });
+    }
+
+    let base_line = line_of(work, from);
+    let mut out = String::with_capacity(work.len());
+    out.push_str(&work[..from]);
+    let mut last = 0usize;
+    for (start, end, matched, expanded) in &hits {
+        out.push_str(&scope[last..*start]);
+        out.push_str(expanded);
+        last = *end;
+        let line_no = base_line + scope[..*start].matches('\n').count();
+        if touched_lines.insert(line_no) {
+            res.removed_lines += count_lines(matched);
+            res.added_lines += count_lines(expanded);
+        }
+        res.applied += 1;
+        push_locus(&mut res.loci, line_no, expanded);
+        if res.hunks.len() < MAX_HUNKS {
+            res.hunks.push(Hunk {
+                line: line_no,
+                old: matched.clone(),
+                new: expanded.clone(),
+            });
+        }
+    }
+    out.push_str(&scope[last..]);
+    out.push_str(&work[to..]);
+    *work = out;
+    Ok(())
+}
+
+/// 取 [start,end] 行范围对应的字节区间（1 基，含端点）。
+fn line_span(text: &str, start: Option<usize>, end: Option<usize>) -> (usize, usize) {
+    let first = start.unwrap_or(1).max(1);
+    let last = end.unwrap_or(usize::MAX);
+    let mut starts = vec![0usize];
+    for (i, b) in text.bytes().enumerate() {
+        if b == b'\n' && i + 1 < text.len() {
+            starts.push(i + 1);
+        }
+    }
+    let from = starts.get(first - 1).copied().unwrap_or(text.len());
+    let to = if last == usize::MAX {
+        text.len()
+    } else {
+        starts.get(last).copied().unwrap_or(text.len())
+    };
+    (from.min(text.len()), to.max(from).min(text.len()))
 }
 
 /// 片段覆盖的行数：换行数 + 1（单行片段是 1 行，不是 0 行）。
@@ -271,12 +396,59 @@ mod tests {
 
     fn spec(old: &str, new: &str) -> EditSpec {
         EditSpec {
-            old: old.into(),
-            new: new.into(),
+            old: Some(old.into()),
+            new: Some(new.into()),
+            pattern: None,
+            replacement: None,
             all: false,
             start: None,
             end: None,
         }
+    }
+
+    fn regex_spec(pattern: &str, replacement: &str) -> EditSpec {
+        EditSpec {
+            old: None,
+            new: None,
+            pattern: Some(pattern.into()),
+            replacement: Some(replacement.into()),
+            all: false,
+            start: None,
+            end: None,
+        }
+    }
+
+    #[test]
+    fn 正则替换支持捕获组() {
+        let (out, res) = apply(
+            "let a = 30;\nlet b = 30;\n",
+            Eol::Lf,
+            &[regex_spec(r"let (\w+) = 30", "let $1 = 60")],
+        )
+        .unwrap();
+        assert_eq!(res.applied, 2);
+        assert!(
+            out.contains("let a = 60;") && out.contains("let b = 60;"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn 正则替换可限定行范围() {
+        let mut e = regex_spec(r"= 1;", "= 2;");
+        e.start = Some(2);
+        e.end = Some(2);
+        let (out, res) = apply("let a = 1;\nlet b = 1;\nlet c = 1;\n", Eol::Lf, &[e]).unwrap();
+        assert_eq!(res.applied, 1);
+        assert_eq!(out, "let a = 1;\nlet b = 2;\nlet c = 1;\n");
+    }
+
+    #[test]
+    fn 正则零匹配与空匹配都被拒绝() {
+        let err = apply("abc\n", Eol::Lf, &[regex_spec("zzz", "y")]).unwrap_err();
+        assert!(err.starts_with("E_NO_MATCH"), "{err}");
+        let err = apply("abc\n", Eol::Lf, &[regex_spec("a*", "y")]).unwrap_err();
+        assert!(err.starts_with("E_BAD_REGEX"), "{err}");
     }
 
     #[test]

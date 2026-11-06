@@ -609,6 +609,26 @@ body = [l for l in text.splitlines() if "|" in l]
 check("block=true 嵌套块内展开到最近的 if",
       err is False and len(body) == 3 and body[0].startswith("3|"), text)
 
+# fs_edit 正则模式：不知道确切原文也能改，省掉为抄原文而做的读取
+re_path = os.path.join(root, "regex-probe.rs")
+open(re_path, "w", encoding="utf-8").write(
+    "fn cfg() {\n" + "\n".join(f"    let limit_{i} = {100 + i};" for i in range(5)) + "\n}\n")
+text, err = call("fs_edit", path=posix(re_path), edits=[
+    {"pattern": r"let limit_(\d+) = \d+;", "replacement": "let cap_$1 = 500;"}], diff=True)
+after = open(re_path, encoding="utf-8").read()
+check("正则替换支持捕获组且一次改完",
+      err is False and after.count("= 500;") == 5 and "let cap_0" in after
+      and "+let cap_0 = 500;" in text, text + after)
+text, err = call("fs_edit", path=posix(re_path),
+                 edits=[{"pattern": r"= 500;", "replacement": "= 1;", "start": 2, "end": 2}])
+after2 = open(re_path, encoding="utf-8").read()
+check("正则可限定行范围",
+      err is False and after2.count("= 1;") == 1 and after2.count("= 500;") == 4, text + after2)
+text, err = call("fs_edit", path=posix(re_path),
+                 edits=[{"pattern": r"nonexistent_\w+", "replacement": "x"}])
+check("正则不匹配时给 fs_grep 建议而非 fs_read",
+      err is True and "E_NO_MATCH" in text and "fs_grep" in text, text)
+
 # fs_edit diff=true：改完直接看到变更片段，省一次回读
 diff_path = os.path.join(root, "diff-probe.rs")
 open(diff_path, "w", encoding="utf-8").write("fn f() {\n    let t = 30;\n}\n")
@@ -805,7 +825,8 @@ check("path 类型错误报 E_BAD_ARGS",
       text.startswith("E_BAD_ARGS") and "需要字符串" in text and err is True, text)
 text, err = call("fs_edit", path=posix(one_path), edits=[{"old": "NEEDLE here"}])
 check("edits 漏 new 时拒绝而不是删除",
-      text.startswith("E_BAD_ARGS") and "old 与 new" in text and err is True, text)
+      text.startswith("E_BAD_") and ("缺少 new" in text or "old+new" in text)
+      and err is True, text)
 check("漏 new 时文件未改动",
       open(one_path, encoding="utf-8").read() == "NEEDLE here\n", "文件被改动")
 

@@ -309,13 +309,15 @@ fn edit_item_schema() -> serde_json::Value {
     json!({
         "type": "object",
         "properties": {
-            "old": {"type": "string", "description": "原文片段（需唯一，除非 all=true）"},
-            "new": {"type": "string", "description": "替换内容，空串表示删除"},
+            "old": {"type": "string", "description": "原文片段（需唯一，除非 all=true）；与 pattern 二选一"},
+            "new": {"type": "string", "description": "替换内容，空串表示删除；与 replacement 二选一"},
+            "pattern": {"type": "string", "description": "正则模式：替换范围内所有匹配，可用 $1 引用捕获组；不知道确切原文时用它，省掉为抄原文而做的一次 fs_read"},
+            "replacement": {"type": "string", "description": "正则替换内容，与 pattern 配套"},
             "all": {"type": "boolean", "description": "替换全部出现位置"},
             "start": {"type": "integer", "description": "限定替换只发生在第 start..=end 行内（1 基）；配合 all=true 只改某个函数内的重复字面量"},
             "end": {"type": "integer", "description": "行范围结束行（含）；省略表示到文件末尾"}
         },
-        "required": ["old"]
+        "required": []
     })
 }
 
@@ -1331,8 +1333,8 @@ mod tests {
         }));
         let content = fs::read_to_string(&path).unwrap();
         let _ = fs::remove_file(path);
-        assert!(out.starts_with("E_BAD_ARGS"), "应报参数错误: {out}");
-        assert!(out.contains("old 与 new"), "{out}");
+        assert!(out.starts_with("E_BAD_"), "应报参数错误: {out}");
+        assert!(out.contains("缺少 new") || out.contains("old+new"), "{out}");
         assert_eq!(content, "keep me\n", "文件不应被改动");
     }
 
@@ -2295,7 +2297,8 @@ fn next_fn() {
             single["properties"], nested["properties"],
             "两处 items 必须同形"
         );
-        assert_eq!(nested["required"], json!(["old"]));
+        // pattern 模式下不需要 old，所以两个字段都不强制。
+        assert_eq!(nested["required"], json!([]));
         for name in ["old", "new", "all", "start", "end"] {
             assert!(
                 nested["properties"][name].is_object(),
@@ -2697,15 +2700,18 @@ fn parse_edits(value: &Value) -> Result<Vec<EditSpec>, String> {
     // 参数错误要给出可执行的修法，而不是漏出 serde 内部诊断。
     let edits: Vec<EditSpec> = serde_json::from_value(value.clone()).map_err(|e| {
         if value.is_null() {
-            "E_BAD_ARGS 缺少 edits；需要 [{\"old\":\"原文\",\"new\":\"替换\"}, ...]".to_string()
+            "E_BAD_ARGS 缺少 edits；需要 [{\"old\":\"原文\",\"new\":\"替换\"}] 或 [{\"pattern\":\"正则\",\"replacement\":\"替换\"}]".to_string()
         } else if let Some(list) = value.as_array() {
             let bad = list.iter().position(|item| {
-                item.get("old").and_then(Value::as_str).is_none()
-                    || item.get("new").and_then(Value::as_str).is_none()
+                let literal = item.get("old").and_then(Value::as_str).is_some()
+                    && item.get("new").and_then(Value::as_str).is_some();
+                let regex_mode = item.get("pattern").and_then(Value::as_str).is_some()
+                    && item.get("replacement").and_then(Value::as_str).is_some();
+                !literal && !regex_mode
             });
             match bad {
                 Some(i) => format!(
-                    "E_BAD_ARGS edits[{}] 必须同时有字符串 old 与 new；当前={}",
+                    "E_BAD_ARGS edits[{}] 需要 old+new 或 pattern+replacement；当前={}",
                     i,
                     list.get(i).map(|v| v.to_string()).unwrap_or_default()
                 ),
