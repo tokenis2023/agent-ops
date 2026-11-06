@@ -120,17 +120,30 @@ pub fn apply(original: &str, eol: Eol, edits: &[EditSpec]) -> Result<(String, Ed
             return Err(no_match_error(&work, &needle, i + 1));
         }
         if positions.len() > 1 && !e.all {
-            let lines: Vec<String> = positions
+            let line_list: Vec<String> = positions
                 .iter()
                 .take(8)
                 .map(|p| line_of(&work, *p).to_string())
                 .collect();
+            // 前几处附上下文片段：模型不必再 fs_read 就能构造出唯一的 old。
+            let rows: Vec<&str> = work.split('\n').collect();
+            let mut snippets = String::new();
+            for p in positions.iter().take(3) {
+                let hit = line_of(&work, *p);
+                let from = hit.saturating_sub(2).max(1);
+                let to = (hit + 2).min(rows.len());
+                for n in from..=to {
+                    let text = rows.get(n - 1).copied().unwrap_or("");
+                    snippets.push_str(&format!("\n  {n}|{}", snippet_line(text)));
+                }
+                snippets.push('\n');
+            }
             return Err(format!(
-                "E_AMBIGUOUS 第{}处匹配到 {} 个位置（行 {}）；\
-                 加更多上下文，或设 all=true 全部替换",
+                "E_AMBIGUOUS 第{}处匹配到 {} 个位置（行 {}）；加更多上下文，或设 all=true 全部替换，或用 start/end 限定行范围{}",
                 i + 1,
                 positions.len(),
-                lines.join(",")
+                line_list.join(","),
+                snippets
             ));
         }
 
@@ -447,6 +460,17 @@ fn push_locus(loci: &mut Vec<String>, line_no: usize, repl: &str) {
     }
 }
 
+/// 歧义片段里的单行截断：定位用，不需要完整长行。
+fn snippet_line(text: &str) -> String {
+    const MAX_CHARS: usize = 160;
+    let trimmed = text.trim_end();
+    let mut out: String = trimmed.chars().take(MAX_CHARS).collect();
+    if trimmed.chars().count() > MAX_CHARS {
+        out.push('…');
+    }
+    out
+}
+
 fn find_all(hay: &str, needle: &str) -> Vec<usize> {
     let mut out = Vec::new();
     let mut from = 0;
@@ -632,6 +656,9 @@ mod tests {
         let err = apply(src, Eol::Lf, &[spec("x();", "y();")]).unwrap_err();
         assert!(err.starts_with("E_AMBIGUOUS"));
         assert!(err.contains("1,2"));
+        // 附上下文片段：模型不必再 fs_read 就能构造出唯一的 old。
+        assert!(err.contains("1|x();"), "应含命中行片段: {err}");
+        assert!(err.contains("2|x();"), "应含命中行片段: {err}");
     }
 
     #[test]

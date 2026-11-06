@@ -75,6 +75,7 @@ pub fn run(args: &Value) -> String {
     if crate::tools::arg_bool(args, "background", false) {
         return crate::jobs::start(args);
     }
+    let check = crate::tools::arg_bool(args, "check", false);
     let timeout_ms =
         crate::tools::arg_usize(args, "timeout_ms", DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
     let max_output = crate::tools::arg_usize(args, "max_output", DEFAULT_MAX_OUTPUT).max(1024);
@@ -142,10 +143,13 @@ pub fn run(args: &Value) -> String {
         return text;
     }
 
-    let mut text = format!(
-        "ok exit={} {elapsed}ms stdout={out_total}B stderr={err_total}B\n",
-        exit_code.unwrap_or(-1)
-    );
+    // check=true：非零退出按错误返回；默认保持 ok，测试失败不是工具错误。
+    let exit = exit_code.unwrap_or(-1);
+    let mut text = if check && exit != 0 {
+        format!("E_EXIT code={exit} {elapsed}ms stdout={out_total}B stderr={err_total}B\n")
+    } else {
+        format!("ok exit={exit} {elapsed}ms stdout={out_total}B stderr={err_total}B\n")
+    };
     push_stream(&mut text, "stdout", &out_text, out_bytes.len(), out_total);
     push_stream(&mut text, "stderr", &err_text, err_bytes.len(), err_total);
     if out_total == 0 && err_total == 0 {
@@ -228,6 +232,16 @@ mod tests {
     fn 非零退出不是错误() {
         let out = run(&json!({"program": "cmd", "args": ["/c", "exit 3"]}));
         assert!(out.starts_with("ok exit=3"), "{out}");
+    }
+
+    #[test]
+    fn check开启时非零退出是错误() {
+        let out = run(&json!({"program": "cmd", "args": ["/c", "exit 3"], "check": true}));
+        assert!(out.starts_with("E_EXIT"), "{out}");
+        assert!(out.contains("code=3"), "{out}");
+        // 默认行为不变：非零退出仍是 ok
+        let off = run(&json!({"program": "cmd", "args": ["/c", "exit 3"]}));
+        assert!(off.starts_with("ok exit=3"), "{off}");
     }
 
     #[test]

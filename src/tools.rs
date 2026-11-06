@@ -17,7 +17,7 @@ pub fn tool_defs() -> Vec<Value> {
     let mut defs = vec![
         json!({
             "name": "fs_read",
-            "description": "读取文件。优先用本工具替代宿主 read_file/cat/head/tail/Get-Content。默认只返回前 12KB 并给出续读方式；支持行范围、多文件、DOCX/PDF 正文、自动识别 GBK/UTF-16/BOM 与 CRLF。",
+            "description": "读取文件。优先用本工具替代宿主 read_file/cat/head/tail/Get-Content。默认只返回前 12KB 并给出续读方式；支持行范围、多文件、DOCX/PDF 正文、自动识别 GBK/UTF-16/BOM 与 CRLF。模式四选一：单文件 path、多文件 paths、异构区间 reads、按正则取块 focus；summary 仅单文件且不能与 ranges/block/end 同用；reads 每项可带 focus 与 budget。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -36,7 +36,9 @@ pub fn tool_defs() -> Vec<Value> {
                                 "ranges": {"type": "array", "items": {"type": "array", "items": {"type": "integer", "minimum": 1}, "minItems": 2, "maxItems": 2}},
                                 "block": {"type": "boolean"},
                                 "max_line": {"type": "integer"},
-                                "scan": {"type": "string", "enum": ["window", "full"]}
+                                "scan": {"type": "string", "enum": ["window", "full"]},
+                                "budget": {"type": "integer", "description": "该项独立预算；未给时与其他项均分顶层 budget"},
+                                "focus": {"type": "string", "description": "该项只返回命中所在的完整代码块"}
                             },
                             "required": ["path"]
                         }
@@ -177,8 +179,8 @@ pub fn tool_defs() -> Vec<Value> {
                     "paths": {"type": "array", "items": {"type": "string"}, "maxItems": 50},
                     "detail": {
                         "type": "string",
-                        "enum": ["meta", "hash", "full"],
-                        "description": "meta 只查元信息不读内容；hash 读一次给指纹；full 额外统计行数，默认 full"
+                        "enum": ["meta", "hash", "full", "server"],
+                        "description": "meta 只查元信息不读内容；hash 读一次给指纹；full 额外统计行数，默认 full；server 返回服务端版本与工具数，用于自检"
                     }
                 },
                 "required": []
@@ -198,6 +200,7 @@ pub fn tool_defs() -> Vec<Value> {
                     "env": {"type": "object", "description": "追加/覆盖环境变量，如 {\"RUST_BACKTRACE\":\"1\"}"},
                     "shell": {"type": "boolean", "description": "显式走 cmd /c（需要管道/重定向时才用，会回到文本解析）"},
                     "max_output": {"type": "integer", "description": "每条流最多保留字节，默认 32768"},
+                    "check": {"type": "boolean", "description": "非零退出按 E_EXIT 错误返回；默认 false，非零仍是 ok"},
                     "background": {"type": "boolean", "description": "后台运行：立即返回 job id，用 job=<id> 轮询输出；适合 dev server/watch 这类长驻命令"},
                     "job": {"type": "integer", "description": "轮询/终止后台任务：传启动时返回的 job id"},
                     "kill": {"type": "boolean", "description": "配合 job 使用：结束该任务的整个进程树"}
@@ -660,7 +663,7 @@ fn read_items(args: &Value) -> String {
     ] {
         if args.get(key).is_some() {
             return format!(
-                "E_BAD_ARGS reads 不能与 {key} 同时使用；每项的区间写在 reads 项内（path/start/end/ranges/block/max_line）"
+                "E_BAD_ARGS reads 不能与 {key} 同时使用；每项的区间写在 reads 项内（path/start/end/ranges/block/max_line/budget/focus）"
             );
         }
     }
@@ -670,8 +673,8 @@ fn read_items(args: &Value) -> String {
     if items.len() > 20 {
         return format!("E_BAD_ARGS reads 最多 20 项，当前 {} 项", items.len());
     }
-    const ALLOWED: [&str; 7] = [
-        "path", "start", "end", "ranges", "block", "max_line", "scan",
+    const ALLOWED: [&str; 9] = [
+        "path", "start", "end", "ranges", "block", "max_line", "scan", "budget", "focus",
     ];
     let budget = arg_usize(args, "budget", render::DEFAULT_BUDGET);
     let force = arg_bool(args, "force", false);
@@ -705,13 +708,16 @@ fn read_items(args: &Value) -> String {
             .collect();
         if !unknown.is_empty() {
             out.push_str(&format!(
-                "E_BAD_ARGS reads[{index}] 未知字段 {}；可用 path/start/end/ranges/block/max_line/scan\n",
+                "E_BAD_ARGS reads[{index}] 未知字段 {}；可用 path/start/end/ranges/block/max_line/scan/budget/focus\n",
                 unknown.join(",")
             ));
             continue;
         }
         let mut single = obj.clone();
-        single.insert("budget".to_string(), json!(per_item));
+        // 项内 budget 优先：大文件可以多要一点，小文件把额度让出来。
+        if obj.get("budget").is_none() {
+            single.insert("budget".to_string(), json!(per_item));
+        }
         if force {
             single.insert("force".to_string(), json!(true));
         }
@@ -2918,6 +2924,17 @@ fn next_fn() {
     }
 
     #[test]
+    fn fs_read描述包含模式互斥表() {
+        // 模式互斥只能靠运行时错误教学的话，模型要付一轮试错；
+        // description 里给一张组合表，让它在发出调用前就能拼出合法参数。
+        let defs = tool_defs();
+        let read = defs.iter().find(|d| d["name"] == "fs_read").unwrap();
+        let desc = read["description"].as_str().unwrap();
+        assert!(desc.contains("四选一"), "缺少模式表: {desc}");
+        assert!(desc.contains("summary"), "缺少 summary 的限制说明: {desc}");
+    }
+
+    #[test]
     fn fs_read_schema暴露scan开关() {
         let defs = tool_defs();
         let read = defs
@@ -4865,8 +4882,12 @@ fn grep_tool(args: &Value) -> String {
 
 fn stat(args: &Value) -> String {
     let detail = arg_str(args, "detail").unwrap_or("full");
+    if detail == "server" {
+        // 版本自检：宿主重载后模型一条调用就能确认连的是哪版、几个工具。
+        return format!("fsops {} tools={}", crate::VERSION, tool_defs().len());
+    }
     if !matches!(detail, "meta" | "hash" | "full") {
-        return "E_BAD_ARGS detail 仅支持 meta/hash/full".into();
+        return "E_BAD_ARGS detail 仅支持 meta/hash/full/server".into();
     }
     let mut targets: Vec<String> = Vec::new();
     if let Some(p) = arg_str(args, "path") {
@@ -5148,6 +5169,40 @@ mod roundtrip_tests {
         assert!(out.contains("a.txt") && out.contains("b.txt"), "{out}");
         assert!(out.contains("1|a1"), "{out}");
         assert!(out.contains("1|b1"), "{out}");
+    }
+
+    #[test]
+    fn reads项支持budget与focus() {
+        let dir = 目录("reads-item-opts");
+        let a = dir.join("a.rs");
+        let b = dir.join("b.txt");
+        fs::write(
+            &a,
+            "fn one() {\n    let t = 1;\n}\n\nfn two() {\n    let t = 2;\n}\n",
+        )
+        .unwrap();
+        fs::write(&b, "alpha\nbeta\n").unwrap();
+        let out = call(
+            "fs_read",
+            &json!({"reads": [
+                {"path": a.to_string_lossy().replace('\\', "/"), "focus": "let t", "budget": 2048},
+                {"path": b.to_string_lossy().replace('\\', "/"), "budget": 400}
+            ]}),
+        );
+        let _ = fs::remove_dir_all(&dir);
+        // a 项：focus 只给命中所在的完整函数块
+        assert!(out.contains("fn one()"), "{out}");
+        assert!(out.contains("fn two()"), "{out}");
+        // b 项：单独的小预算也放得下两行
+        assert!(out.contains("alpha"), "{out}");
+        assert!(out.contains("beta"), "{out}");
+    }
+
+    #[test]
+    fn stat_server模式返回版本与工具数() {
+        let out = call("fs_stat", &json!({"detail": "server"}));
+        assert!(out.contains(crate::VERSION), "{out}");
+        assert!(out.contains("tools=8"), "{out}");
     }
 
     #[test]

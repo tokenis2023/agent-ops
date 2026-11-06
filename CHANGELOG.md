@@ -5,6 +5,11 @@
 ## [Unreleased]
 
 - 修复 `fs_exec` 的 schema 把 `program` 标为必填：只轮询/终止后台任务的 `{"job":1}` 会在宿主 schema 校验处就被拒，而运行时本就允许省略。DSH 插件与工具参考同步。
+- `fs_exec` 新增 `check=true`：非零退出按 `E_EXIT code=N` 返回，默认仍是 `ok`；跑必须成功的命令时不必再人工判断退出码。
+- `fs_edit` 的 `E_AMBIGUOUS` 附前 3 处命中位置的 ±2 行片段：构造唯一的 `old` 不再需要额外一次 `fs_read`。
+- `fs_read reads[]` 每项支持 `budget` 与 `focus`：大文件可单项多要预算，多文件按模式取块一次完成。
+- `fs_read` 的 description 增加模式互斥表（path/paths/reads/focus 四选一），模型在发出调用前就能拼出合法参数。
+- `fs_stat detail=server` 返回 `fsops 0.3.0 tools=8`：宿主重载后一条调用即可自检连接的服务端版本与工具数。
 
 ## [0.3.0] - 2026-11-06
 
