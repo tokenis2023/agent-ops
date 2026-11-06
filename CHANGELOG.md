@@ -18,6 +18,8 @@
 - `focus` 与 `fs_grep` 的正则描述标注「JSON 字符串里反斜杠需双写」，减少一层转义错误。
 - `E_LINE_TOO_LONG` 的「当前 budget=N」改为「渲染剩余预算 NB」：那是收敛后的剩余额度而非请求值，原措辞会把调参引向错误方向。
 - `fsops mcp --jobs 0/1` 不再走读线程串行 dispatch：升为单工作线程，避免 `background`/`wait_ms` 把读线程占住、后续请求（包括 kill 自救）全部排队；控制类请求仍在读线程就地应答。
+- 使用指南新增「升级后工具面仍是旧版」排障章节：宿主按连接配置指纹缓存 schema，先用 `fs_stat detail=server` 确认连的是哪一版，再按需需要 `/reload-mcp` 或删除 `mcp_schema_cache.json`。
+- `wait_ms` 测试改为断言「退出码 + 输出完整」，不再依赖 `ping -n 2` 的墙钟时间。
 
 ## [0.3.0] - 2026-11-06
 

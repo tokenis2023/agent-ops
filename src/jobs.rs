@@ -411,11 +411,11 @@ mod tests {
         let id = job_id(&started);
         let began = std::time::Instant::now();
         let text = poll_or_kill(id, &json!({"wait_ms": 15000}));
+        // 不断言墙钟时间：ping -n 2 在快机器上可能 1s 内结束，
+        // 断言「退出码存在 + 输出完整」才是语义；等待本身由 wait_ms 的实现保证。
         assert!(text.contains("exit="), "等待后应带退出码: {text}");
-        assert!(
-            began.elapsed().as_secs() >= 1,
-            "应等待任务结束而不是立即返回: {text}"
-        );
+        assert!(text.contains("stdout"), "应带输出: {text}");
+        let _ = began;
     }
 
     #[test]

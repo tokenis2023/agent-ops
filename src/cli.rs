@@ -53,7 +53,7 @@ fn usage() -> String {
         "fsops {} — 面向 AI Agent 的 Windows 文件操作层
 
 用法:
-  fsops mcp [--jobs N]                   以 MCP 服务运行（stdio；默认 4 并发，0/1 串行）
+  fsops mcp [--jobs N]                   以 MCP 服务运行（stdio；默认 4 并发，0/1 为单工作线程）
   fsops read <path> [--start N] [--end N] [--budget N]
   fsops grep <pattern> [--path DIR] [--glob G] [--context N] [--ignore-case]
   fsops glob [pattern] [--path DIR] [--dirs] [--limit N]
