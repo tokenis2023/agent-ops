@@ -10,7 +10,7 @@
 irm https://github.com/tokenis2023/agent-ops/releases/latest/download/install.ps1 | iex
 
 .EXAMPLE
-.\install.ps1 -Version v0.2.1 -Client none -InstallDir "$env:LOCALAPPDATA\fsops"
+.\install.ps1 -Version v0.2.2 -Client none -InstallDir "$env:LOCALAPPDATA\fsops"
 
 .EXAMPLE
 .\install.ps1 -DryRun
@@ -186,4 +186,6 @@ if ($clients.Count -gt 0) {
 
 Write-Host ""
 Write-Host "安装完成。新终端执行：fsops version" -ForegroundColor Green
+Write-Host "项目内建议执行：fsops integrate --rules" -ForegroundColor Green
+Write-Host "接入诊断：fsops doctor" -ForegroundColor Green
 Write-Host "使用指南：https://github.com/$Repo/blob/master/docs/使用指南.md"

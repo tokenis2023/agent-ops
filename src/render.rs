@@ -38,9 +38,13 @@ pub struct Rendered {
     pub body: String,
     /// 已经输出到的最后一行（1 基）
     pub last_line: usize,
+    /// 实际输出的第一行（1 基）；尾注写“起始-结束”时用它，不能按固定行数倒推。
+    pub first_line: usize,
     /// 是否因预算被截断
     pub truncated: bool,
     pub total_lines: usize,
+    /// 是否有长行因 max_line 被截断（只在尾注提示一次，避免每行重复浪费预算）。
+    pub line_cut: bool,
     /// 预算截断后仍未输出的区间，可直接作为下一次 ranges 参数。
     pub continuation: Vec<(usize, usize)>,
 }
@@ -52,12 +56,31 @@ pub fn render_window(text: &str, opts: RenderOpts) -> Rendered {
 
 /// 多个区间共享同一份正文预算；截断时保留所有尚未输出的区间。
 pub fn render_ranges(text: &str, ranges: &[(usize, usize)], opts: RenderOpts) -> Rendered {
+    // 空文件没有任何行：直接返回空正文，避免渲染出一个空的 `1|`。
+    if text.is_empty() {
+        return Rendered {
+            body: String::new(),
+            last_line: 0,
+            first_line: 0,
+            truncated: false,
+            total_lines: 0,
+            line_cut: false,
+            continuation: Vec::new(),
+        };
+    }
     let lines: Vec<&str> = text.split('\n').collect();
-    let total = lines.len();
+    // 末尾换行（含 CRLF）不代表额外一行；否则"共N行"会比头部多 1，自相矛盾。
+    let total = if lines.len() > 1 && lines[lines.len() - 1].is_empty() {
+        lines.len() - 1
+    } else {
+        lines.len()
+    };
     let initial_start = ranges.first().map(|r| r.0).unwrap_or(opts.start).max(1);
     let mut out = String::with_capacity(2048);
+    let mut first = 0usize;
     let mut last = initial_start.saturating_sub(1);
     let mut truncated = false;
+    let mut line_cut = false;
     let mut continuation = Vec::new();
 
     'ranges: for (range_index, &(raw_start, raw_end)) in ranges.iter().enumerate() {
@@ -86,6 +109,7 @@ pub fn render_ranges(text: &str, ranges: &[(usize, usize)], opts: RenderOpts) ->
                 shown.to_string()
             };
             let suffix = if extra > 0 {
+                line_cut = true;
                 format!("…(+{extra}字符)")
             } else {
                 String::new()
@@ -100,6 +124,9 @@ pub fn render_ranges(text: &str, ranges: &[(usize, usize)], opts: RenderOpts) ->
             out.push_str(&piece);
             out.push_str(&suffix);
             out.push('\n');
+            if first == 0 {
+                first = idx;
+            }
             last = idx;
         }
     }
@@ -107,8 +134,10 @@ pub fn render_ranges(text: &str, ranges: &[(usize, usize)], opts: RenderOpts) ->
     Rendered {
         body: out,
         last_line: last,
+        first_line: first,
         truncated,
         total_lines: total,
+        line_cut,
         continuation,
     }
 }
@@ -162,19 +191,68 @@ where
 
 /// 在 UTF-8 字符边界截断，绝不返回半个中文或 emoji。
 pub fn truncate_utf8(text: &str, budget: usize) -> &str {
-    if text.len() <= budget {
+    // 错误消息保留最低可解析长度：错误的全部价值在于"可执行"，
+    // 被截成 `E_BAD_ARGS` 或 `E_READ /c/` 就完全失去意义。
+    // 但仍受 budget 约束（budget 是调用方给的硬上限），
+    // 因此这里只是把"太小以至于无意义"的预算抬到能放下错误码+一句话的下限。
+    let effective = if text.starts_with("E_") {
+        budget.max(ERROR_MIN_BUDGET)
+    } else {
+        budget
+    };
+    if text.len() <= effective {
         return text;
     }
-    let mut end = budget;
+    let mut end = effective;
     while end > 0 && !text.is_char_boundary(end) {
         end -= 1;
     }
     &text[..end]
 }
 
+/// 错误消息的最低可解析长度：够放下 `E_XXX` + 一句原因。
+pub const ERROR_MIN_BUDGET: usize = 240;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 错误消息不被极小预算截成碎片() {
+        // 错误的全部价值是"可执行"；截成 `E_BAD_ARGS` 或 `E_READ /c/` 毫无用处。
+        let long_err = "E_BAD_ARGS 一次最多读 20 个文件，当前 25 个；请分批读取";
+        for budget in [0, 5, 10, 20, 50] {
+            let out = truncate_utf8(long_err, budget);
+            assert!(
+                out.starts_with("E_BAD_ARGS") && out.len() > 20,
+                "budget={budget} 截成了碎片: {out}"
+            );
+        }
+        // 非错误内容仍严格受 budget 约束
+        let content = "abcdefghij";
+        assert_eq!(truncate_utf8(content, 5), "abcde");
+        assert_eq!(truncate_utf8(content, 0), "");
+    }
+
+    #[test]
+    fn 末尾换行不算额外一行() {
+        let r = render_window(
+            "a\nb\n",
+            RenderOpts {
+                budget: 4096,
+                ..Default::default()
+            },
+        );
+        assert_eq!(r.total_lines, 2, "末尾换行不应多算一行");
+        let r2 = render_window(
+            "a\nb",
+            RenderOpts {
+                budget: 4096,
+                ..Default::default()
+            },
+        );
+        assert_eq!(r2.total_lines, 2);
+    }
 
     #[test]
     fn 行号前缀与范围正确() {
@@ -195,7 +273,9 @@ mod tests {
     fn 连续空行被折叠() {
         let text = "a\n\n\n\nb\n";
         let r = render_window(text, RenderOpts::default());
-        assert_eq!(r.body, "1|a\n2|\n5|b\n6|\n");
+        // 末尾换行不是一行，末尾不再输出幽灵的 `6|`。
+        assert_eq!(r.body, "1|a\n2|\n5|b\n");
+        assert_eq!(r.total_lines, 5);
     }
 
     #[test]

@@ -43,6 +43,80 @@ pub struct Doc {
     pub size: u64,
 }
 
+/// 判断字节流是否为二进制（而非可安全当文本编辑的内容）。
+///
+/// 判据：前 8KB 含 NUL，且不属于合法的 UTF-16（UTF-16 文本天然含大量 NUL）。
+/// 目的不是“精确识别所有格式”，而是在读/写前拦住会把二进制当文本糟蹋的操作。
+pub fn is_binary(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+    // BOM 是最权威的信号：带 UTF-16/UTF-8 BOM 的就是文本。
+    // 纯中文的 UTF-16 文本几乎没有零字节（高位不是 0），
+    // 光靠零字节分布会把它们误判成二进制。
+    if bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) {
+        return false;
+    }
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        return false;
+    }
+    let sample = &bytes[..bytes.len().min(8192)];
+    if !sample.contains(&0) {
+        return false;
+    }
+    // 真 UTF-16 文本的零字节几乎只出现在单一奇偶位（ASCII 高位为零）。
+    // 但极小样本里偶发 1 个 NUL 也符合这个形态，因此要求至少 2 个零字节
+    // 才承认“这是 UTF-16”，否则一律按二进制拒绝——宁可误拒也不毁文件。
+    let zeros_even = sample.iter().step_by(2).filter(|&&b| b == 0).count();
+    let zeros_odd = sample
+        .iter()
+        .skip(1)
+        .step_by(2)
+        .filter(|&&b| b == 0)
+        .count();
+    let total_zeros = zeros_even + zeros_odd;
+    if total_zeros < 2 {
+        return true;
+    }
+    let dominant = zeros_even.max(zeros_odd);
+    if dominant * 10 < total_zeros * 9 {
+        return true; // 零字节分布均匀，不是 UTF-16
+    }
+    // 零字节集中在单一奇偶位：再确认解码结果像正常文本。
+    let little = zeros_odd >= zeros_even;
+    !looks_like_utf16_text(bytes, little)
+}
+
+/// 把字节按 UTF-16 解码，判断结果是否像正常文本（而非二进制乱码）。
+fn looks_like_utf16_text(bytes: &[u8], little: bool) -> bool {
+    if bytes.len() < 4 || !bytes.len().is_multiple_of(2) {
+        return false;
+    }
+    let units: Vec<u16> = bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| {
+            if little {
+                u16::from_le_bytes([c[0], c[1]])
+            } else {
+                u16::from_be_bytes([c[0], c[1]])
+            }
+        })
+        .collect();
+    let mut printable = 0usize;
+    for ch in String::from_utf16_lossy(&units).chars() {
+        if ch == '\u{FFFD}' {
+            return false;
+        }
+        if !ch.is_control() || matches!(ch, '\t' | '\n' | '\r') {
+            printable += 1;
+        }
+    }
+    let total = units.len();
+    total > 0 && printable * 10 >= total * 7
+}
+
 /// 识别编码并解码。顺序：BOM → 无 BOM 的 UTF-16 特征 → UTF-8 校验 → GBK → 容错 UTF-8。
 pub fn decode(bytes: &[u8]) -> Doc {
     let (text, encoding, bom) = if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
@@ -89,7 +163,9 @@ pub fn decode(bytes: &[u8]) -> Doc {
 
 fn decode_utf16(bytes: &[u8], little: bool) -> String {
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| {
             if little {
                 u16::from_le_bytes([c[0], c[1]])
@@ -103,7 +179,7 @@ fn decode_utf16(bytes: &[u8], little: bool) -> String {
 
 /// 无 BOM 的 UTF-16：ASCII 文本里会出现大量 0x00 间隔字节。
 fn looks_like_utf16_le(b: &[u8]) -> bool {
-    if b.len() < 4 || b.len() % 2 != 0 {
+    if b.len() < 4 || !b.len().is_multiple_of(2) {
         return false;
     }
     let sample = &b[..b.len().min(200)];
@@ -117,7 +193,7 @@ fn looks_like_utf16_le(b: &[u8]) -> bool {
 }
 
 fn looks_like_utf16_be(b: &[u8]) -> bool {
-    if b.len() < 4 || b.len() % 2 != 0 {
+    if b.len() < 4 || !b.len().is_multiple_of(2) {
         return false;
     }
     let sample = &b[..b.len().min(200)];
@@ -190,9 +266,29 @@ pub fn encode(doc: &Doc, text: &str) -> Result<Vec<u8>, String> {
     }
     let (cow, _, had_errors) = enc.encode(text);
     if had_errors {
+        // 只报"包含无法表示的字符"等于没说：模型不知道是哪个字符，
+        // 只能整段重写反复试。这里给出具体字符与位置。
+        let mut bad: Vec<(usize, char)> = Vec::new();
+        for (idx, ch) in text.char_indices() {
+            if bad.len() >= 5 {
+                break;
+            }
+            let mut probe = [0u8; 8];
+            let one = ch.encode_utf8(&mut probe);
+            let (_, _, err) = enc.encode(one);
+            if err {
+                let line = text[..idx].matches('\n').count() + 1;
+                bad.push((line, ch));
+            }
+        }
+        let detail = bad
+            .iter()
+            .map(|(line, ch)| format!("U+{:04X} '{ch}'（第 {line} 行）", *ch as u32))
+            .collect::<Vec<_>>()
+            .join("、");
         return Err(format!(
-            "E_ENCODING_LOSS 新文本包含 {} 无法表示的字符，文件未修改",
-            doc.encoding
+            "E_ENCODING_LOSS 新文本有 {} 无法表示的字符：{}；请替换这些字符或改用 UTF-8 文件，文件未修改",
+            doc.encoding, detail
         ));
     }
     out.extend_from_slice(&cow);
@@ -216,6 +312,19 @@ pub fn from_lf(text: &str, eol: Eol) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 编码损失时报出具体字符与行号() {
+        // 只说"包含无法表示的字符"等于没说：模型不知道是哪个字符，
+        // 只能整段重写反复试。
+        let doc = decode(b"\xd6\xd0\xce\xc4\n");
+        let err = encode(&doc, "第一行\n第二行\n第三行😀\n").unwrap_err();
+        assert!(err.contains("E_ENCODING_LOSS"), "{err}");
+        assert!(err.contains("U+1F600"), "应给出码位: {err}");
+        assert!(err.contains("😀"), "应给出字符本身: {err}");
+        assert!(err.contains("第 3 行"), "应给出所在行: {err}");
+        assert!(err.contains("UTF-8"), "应给出替代方案: {err}");
+    }
 
     #[test]
     fn gbk_文件能正确解码并写回() {

@@ -36,6 +36,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://github.com/t
 - 加入用户 `PATH`
 - 自动注册检测到的 Claude Code、Hermes 和 Codex
 
+装完后在项目根目录执行 `fsops integrate --rules`，让 Agent 优先选择 fsops。
+
 跳过宿主注册或 PATH 修改：
 
 ```powershell
@@ -120,20 +122,49 @@ args = ["mcp"]
 
 | 工具 | 用途 | 关键参数 |
 |---|---|---|
-| `fs_read` | 读文件、行区间、多文件、大文件窗口 | `path`/`paths`、`start`、`end`、`ranges`、`max_line`、`budget` |
+| `fs_read` | 读文件、行区间、多文件、大文件窗口、DOCX/PDF 正文 | `path`/`paths`、`start`、`end`、`ranges`、`max_line`、`budget` |
 | `fs_edit` | 精确替换、多文件批量、dry run、并发保护 | `edits`、`files`、`expect_hash`、`normalize_eol` |
-| `fs_write` | 新建或整体覆盖，原子写入 | `content`、`expect_hash`、`normalize_eol` |
-| `fs_glob` | 按 glob 找文件，尊重 `.gitignore` | `pattern`、`path`、`dirs`、`detail`、`limit`、`budget` |
-| `fs_grep` | 正则搜索、四种输出、分页、并行 | `pattern`、`output`、`context`、`max_per_file`、`offset`、`parallel` |
+| `fs_write` | 新建或整体覆盖，原子写入，可生成 DOCX | `content`、`expect_hash`、`normalize_eol` |
+| `fs_glob` | 按 glob 找文件，尊重 `.gitignore`，带遍历时间预算 | `pattern`、`path`、`dirs`、`detail`、`limit`、`time_budget_ms`、`budget` |
+| `fs_grep` | 正则搜索、四种输出、分页、并行，支持 DOCX/PDF 正文 | `pattern`、`output`、`context`、`max_per_file`、`offset`、`parallel` |
 | `fs_stat` | 元信息、编码、换行、hash | `path`/`paths`、`detail=meta/hash/full` |
 
 完整参数、输出和错误码见 **[工具参考](docs/工具参考.md)**。
 
 ## Agent 使用引导
 
-推荐把 [AGENTS.md](AGENTS.md) 中的规则复制到项目的 `AGENTS.md` 或 `.hermes.md`。
+在项目根目录写入受管规则块：
 
-推荐链路：
+```bash
+fsops integrate --rules
+```
+
+默认写入 `AGENTS.md` 和 `CLAUDE.md`；需要覆盖更多宿主时：
+
+```bash
+fsops integrate --rules --target all
+```
+
+支持 `cursor`、`windsurf`、`cline`、`gemini`、`copilot`。规则块可重复执行，不会覆盖用户内容；用 `--remove` 移除，用 `--check` 检查版本。
+
+检查接入状态：
+
+```bash
+fsops doctor
+fsops doctor --json
+```
+
+`doctor` 会报告规则文件、MCP 宿主注册状态、Claude Code hook 和当前引导级别。如果宿主把 fsops 放在 deferred 目录，先执行一次工具发现，或直接用 `fsops read/grep/glob/stat/call` CLI。注意：规则是**软引导**；Claude Code 可用 `harden` 做硬接管：
+
+```bash
+fsops harden claude
+fsops harden claude --check
+fsops harden claude --remove
+```
+
+`harden` 安装 `PreToolUse` hook，拦截文本文件、DOCX 和 PDF 的 `Read/Grep/Glob`；图片、旧版 `.doc`、压缩包等二进制仍放行内置 `Read`。默认写项目 `.claude/settings.json`，加 `--user` 写用户级配置。
+
+详细规则见 [AGENTS.md](AGENTS.md)。推荐链路：
 
 ```text
 fs_grep output=files
@@ -167,28 +198,45 @@ fsops 可以替代 Agent 对 `Get-Content`、`Set-Content`、`Select-String`、`
 - 进程、服务、端口、注册表、ACL
 - Git、构建、测试、包管理
 - 删除、移动、复制、压缩包
-- PDF/Word/二进制内容
+- 图片和二进制内容
 
 推荐分工：**fsops 管文件，shell 管进程和工具链，PowerShell 只做 Windows 原生兜底。**
 
 ## 实测
 
-某真实 Go 仓库，122 个 Go 文件。只统计**工具输出** token（cl100k_base），baseline 使用宿主原生整文件读取、`grep -rn` 和 `find`。
+只统计**工具输出**（模型必须读进上下文的量），baseline 用宿主原生做法：整文件读、整文件写回、`grep -rn`、`find`。数字可用 `python tests/bench.py` 直接复跑。
+
+**内置 fixture**（40 个文件 / 每文件 36 行，单位：字符）：
 
 | 场景 | baseline | fsops | 省 |
 |---|---:|---:|---:|
-| 读某文件 40–80 行 | 14,861 | 603 | **95.9%** |
-| 找符号定义 | 27 | 26 | 3.7% |
-| 正则搜索（限量） | 1,198 | 541 | 54.8% |
-| 列出全部 `.go` | 862 | 739 | 14.3% |
-| 改 3 处（读全文+写全文 vs 单次 edit） | 29,722 | 131 | **99.6%** |
+| 列出命中文件 | 4,269 | 509 | 88.1% |
+| 定位单行（只要位置） | 135 | 57 | 57.8% |
+| 定位 + 4 行上下文 | 679 | 177 | 73.9% |
+| 读前 10 行 | 944 | 410 | 56.6% |
+| 改 3 处（读全文+写回 vs 单次 edit） | 1,888 | 353 | 81.3% |
+| 列出全部文件 | 4,269 | 509 | 88.1% |
+| **合计** | **12,184** | **2,015** | **83.5%** |
 
-结论：**读得少、改得省**是主要收益；纯搜索收益有限，不要期待 grep 变成零成本。
+**真实仓库**（fsops 自身源码）：
+
+| 场景 | baseline | fsops | 省 |
+|---|---:|---:|---:|
+| 列出命中文件 | 28 | 17 | 39.3% |
+| 定位单行（只要位置） | 76 | 78 | **−2.6%** |
+| 定位 + 4 行上下文 | 357 | 243 | 31.9% |
+| 读前 10 行 | 27,799 | 324 | **98.8%** |
+| 改 3 处 | 55,598 | 144 | **99.7%** |
+| 列出全部文件 | 468 | 188 | 59.8% |
+| **合计** | **84,326** | **994** | **98.8%** |
+
+结论：**读得少、改得省**是主要收益。纯定位单行时 fsops 可能持平甚至略亏（工具输出带路径头），这类查询直接给 `pattern` 已经足够，不必期待零成本。
 
 复跑：
 
 ```bash
-python tests/bench.py /path/to/go/repo
+python tests/bench.py                  # 自带 fixture，无需外部仓库、无需 tiktoken
+python tests/bench.py /path/to/repo    # 额外在真实代码上跑一轮
 ```
 
 ## 安全模型
@@ -205,11 +253,14 @@ python tests/bench.py /path/to/go/repo
 
 ## 已知限制
 
-- 只处理文本，不解析 PDF/Word/图片。
+- DOCX 只读取正文；`fs_write` 可生成纯文本段落的 DOCX，但不保留复杂版式、图片、批注。
+- PDF 只读取正文；扫描版（无文本层）和加密 PDF 无法抽取，`fs_write`/`fs_edit` 对 PDF 明确拒绝。
+- 图片、旧版 `.doc` 和二进制文件不解析：`fs_read`/`fs_edit`/`fs_write` 返回 `E_BINARY`，`fs_stat` 标记 `binary`。UTF-16 文本不会被误判。
 - 超大 UTF-16 文件暂不支持流式读取。
 - 超大文件只支持一个连续 `start`/`end` 区间，不支持多区间。
 - `fs_edit` 遇到混合换行默认拒绝，必须显式 `normalize_eol=true`。
 - 多文件编辑不是跨文件事务，写入阶段失败会返回 `E_BATCH_PARTIAL`。
+- `fs_edit` 的摘要只列前 64 处落点，其余用总数表示。
 - 编码识别是启发式的；极短 GBK 文件可能被判为 UTF-8-lossy。
 - 并行搜索为保证稳定顺序，达到 limit 后可能多扫描当前波次。
 

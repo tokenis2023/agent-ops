@@ -27,15 +27,29 @@ pub struct WalkOpts {
     pub include_dirs: bool,
     pub limit: usize,
     pub follow_links: bool,
+    /// 遍历时间预算；无匹配时也要能及时返回，避免全盘扫描把 Agent 卡死。
+    pub time_budget_ms: u128,
+    /// 忽略 .gitignore 与硬跳过目录。只在明确要查依赖源码/构建产物时打开：
+    /// 默认跳过是对的（否则一次 glob 能扫出几万条），但 agent 不能因此失去查 node_modules 的能力。
+    pub no_ignore: bool,
 }
 
 impl Default for WalkOpts {
     fn default() -> Self {
         Self {
             include_dirs: false,
-            limit: 500,
+            limit: usize::MAX,
             follow_links: false,
+            time_budget_ms: 5000,
+            no_ignore: false,
         }
+    }
+}
+
+impl WalkOpts {
+    fn deadline(&self) -> std::time::Instant {
+        std::time::Instant::now()
+            + std::time::Duration::from_millis(self.time_budget_ms.min(u64::MAX as u128) as u64)
     }
 }
 
@@ -55,6 +69,53 @@ pub enum VisitControl {
 pub struct WalkReport {
     pub entries_visited: usize,
     pub stopped: bool,
+    /// 是否因时间预算耗尽而停止；与“没有匹配”区分开。
+    pub timed_out: bool,
+}
+
+/// 拆分逗号分隔的 glob，但忽略花括号/方括号内部的逗号。
+///
+/// `{a,b}.rs` 是一个带 alternate group 的 glob；简单 `split(',')` 会把它
+/// 切成 `{a` 和 `b}.rs`，报出令人困惑的解析错误。
+fn split_patterns(pattern: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (i, ch) in pattern.char_indices() {
+        match ch {
+            '{' | '[' => depth += 1,
+            '}' | ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                out.push(&pattern[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&pattern[start..]);
+    out.into_iter()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// 构建 glob 集合；两处遍历入口共用，避免行为分叉。
+fn build_globset(pattern: &str) -> Result<globset::GlobSet, String> {
+    // 竖线是正则的"或"，在 glob 里是字面量：会静默匹配不到任何文件。
+    if pattern.contains('|') {
+        return Err(format!(
+            "E_BAD_GLOB pattern 不支持 `|`（那是正则写法）；\
+             多个模式请用逗号分隔，如 `*.rs,*.ts`（当前: {pattern}）"
+        ));
+    }
+    let mut builder = GlobSetBuilder::new();
+    for pat in split_patterns(pattern) {
+        let g = Glob::new(pat).map_err(|e| format!("E_BAD_GLOB {pat}: {e}"))?;
+        builder.add(g);
+    }
+    builder
+        .build()
+        .map_err(|e| format!("E_BAD_GLOB 解析失败: {e}"))
 }
 
 /// 逐项访问匹配路径，不预先收集完整文件列表。
@@ -70,25 +131,26 @@ where
     if !root.exists() {
         return Err(format!("E_NOT_FOUND {}", root.display()));
     }
-    let mut builder = GlobSetBuilder::new();
     let has_pattern = !pattern.trim().is_empty();
-    if has_pattern {
-        for pat in pattern.split(',') {
-            let pat = pat.trim();
-            if pat.is_empty() {
-                continue;
-            }
-            let g = Glob::new(pat).map_err(|e| format!("E_BAD_GLOB {pat}: {e}"))?;
-            builder.add(g);
-        }
-    }
-    let set = builder
-        .build()
-        .map_err(|e| format!("E_BAD_GLOB 解析失败: {e}"))?;
+    let set = if has_pattern {
+        build_globset(pattern)?
+    } else {
+        GlobSetBuilder::new()
+            .build()
+            .map_err(|e| format!("E_BAD_GLOB 解析失败: {e}"))?
+    };
     let mut report = WalkReport {
         entries_visited: 0,
         stopped: opts.limit == 0,
+        timed_out: false,
     };
+    // 入口就检查 deadline：预算为 0 时必须立刻返回，
+    // 否则要等第一个 256 项检查点，白扫 256 项（且错误信息会误导成"已访问 256 项"）。
+    if std::time::Instant::now() > opts.deadline() {
+        report.timed_out = true;
+        report.stopped = true;
+        return Ok(report);
+    }
     if opts.limit == 0 {
         return Ok(report);
     }
@@ -114,16 +176,20 @@ where
         return Ok(report);
     }
     let base = root.native().to_path_buf();
+    let no_ignore = opts.no_ignore;
     let mut walker = WalkBuilder::new(&base);
     walker
         .hidden(false)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
+        .git_ignore(!opts.no_ignore)
+        .git_global(!opts.no_ignore)
+        .git_exclude(!opts.no_ignore)
         .follow_links(opts.follow_links)
         // 串行流只按路径排序当前目录，不预先收集全局列表；输出因此可重放。
         .sort_by_file_path(|a, b| a.cmp(b))
-        .filter_entry(|e| {
+        .filter_entry(move |e| {
+            if no_ignore {
+                return true;
+            }
             !e.file_name()
                 .to_str()
                 .map(|n| HARD_SKIP.contains(&n))
@@ -171,59 +237,91 @@ where
 
 /// 按 glob 收集文件；`pattern` 为空表示全部。
 pub fn glob(root: &FsPath, pattern: &str, opts: &WalkOpts) -> Result<Vec<Entry>, String> {
+    glob_with_report(root, pattern, opts).map(|(entries, _)| entries)
+}
+
+/// 带遍历状态的 glob：调用方可区分“无匹配”和“时间预算耗尽”。
+pub fn glob_with_report(
+    root: &FsPath,
+    pattern: &str,
+    opts: &WalkOpts,
+) -> Result<(Vec<Entry>, WalkReport), String> {
+    let deadline = opts.deadline();
+    let mut report = WalkReport {
+        entries_visited: 0,
+        stopped: false,
+        timed_out: false,
+    };
+    let (entries, timed_out) = glob_inner(root, pattern, opts, deadline, &mut report)?;
+    report.timed_out = timed_out;
+    Ok((entries, report))
+}
+
+fn glob_inner(
+    root: &FsPath,
+    pattern: &str,
+    opts: &WalkOpts,
+    deadline: std::time::Instant,
+    report: &mut WalkReport,
+) -> Result<(Vec<Entry>, bool), String> {
     if !root.exists() {
         return Err(format!("E_NOT_FOUND {}", root.display()));
     }
     if opts.limit == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), false));
+    }
+    // 预算为 0 时立刻返回：否则要等第一个 256 项检查点，
+    // 白扫 256 项，且错误信息会误导成"已访问 256 项"。
+    if std::time::Instant::now() > deadline {
+        return Ok((Vec::new(), true));
     }
 
-    let mut builder = GlobSetBuilder::new();
     let has_pattern = !pattern.trim().is_empty();
-    if has_pattern {
-        for pat in pattern.split(',') {
-            let pat = pat.trim();
-            if pat.is_empty() {
-                continue;
-            }
-            let g = Glob::new(pat).map_err(|e| format!("E_BAD_GLOB {pat}: {e}"))?;
-            builder.add(g);
-        }
-    }
-    let set = builder
-        .build()
-        .map_err(|e| format!("E_BAD_GLOB 解析失败: {e}"))?;
+    let set = if has_pattern {
+        build_globset(pattern)?
+    } else {
+        GlobSetBuilder::new()
+            .build()
+            .map_err(|e| format!("E_BAD_GLOB 解析失败: {e}"))?
+    };
 
     // 文件根只返回该文件，不能退到父目录后把兄弟文件也扫出来。
     if !root.is_dir() {
         let rel_posix = root.file_name().replace('\\', "/");
         if has_pattern && !set.is_match(&rel_posix) {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), false));
         }
         let m = match meta(root) {
             Ok(m) => m,
-            Err(_) => return Ok(Vec::new()),
+            Err(_) => return Ok((Vec::new(), false)),
         };
-        return Ok(vec![Entry {
-            path: rel_posix,
-            is_dir: false,
-            size: m.size,
-            mtime: m.mtime,
-        }]);
+        return Ok((
+            vec![Entry {
+                path: rel_posix,
+                is_dir: false,
+                size: m.size,
+                mtime: m.mtime,
+            }],
+            false,
+        ));
     }
 
     let base = root.native().to_path_buf();
 
+    let no_ignore = opts.no_ignore;
     let mut walker = WalkBuilder::new(&base);
     walker
         .hidden(false) // 保留点文件
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
+        .git_ignore(!opts.no_ignore)
+        .git_global(!opts.no_ignore)
+        .git_exclude(!opts.no_ignore)
         .follow_links(opts.follow_links)
         // 目录内按路径稳定排序，达到 limit 立即停止，不再全量收集后排序。
         .sort_by_file_path(|a, b| a.cmp(b))
-        .filter_entry(|e| {
+        .filter_entry(move |e| {
+            if no_ignore {
+                return true;
+            }
             !e.file_name()
                 .to_str()
                 .map(|n| HARD_SKIP.contains(&n))
@@ -239,6 +337,11 @@ pub fn glob(root: &FsPath, pattern: &str, opts: &WalkOpts) -> Result<Vec<Entry>,
         let path = entry.path();
         if path == base {
             continue;
+        }
+        report.entries_visited += 1;
+        // 每 256 项检查一次 deadline：全盘无匹配时也能按时返回。
+        if report.entries_visited.is_multiple_of(256) && std::time::Instant::now() > deadline {
+            return Ok((out, true));
         }
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
         if is_dir && !opts.include_dirs {
@@ -266,6 +369,10 @@ pub fn glob(root: &FsPath, pattern: &str, opts: &WalkOpts) -> Result<Vec<Entry>,
         }
     }
 
+    let mut timed_out = false;
+    if std::time::Instant::now() > deadline && out.len() < opts.limit {
+        timed_out = true;
+    }
     if out.len() == opts.limit {
         // 无法在不继续遍历的情况下确认是否还有更多，明确提示而不是静默截断。
         out.push(Entry {
@@ -275,7 +382,7 @@ pub fn glob(root: &FsPath, pattern: &str, opts: &WalkOpts) -> Result<Vec<Entry>,
             mtime: std::time::SystemTime::UNIX_EPOCH,
         });
     }
-    Ok(out)
+    Ok((out, timed_out))
 }
 
 /// 紧凑列表：默认只给路径（目录带 `/`），`detail` 时补大小与时间。
@@ -312,6 +419,86 @@ mod tests {
     use std::fs;
 
     #[test]
+    fn 零时间预算立刻返回不白扫() {
+        // 预算为 0 时必须入口就返回：否则要等第一个 256 项检查点，
+        // 白扫 256 项，且错误信息会误导成"已访问 256 项"。
+        let dir = std::env::temp_dir().join(format!("fsops-zero-budget-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        for i in 0..300 {
+            fs::write(dir.join(format!("f{i}.txt")), "x").unwrap();
+        }
+        let root = FsPath::parse(&dir.to_string_lossy()).unwrap();
+        let opts = WalkOpts {
+            time_budget_ms: 0,
+            ..Default::default()
+        };
+        let (entries, report) = glob_with_report(&root, "**/*.zzz", &opts).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(report.timed_out, "应标记超时");
+        assert!(entries.is_empty(), "不应返回条目");
+        assert!(
+            report.entries_visited < 256,
+            "预算为 0 时不应白扫 256 项，实际 {} 项",
+            report.entries_visited
+        );
+    }
+
+    #[test]
+    fn 花括号内逗号不被当作模式分隔符() {
+        // `{a,b}.rs` 是一个带 alternate group 的 glob；
+        // 简单 split(',') 会切成 `{a` 和 `b}.rs` 并报解析错误。
+        let tmp = std::env::temp_dir().join(format!("fsops-brace-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        for n in ["a.rs", "b.rs", "c.rs"] {
+            fs::write(tmp.join(n), "x").unwrap();
+        }
+        let root = FsPath::parse(&tmp.to_string_lossy()).unwrap();
+        let (entries, _) = glob_with_report(&root, "{a,b}.rs", &WalkOpts::default()).unwrap();
+        let names: Vec<String> = entries.iter().map(|e| e.path.clone()).collect();
+        let _ = fs::remove_dir_all(&tmp);
+        assert_eq!(names.len(), 2, "花括号分组应匹配 2 个: {names:?}");
+        assert!(names.contains(&"a.rs".to_string()), "{names:?}");
+        assert!(names.contains(&"b.rs".to_string()), "{names:?}");
+        assert!(!names.contains(&"c.rs".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn 竖线写法给出可执行错误() {
+        // `|` 是正则写法，在 glob 里是字面量：会静默匹配不到任何文件。
+        let tmp = std::env::temp_dir().join(format!("fsops-pipe-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(tmp.join("a.rs"), "x").unwrap();
+        let root = FsPath::parse(&tmp.to_string_lossy()).unwrap();
+        let result = glob_with_report(&root, "*.rs|*.ts", &WalkOpts::default());
+        let _ = fs::remove_dir_all(&tmp);
+        let err = match result {
+            Ok(_) => panic!("竖线写法应报错而不是静默无匹配"),
+            Err(e) => e,
+        };
+        assert!(err.starts_with("E_BAD_GLOB"), "{err}");
+        assert!(err.contains("不支持 `|`"), "{err}");
+        assert!(err.contains("逗号分隔"), "应给出正确写法: {err}");
+    }
+
+    #[test]
+    fn 逗号分隔多个模式() {
+        let tmp = std::env::temp_dir().join(format!("fsops-multi-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        for n in ["a.rs", "b.ts", "c.py"] {
+            fs::write(tmp.join(n), "x").unwrap();
+        }
+        let root = FsPath::parse(&tmp.to_string_lossy()).unwrap();
+        let (entries, _) = glob_with_report(&root, "*.rs, *.ts", &WalkOpts::default()).unwrap();
+        let names: Vec<String> = entries.iter().map(|e| e.path.clone()).collect();
+        let _ = fs::remove_dir_all(&tmp);
+        assert_eq!(names.len(), 2, "应匹配 rs 和 ts: {names:?}");
+    }
+
+    #[test]
     fn glob_只返回匹配文件并跳过硬忽略目录() {
         let tmp = std::env::temp_dir().join(format!("fsops-glob-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
@@ -327,6 +514,53 @@ mod tests {
         assert_eq!(names.len(), 1);
         assert!(names[0].ends_with("src/a.rs"));
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn glob_时间预算耗尽时返回超时标记() {
+        let dir = std::env::temp_dir().join(format!("fsops-glob-timeout-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..300 {
+            std::fs::write(dir.join(format!("f{i}.txt")), "x").unwrap();
+        }
+        let fp = crate::paths::FsPath::parse(&dir.to_string_lossy()).unwrap();
+        let opts = WalkOpts {
+            include_dirs: false,
+            limit: usize::MAX,
+            follow_links: false,
+            time_budget_ms: 0,
+            no_ignore: false,
+        };
+        let (entries, report) = glob_with_report(&fp, "**/*.zzz", &opts).unwrap();
+        assert!(entries.is_empty());
+        assert!(report.timed_out, "时间预算为 0 时应标记超时");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn glob_时间预算耗尽时停止遍历() {
+        let dir = std::env::temp_dir().join(format!("fsops-glob-budget-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..500 {
+            std::fs::write(dir.join(format!("f{i}.txt")), "x").unwrap();
+        }
+        let fp = crate::paths::FsPath::parse(&dir.to_string_lossy()).unwrap();
+        let opts = WalkOpts {
+            include_dirs: false,
+            limit: usize::MAX,
+            follow_links: false,
+            time_budget_ms: 0,
+            no_ignore: false,
+        };
+        let (entries, report) = glob_with_report(&fp, "", &opts).unwrap();
+        assert!(report.timed_out);
+        assert!(
+            report.entries_visited < 500,
+            "预算为 0 不应遍历全部 {} 项",
+            report.entries_visited
+        );
+        let _ = entries;
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

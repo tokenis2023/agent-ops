@@ -35,3 +35,6 @@ jobs:
 
       - name: 真实 MCP 端到端测试
         run: python tests/windows_semantics.py
+
+      - name: 基准脚本自检
+        run: python tests/bench.py

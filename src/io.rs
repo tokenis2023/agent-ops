@@ -161,6 +161,24 @@ where
     ))
 }
 
+/// 在错误信息里补上路径：多文件读取时只报系统错误无法定位是哪个文件。
+/// 复用 FsPath::display()，保证与其它输出用同一种路径写法。
+pub fn with_path(err: String, fp: &FsPath) -> String {
+    match err.strip_prefix("E_READ 读取失败: ") {
+        Some(rest) => format!("E_READ {} 读取失败: {}", fp.display(), with_hint(rest, fp)),
+        None => err,
+    }
+}
+
+/// 路径不存在时检查是否写错了格式（双重盘符、多余斜杠）。
+/// Windows 只说"找不到路径"，模型会误以为文件不存在而多跑一次 fs_glob。
+fn with_hint(reason: &str, fp: &FsPath) -> String {
+    match crate::paths::double_prefix_hint(&fp.display()) {
+        Some(fixed) => format!("{reason}；路径疑似多了一层盘符，应为 {fixed}"),
+        None => reason.to_string(),
+    }
+}
+
 pub fn read_bytes(p: &Path) -> Result<Vec<u8>, String> {
     let wide = p.to_path_buf();
     retry(|| {
@@ -187,7 +205,14 @@ pub fn read_snapshot(fp: &FsPath) -> Result<Snapshot, String> {
     if fp.is_dir() {
         return Err(format!("E_IS_DIR {} 是目录", fp.display()));
     }
-    let bytes = read_bytes(&fp.wide())?;
+    let bytes = read_bytes(&fp.wide()).map_err(|e| with_path(e, fp))?;
+    if text::is_binary(&bytes) {
+        return Err(format!(
+            "E_BINARY {} 是二进制文件（{}），fsops 只处理文本和 DOCX/PDF",
+            fp.display(),
+            human_size(bytes.len() as u64)
+        ));
+    }
     let doc = text::decode(&bytes);
     let hash = hash_hex(&bytes);
     Ok(Snapshot { bytes, doc, hash })
@@ -304,9 +329,39 @@ fn decode_large_line(bytes: &[u8], encoding: &str) -> String {
     }
 }
 
+/// 解析符号链接/junction 的真实目标；不是链接则原样返回。
+///
+/// 不这样做的话，原子写入的 rename 会把链接本身替换成普通文件：
+/// 目标文件没被修改，链接却被静默破坏（Windows 上 node_modules、junction 常见）。
+fn resolve_link(path: &std::path::Path) -> std::path::PathBuf {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+        }
+        _ => path.to_path_buf(),
+    }
+}
+
+/// 目标是否带只读属性（Windows 上 rename 覆盖会因此失败）。
+fn is_readonly(path: &std::path::Path) -> bool {
+    std::fs::metadata(path)
+        .map(|m| m.permissions().readonly())
+        .unwrap_or(false)
+}
+
 /// 原子写入：同目录临时文件 → 落盘 → 改名覆盖。
 pub fn atomic_write(dp: &FsPath, bytes: &[u8]) -> Result<(), String> {
-    let native = dp.native();
+    // 目标是符号链接时写到真实文件，避免把链接本身换成普通文件。
+    let resolved = resolve_link(dp.native());
+    let native = resolved.as_path();
+    // 目录不能被当文件写入：不加这个检查会在 rename 阶段报
+    // `E_RENAME 拒绝访问`，模型看不出真正原因。
+    if native.is_dir() {
+        return Err(format!(
+            "E_IS_DIR {} 是目录，不能用 fs_write 写入",
+            dp.display()
+        ));
+    }
     if let Some(parent) = native.parent() {
         if !parent.exists() {
             fs::create_dir_all(parent)
@@ -343,6 +398,15 @@ pub fn atomic_write(dp: &FsPath, bytes: &[u8]) -> Result<(), String> {
                 }
                 Err(e) => {
                     let _ = fs::remove_file(&tmp);
+                    // 只读属性是 Windows 上最常见的写失败原因，直说并给解法。
+                    if is_readonly(native) {
+                        return Err(format!(
+                            "E_READONLY {} 是只读文件；先去掉只读属性（PowerShell: \
+                             Set-ItemProperty -Path '{}' -Name IsReadOnly -Value $false）再写入",
+                            dp.display(),
+                            native.display()
+                        ));
+                    }
                     return Err(format!("E_RENAME 替换目标失败: {e}"));
                 }
             }
@@ -367,6 +431,9 @@ pub struct Meta {
     pub size: u64,
     pub mtime: SystemTime,
     pub readonly: bool,
+    /// 符号链接的真实目标及其大小：链接自身的 size 是 0，
+    /// 只报 0B 会让模型以为目标文件是空的。
+    pub link: Option<(String, u64)>,
 }
 
 pub fn meta(fp: &FsPath) -> Result<Meta, String> {
@@ -382,11 +449,27 @@ pub fn meta(fp: &FsPath) -> Result<Meta, String> {
     } else {
         "other"
     };
+    let link = if ft.is_symlink() {
+        fs::canonicalize(fp.wide()).ok().and_then(|target| {
+            fs::metadata(&target).ok().map(|m| {
+                // canonicalize 会带 `\\?\` 长路径前缀，对模型是噪声。
+                let shown = target
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .trim_start_matches("//?/")
+                    .to_string();
+                (shown, m.len())
+            })
+        })
+    } else {
+        None
+    };
     Ok(Meta {
         kind,
         size: md.len(),
         mtime: md.modified().unwrap_or(UNIX_EPOCH),
         readonly: md.permissions().readonly(),
+        link,
     })
 }
 

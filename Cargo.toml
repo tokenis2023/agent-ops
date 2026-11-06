@@ -1,8 +1,8 @@
 [package]
 name = "fsops"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.88"
 description = "面向 AI Agent 的 Windows 原生文件操作层：POSIX 语义、紧凑输出、低 token"
 license = "MIT"
 repository = "https://github.com/tokenis2023/agent-ops"
@@ -26,10 +26,12 @@ ignore = "0.4"
 globset = "0.4"
 encoding_rs = "0.8"
 blake3 = "1"
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
+quick-xml = "0.31"
+pdf-extract = "0.12"
 
 [profile.release]
 opt-level = "z"
 lto = true
 codegen-units = 1
-panic = "abort"
 strip = true

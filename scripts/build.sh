@@ -9,7 +9,7 @@ case "${1:-build}" in
   build)   cargo build --release ;;
   test)    cargo test ;;
   e2e)     cargo build && "$PYTHON" tests/windows_semantics.py ;;
-  bench)   "$PYTHON" tests/bench.py "${2:?请提供用于基准测试的 Go 仓库路径}" ;;
+  bench)   "$PYTHON" tests/bench.py "${2:-}" ;;
   all)
     cargo test
     cargo build

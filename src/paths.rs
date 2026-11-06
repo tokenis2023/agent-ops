@@ -111,6 +111,42 @@ fn is_drive_abs(s: &str) -> bool {
     b.len() >= 3 && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/') && b[0].is_ascii_alphabetic()
 }
 
+/// 检测"双重盘符前缀"，如 `/d/c/Users/x`、`/c/c/x`、`/mnt/d/c/x`。
+///
+/// 模型在不同工具间传路径时，容易对已经 POSIX 化的 `/c/...` 再加一次盘符，
+/// 得到 `/d/c/...`。Windows 只会报"系统找不到指定的路径"，
+/// 模型会误以为文件不存在而去 `fs_glob` 找，白白多一次往返。
+/// 返回去掉多余前缀后的正确形式，供错误信息里给出。
+pub fn double_prefix_hint(input: &str) -> Option<String> {
+    let raw = input.trim().replace('\\', "/");
+    // 只处理 POSIX 形式（/d/c/...、/mnt/d/c/...）。
+    // 原生形式 D:/c/x 在 Windows 上本身合法（D 盘下的 c 目录），不能当多余前缀。
+    let body = if let Some(rest) = raw.strip_prefix("/mnt/") {
+        rest
+    } else {
+        raw.strip_prefix('/')?
+    };
+    let mut chars = body.chars();
+    let first = chars.next()?;
+    if !first.is_ascii_alphabetic() {
+        return None;
+    }
+    let rest = chars.as_str();
+    // 剩余部分必须以 /<盘符>/ 或 /<盘符> 结尾，说明第一个盘符是多余的。
+    let tail = rest.strip_prefix('/')?;
+    let mut tail_chars = tail.chars();
+    let second = tail_chars.next()?;
+    if !second.is_ascii_alphabetic() {
+        return None;
+    }
+    let after = tail_chars.as_str();
+    if !(after.is_empty() || after.starts_with('/')) {
+        return None;
+    }
+    // /d/c/Users/x → /c/Users/x
+    Some(format!("/{second}{after}"))
+}
+
 /// `/c/...` 或 `/mnt/c/...` → ("c", "rest")
 fn strip_drive_prefix(s: &str) -> Option<(char, String)> {
     let t = if let Some(rest) = s.strip_prefix("/mnt/") {
@@ -172,6 +208,28 @@ mod tests {
         assert_eq!(c.display(), "/c/repo/x");
         let d = FsPath::parse("d:/repo/y").unwrap();
         assert_eq!(d.display(), "/d/repo/y");
+    }
+
+    #[test]
+    fn 检测双重盘符前缀() {
+        // 模型在工具间传路径时容易对 /c/... 再加一次盘符，得到 /d/c/...；
+        // Windows 只说"找不到路径"，模型会误以为文件不存在。
+        assert_eq!(
+            double_prefix_hint("/d/c/Users/x.txt").as_deref(),
+            Some("/c/Users/x.txt")
+        );
+        assert_eq!(
+            double_prefix_hint("/c/c/Users/x").as_deref(),
+            Some("/c/Users/x")
+        );
+        assert_eq!(double_prefix_hint("/mnt/d/c/x").as_deref(), Some("/c/x"));
+        // 原生 D:/c/x 在 Windows 上合法（D 盘下的 c 目录），不能当多余前缀
+        assert_eq!(double_prefix_hint("D:/c/Users/x"), None);
+        // 正常路径与合法深目录不应误判
+        assert_eq!(double_prefix_hint("/c/Users/x"), None);
+        assert_eq!(double_prefix_hint("/d/code/fsops/src"), None);
+        assert_eq!(double_prefix_hint("/c/documents/a.txt"), None);
+        assert_eq!(double_prefix_hint("C:\\Users\\x"), None);
     }
 
     #[test]

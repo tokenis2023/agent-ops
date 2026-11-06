@@ -45,7 +45,7 @@ pub fn serve() -> io::Result<()> {
                     "protocolVersion": requested,
                     "capabilities": {"tools": {"listChanged": false}},
                     "serverInfo": {"name": "fsops", "version": crate::VERSION},
-                    "instructions": "Windows 上按 Linux 习惯读写文件：支持 /c/... 与 ~ 路径、GBK/UTF-16/CRLF 自动识别；返回体有字节预算，读长文件请按提示用 start 续读。"
+                    "instructions": "文件读写、搜索、编辑、元信息操作优先使用 fs_* 工具。只要 fsops 可用，不要用宿主内置 read_file/write_file/search_files 或 shell 的 cat/head/tail/grep/find/sed 处理文本；仅当 fsops 不可用、超时，或目标是图片/PDF/二进制时回退。局部修改用 fs_edit，不要整文件读回再 fs_write。",
                 }))
             }
             "ping" => Ok(json!({})),
@@ -60,7 +60,9 @@ pub fn serve() -> io::Result<()> {
                     .cloned()
                     .unwrap_or_else(|| json!({}));
                 let text = tools::call(name, &args);
-                let is_error = text.starts_with("E_");
+                // 多文件读取会把错误夹在正文之间，只看首字符会漏报。
+                // 只要任一行以错误码开头，就标记 isError，避免 Agent 把失败当成功。
+                let is_error = text.starts_with("E_") || has_error_line(&text);
                 Ok(json!({
                     "content": [{"type": "text", "text": text}],
                     "isError": is_error
@@ -81,4 +83,35 @@ pub fn serve() -> io::Result<()> {
 
 fn err_resp(id: Value, code: i64, msg: &str) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": msg}})
+}
+
+/// 多文件响应里错误可能出现在任意一行；识别 `E_XXX ` 形式的错误码行。
+fn has_error_line(text: &str) -> bool {
+    text.lines().any(|line| {
+        let line = line.trim_start();
+        let Some(rest) = line.strip_prefix("E_") else {
+            return false;
+        };
+        // 错误码形如 E_READ、E_BINARY、E_TIMEOUT：全大写字母/下划线后接空格或结尾。
+        let code_len = rest
+            .find(|c: char| !(c.is_ascii_uppercase() || c == '_'))
+            .unwrap_or(rest.len());
+        code_len > 0 && rest[code_len..].starts_with([' ', ':'])
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 识别夹在正文中的错误行() {
+        assert!(has_error_line("ok\ntext\nE_READ 读取失败: 不存在\n"));
+        assert!(has_error_line(
+            "== a.txt utf-8\n1|x\nE_BINARY /b.dat 是二进制文件"
+        ));
+        assert!(!has_error_line("== a.txt utf-8\n1|E_READ 只是正文\n"));
+        assert!(!has_error_line("ok 写入文件"));
+        assert!(!has_error_line("1|E_UNKNOWN 出现在内容里"));
+    }
 }

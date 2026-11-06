@@ -2,7 +2,7 @@
 //!
 //! 和系统 findstr / Select-String 的差别：
 //! - 会先按 .gitignore 过滤，不把 node_modules 里的几万行翻出来；
-//! - 自动跳过二进制文件与大文件；
+//! - 自动跳过二进制文件与大文件；DOCX 先抽取正文再搜索。
 //! - 有硬预算，命中太多时只给前 N 条并说明总数。
 
 use crate::paths::FsPath;
@@ -26,6 +26,8 @@ pub struct GrepOpts {
     pub parallel: bool,
     /// 时间预算：超时后返回已找到的结果并标注，避免在 C:\ 这种根目录上卡死
     pub time_budget_ms: u128,
+    /// 忽略 .gitignore 与 node_modules/target 等硬跳过目录；用于查依赖源码或构建产物
+    pub no_ignore: bool,
 }
 
 impl Default for GrepOpts {
@@ -42,6 +44,7 @@ impl Default for GrepOpts {
             max_file_size: 8 * 1024 * 1024,
             parallel: false,
             time_budget_ms: 5000,
+            no_ignore: false,
         }
     }
 }
@@ -65,6 +68,10 @@ pub struct GrepResult {
     pub omitted_per_file: usize,
     pub truncated: bool,
     pub timed_out: bool,
+    /// 因超过 max_file_size 被跳过的文件数；必须回报，否则大文件命中会变成假阴性。
+    pub files_skipped_large: usize,
+    /// 被跳过的最大文件体积，用于提示调整上限。
+    pub largest_skipped: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,12 +89,51 @@ pub struct GrepRendered {
     pub truncated: bool,
 }
 
+/// 判断正则是否会在"任意文本的每一行"都命中（即能匹配空位置）。
+///
+/// 只测空串不够：`\b`、`\B` 在空串上不匹配（空串没有词边界），
+/// 但在真实文本里每个词边界都命中。所以用多段样本，只要**非空样本全部命中**
+/// 且该模式确实能在无内容处匹配，就判定为"无筛选价值"。
+fn matches_everywhere(re: &Regex) -> bool {
+    // 空串命中 → `^`、`$`、`a*`、`.*`、`\d*` 这类，直接判定
+    if re.is_match("") {
+        return true;
+    }
+    // 非空样本：要求每一段都命中（`\b`、`\B` 满足）
+    const SAMPLES: [&str; 3] = ["hello world", "中文文本", "123 abc !!!"];
+    SAMPLES.iter().all(|s| re.is_match(s))
+}
+
 pub fn grep(root: &FsPath, opts: &GrepOpts) -> Result<GrepResult, String> {
     let mut pat = opts.pattern.clone();
     if opts.ignore_case {
         pat = format!("(?i){pat}");
     }
-    let re = Regex::new(&pat).map_err(|e| format!("E_BAD_REGEX {e}"))?;
+    let re = Regex::new(&pat).map_err(|e| {
+        let mut msg = format!("E_BAD_REGEX {e}");
+        // 模型常把 glob 当正则写（`*.txt`），直接点明并给出正确的等价写法。
+        if opts.pattern.contains('*') && !opts.pattern.contains(".*") {
+            let hint = opts.pattern.replace('.', "\\.").replace('*', ".*");
+            msg.push_str(&format!(
+                "\n提示：pattern 是正则不是 glob。`{}` 的等价写法是 `{}`；\
+                 按文件名筛选请用 fs_glob 的 pattern 参数。",
+                opts.pattern, hint
+            ));
+        }
+        msg
+    })?;
+    // 能匹配空串的模式（`^`、`$`、`a*`、`.*`、`\b`、`\d*`）会命中每一行：
+    // 返回 100 行"命中"但没任何信息量，还会让模型误以为文件内容真含该串。
+    //
+    // 判据不能只看 `is_match("")`：`\b` 在空串上不匹配（没有词边界），
+    // 但在任意正常文本里每个词边界都命中。用几段代表性样本做实测更可靠。
+    if matches_everywhere(&re) {
+        return Err(format!(
+            "E_BAD_REGEX pattern `{}` 能匹配空位置，会命中每一行而没有信息量；\
+             请给出至少一个具体字符，如 `TODO`、`fn main`，或加锚点 `^fn`",
+            opts.pattern
+        ));
+    }
     if opts.parallel && root.is_dir() {
         return grep_parallel(root, opts, &re);
     }
@@ -100,6 +146,8 @@ pub fn grep(root: &FsPath, opts: &GrepOpts) -> Result<GrepResult, String> {
     let mut matched_files = 0usize;
     let mut truncated = false;
     let mut timed_out = false;
+    let mut files_skipped_large = 0usize;
+    let mut largest_skipped = 0u64;
     let deadline = std::time::Instant::now()
         + std::time::Duration::from_millis(opts.time_budget_ms.min(u64::MAX as u128) as u64);
     if std::time::Instant::now() > deadline {
@@ -113,6 +161,8 @@ pub fn grep(root: &FsPath, opts: &GrepOpts) -> Result<GrepResult, String> {
             omitted_per_file: 0,
             truncated: true,
             timed_out: true,
+            files_skipped_large: 0,
+            largest_skipped: 0,
         });
     }
 
@@ -125,6 +175,8 @@ pub fn grep(root: &FsPath, opts: &GrepOpts) -> Result<GrepResult, String> {
             include_dirs: true,
             limit: usize::MAX,
             follow_links: false,
+            time_budget_ms: opts.time_budget_ms,
+            no_ignore: opts.no_ignore,
         },
         |e| {
             if std::time::Instant::now() > deadline {
@@ -132,7 +184,12 @@ pub fn grep(root: &FsPath, opts: &GrepOpts) -> Result<GrepResult, String> {
                 truncated = true;
                 return VisitControl::Stop;
             }
-            if e.is_dir || e.size == 0 || e.size > opts.max_file_size {
+            if e.is_dir || e.size == 0 {
+                return VisitControl::Continue;
+            }
+            if e.size > opts.max_file_size {
+                files_skipped_large += 1;
+                largest_skipped = largest_skipped.max(e.size);
                 return VisitControl::Continue;
             }
             // e.path 是相对搜索根的路径；根为单文件时直接使用根路径。
@@ -145,22 +202,18 @@ pub fn grep(root: &FsPath, opts: &GrepOpts) -> Result<GrepResult, String> {
                 Ok(p) => p,
                 Err(_) => return VisitControl::Continue,
             };
-            let bytes = match crate::io::read_bytes(&fp.wide()) {
-                Ok(b) => b,
-                Err(_) => return VisitControl::Continue,
+            // 二进制判定、文档抽取、末尾换行处理统一走 load_search_lines，
+            // 保证串行与并行结果一致。
+            scanned += 1;
+            let lines = match load_search_lines(&fp) {
+                Some(l) => l,
+                None => return VisitControl::Continue,
             };
             if std::time::Instant::now() > deadline {
                 timed_out = true;
                 truncated = true;
                 return VisitControl::Stop;
             }
-            // 二进制判定：前 8KB 里有 NUL
-            if bytes[..bytes.len().min(8192)].contains(&0) {
-                return VisitControl::Continue;
-            }
-            scanned += 1;
-            let doc = text::decode(&bytes);
-            let lines: Vec<&str> = doc.text.split('\n').collect();
             let mut eligible_in_file = 0usize;
             let mut selected = Vec::new();
 
@@ -214,7 +267,8 @@ pub fn grep(root: &FsPath, opts: &GrepOpts) -> Result<GrepResult, String> {
                     hits.push(Hit {
                         path: e.path.clone(),
                         line: index + 1,
-                        text: trim_line(lines[index]),
+                        // 命中行按命中位置开窗；上下文行没有命中，从行首截断。
+                        text: trim_line_at(&lines[index], is_match[index].then_some(&re)),
                         is_context: !is_match[index],
                     });
                 }
@@ -237,6 +291,8 @@ pub fn grep(root: &FsPath, opts: &GrepOpts) -> Result<GrepResult, String> {
         omitted_per_file,
         truncated,
         timed_out,
+        files_skipped_large,
+        largest_skipped,
     })
 }
 
@@ -275,20 +331,13 @@ fn scan_parallel_file(
         Ok(fp) => fp,
         Err(_) => return out,
     };
-    let bytes = match crate::io::read_bytes(&fp.wide()) {
-        Ok(bytes) => bytes,
-        Err(_) => return out,
-    };
-    if std::time::Instant::now() > deadline {
-        out.timed_out = true;
-        return out;
-    }
-    if bytes[..bytes.len().min(8192)].contains(&0) {
-        return out;
-    }
+    // 二进制判定、文档抽取、末尾换行处理统一走 load_search_lines，
+    // 与串行路径保持完全一致。
     out.scanned = true;
-    let doc = text::decode(&bytes);
-    let lines: Vec<&str> = doc.text.split('\n').collect();
+    let lines = match load_search_lines(&fp) {
+        Some(l) => l,
+        None => return out,
+    };
     let mut eligible = 0usize;
     let mut selected = Vec::new();
     for (index, raw) in lines.iter().enumerate() {
@@ -327,8 +376,11 @@ fn scan_parallel_file(
         let last = (selected[selected.len() - 1] + opts.context).min(lines.len() - 1);
         for index in first..=last {
             if in_snippet[index] {
-                out.entries
-                    .push((index + 1, trim_line(lines[index]), is_match[index]));
+                out.entries.push((
+                    index + 1,
+                    trim_line_at(&lines[index], is_match[index].then_some(re)),
+                    is_match[index],
+                ));
             }
         }
     }
@@ -350,11 +402,15 @@ fn grep_parallel(root: &FsPath, opts: &GrepOpts, re: &Regex) -> Result<GrepResul
             omitted_per_file: 0,
             truncated: true,
             timed_out: true,
+            files_skipped_large: 0,
+            largest_skipped: 0,
         });
     }
 
     let mut entries = Vec::new();
     let mut timed_out = false;
+    let mut files_skipped_large = 0usize;
+    let mut largest_skipped = 0u64;
     let report = walk::visit(
         root,
         &opts.glob,
@@ -362,15 +418,23 @@ fn grep_parallel(root: &FsPath, opts: &GrepOpts, re: &Regex) -> Result<GrepResul
             include_dirs: false,
             limit: 100_000,
             follow_links: false,
+            time_budget_ms: opts.time_budget_ms,
+            no_ignore: opts.no_ignore,
         },
         |entry| {
             if std::time::Instant::now() > deadline {
                 timed_out = true;
                 return VisitControl::Stop;
             }
-            if entry.size > 0 && entry.size <= opts.max_file_size {
-                entries.push(entry);
+            if entry.size == 0 {
+                return VisitControl::Continue;
             }
+            if entry.size > opts.max_file_size {
+                files_skipped_large += 1;
+                largest_skipped = largest_skipped.max(entry.size);
+                return VisitControl::Continue;
+            }
+            entries.push(entry);
             VisitControl::Continue
         },
     )?;
@@ -490,16 +554,60 @@ fn grep_parallel(root: &FsPath, opts: &GrepOpts, re: &Regex) -> Result<GrepResul
         omitted_per_file,
         truncated,
         timed_out,
+        files_skipped_large,
+        largest_skipped,
     })
 }
 
-fn trim_line(s: &str) -> String {
+/// 把过长行裁到 200 字符；命中位置靠后时围绕命中开窗，否则模型看到的全是填充字符，
+/// 反而必须再读一次文件才能确认命中内容。
+fn trim_line_at(s: &str, needle: Option<&Regex>) -> String {
     let t = s.trim_end();
-    if t.chars().count() > 200 {
-        format!("{}…", t.chars().take(200).collect::<String>())
-    } else {
-        t.to_string()
+    let chars: Vec<char> = t.chars().collect();
+    if chars.len() <= 200 {
+        return t.to_string();
     }
+    // 找到命中在行内的字符位置，以它为中心取窗口。
+    let center = needle
+        .and_then(|re| re.find(t))
+        .map(|m| t[..m.start()].chars().count())
+        .unwrap_or(0);
+    const HALF: usize = 90;
+    let start = center
+        .saturating_sub(HALF)
+        .min(chars.len().saturating_sub(200));
+    let end = (start + 200).min(chars.len());
+    let body: String = chars[start..end].iter().collect();
+    match (start, end < chars.len()) {
+        (0, true) => format!("{body}…"),
+        (0, false) => body,
+        (_, true) => format!("…{body}…"),
+        (_, false) => format!("…{body}"),
+    }
+}
+
+/// 把一个文件读成可搜索的行列表。
+///
+/// 串行与并行两条扫描路径共用这个函数：否则任何一处修复（二进制判定、
+/// 文档抽取、末尾换行处理）都会只改到一条路径，导致串行/并行结果分叉。
+/// 返回 `None` 表示跳过该文件（二进制、抽取失败、读取失败）。
+fn load_search_lines(fp: &FsPath) -> Option<Vec<String>> {
+    let bytes = crate::io::read_bytes(&fp.wide()).ok()?;
+    // 二进制判定：前 8KB 里有 NUL。DOCX/PDF 是压缩包或二进制，改走正文抽取。
+    let format = crate::documents::format_of(fp.native());
+    if format.is_none() && bytes[..bytes.len().min(8192)].contains(&0) {
+        return None;
+    }
+    let content = match format {
+        Some(format) => crate::documents::extract_bytes(format, &bytes).ok()?,
+        None => text::decode(&bytes).text,
+    };
+    // 末尾换行不产生额外行，避免 context 输出幽灵空行。
+    let mut lines: Vec<String> = content.split('\n').map(str::to_string).collect();
+    if lines.len() > 1 && lines[lines.len() - 1].is_empty() {
+        lines.pop();
+    }
+    Some(lines)
 }
 
 /// 按文件分组渲染：路径只出现一次。
@@ -559,7 +667,13 @@ pub fn render_mode(r: &GrepResult, output: GrepOutput, budget: usize) -> GrepRen
                     }
                     j += 1;
                 }
-                let line = format!("{path}:{count}\n");
+                // `path:N` 与 rg -c 同形，容易被读成"该文件共 N 处命中"。
+                // 受 limit 截断时本页数字只是可见数，必须标出来。
+                let line = if r.truncated {
+                    format!("{path}:{count}(本页可见，未扫完)\n")
+                } else {
+                    format!("{path}:{count}\n")
+                };
                 if text.len() + line.len() > budget {
                     truncated = true;
                     break;
@@ -632,6 +746,203 @@ mod tests {
     use std::fs;
 
     #[test]
+    fn count模式截断时标注本页可见() {
+        // `path:N` 与 rg -c 同形；受 limit 截断时 N 只是本页可见数，
+        // 不标注会被读成"该文件共 N 处命中"。
+        let dir = std::env::temp_dir().join(format!("fsops-count-trunc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("many.txt"), "needle\n".repeat(50)).unwrap();
+        let root = FsPath::parse(&dir.to_string_lossy()).unwrap();
+        let opts = GrepOpts {
+            pattern: "needle".to_string(),
+            limit: 10,
+            ..Default::default()
+        };
+        let truncated = grep(&root, &opts).unwrap();
+        let full = grep(&root, &GrepOpts { limit: 100, ..opts }).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+
+        let a = render_mode(&truncated, GrepOutput::Count, 8192).text;
+        assert!(a.contains("many.txt:10"), "{a}");
+        assert!(a.contains("本页可见"), "截断时必须标注: {a}");
+
+        let b = render_mode(&full, GrepOutput::Count, 8192).text;
+        assert!(b.contains("many.txt:50"), "{b}");
+        assert!(!b.contains("本页可见"), "未截断不应标注: {b}");
+    }
+
+    #[test]
+    fn 能匹配空串的模式被拒绝() {
+        // `^`、`$`、`a*`、`.*`、`\b` 会命中每一行：返回 100 行"命中"但零信息量，
+        // 还会让模型误以为文件内容真的含有该串。
+        let dir = std::env::temp_dir().join(format!("fsops-empty-pat-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("a.txt"), "line1\nline2\n").unwrap();
+        let root = FsPath::parse(&dir.to_string_lossy()).unwrap();
+        for pat in ["^", "$", "a*", ".*", "(x)?", r"\b", r"\d*"] {
+            let result = grep(
+                &root,
+                &GrepOpts {
+                    pattern: pat.to_string(),
+                    ..Default::default()
+                },
+            );
+            let err = match result {
+                Ok(_) => panic!("空匹配模式 {pat} 应被拒绝"),
+                Err(e) => e,
+            };
+            assert!(err.starts_with("E_BAD_REGEX"), "{pat}: {err}");
+            assert!(err.contains("空位置"), "{pat}: {err}");
+        }
+        // 合法锚点模式不受影响
+        let ok = grep(
+            &root,
+            &GrepOpts {
+                pattern: "^line1".to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(ok.hits.len(), 1, "合法锚点应正常工作");
+    }
+
+    #[test]
+    fn 长行命中在中间时围绕命中开窗() {
+        // 压缩后的 JS 常见：单行几千字符，命中在中间。
+        // 若从行首截断，模型看到的全是填充字符，必须再读一次文件。
+        let dir = std::env::temp_dir().join(format!("fsops-window-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let line = format!("var a={};FINDME;{};", "Q".repeat(3000), "R".repeat(3000));
+        fs::write(dir.join("bundle.min.js"), format!("{line}\n")).unwrap();
+        let root = FsPath::parse(&dir.to_string_lossy()).unwrap();
+        let r = grep(
+            &root,
+            &GrepOpts {
+                pattern: "FINDME".to_string(),
+                context: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(r.hits.len(), 1, "应命中一次");
+        let text = &r.hits[0].text;
+        assert!(text.contains("FINDME"), "命中词必须在可见窗口内: {text}");
+        // 窗口两侧都应标出省略
+        assert!(text.starts_with('…'), "前方被截断应有省略号: {text}");
+        assert!(text.ends_with('…'), "后方被截断应有省略号: {text}");
+        // 长度仍受控
+        assert!(
+            text.chars().count() <= 202,
+            "窗口不应超过 200 字符: {}",
+            text.chars().count()
+        );
+    }
+
+    #[test]
+    fn 长行命中在开头时不加前导省略号() {
+        let dir = std::env::temp_dir().join(format!("fsops-window2-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let line = format!("FINDME{}", "Z".repeat(3000));
+        fs::write(dir.join("head.txt"), format!("{line}\n")).unwrap();
+        let root = FsPath::parse(&dir.to_string_lossy()).unwrap();
+        let r = grep(
+            &root,
+            &GrepOpts {
+                pattern: "FINDME".to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        let text = &r.hits[0].text;
+        assert!(text.starts_with("FINDME"), "命中在开头应原样显示: {text}");
+        assert!(!text.starts_with('…'), "不应加前导省略号: {text}");
+        assert!(text.ends_with('…'), "{text}");
+    }
+
+    #[test]
+    fn 上下文不输出末尾幽灵空行() {
+        let tmp = std::env::temp_dir().join(format!("fsops-ctx-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        // 文件只有一行且以换行结尾；context=1 不应产生第 2 行空上下文
+        fs::write(tmp.join("one.txt"), "NEEDLE here\n").unwrap();
+        let root = FsPath::parse(&tmp.to_string_lossy()).unwrap();
+        let r = grep(
+            &root,
+            &GrepOpts {
+                pattern: "NEEDLE".to_string(),
+                context: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let _ = fs::remove_dir_all(&tmp);
+        let rendered = render(&r);
+        assert!(!rendered.contains("2-"), "不应有幽灵空上下文行: {rendered}");
+        assert_eq!(r.hits.len(), 1, "只有一行命中: {rendered}");
+    }
+
+    #[test]
+    fn glob写法误用正则时给出提示() {
+        let dir = std::env::temp_dir().join(format!("fsops-regex-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "x\n").unwrap();
+        let root = FsPath::parse(&dir.to_string_lossy()).unwrap();
+        let result = grep(
+            &root,
+            &GrepOpts {
+                pattern: "*.txt".to_string(),
+                ..Default::default()
+            },
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let err = match result {
+            Ok(_) => panic!("非法 glob 写法应报错"),
+            Err(e) => e,
+        };
+        assert!(err.starts_with("E_BAD_REGEX"), "{err}");
+        assert!(err.contains("是正则不是 glob"), "{err}");
+        assert!(err.contains(r".*\.txt"), "应给出正确等价写法: {err}");
+    }
+
+    #[test]
+    fn 默认跳过依赖目录但可显式关闭忽略() {
+        let dir = std::env::temp_dir().join(format!("fsops-ni-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("node_modules/pkg")).unwrap();
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join("node_modules/pkg/c.js"), "x\n").unwrap();
+        fs::write(dir.join("src/a.rs"), "x\n").unwrap();
+        fs::write(dir.join(".gitignore"), "node_modules/\n").unwrap();
+        let root = FsPath::parse(&dir.to_string_lossy()).unwrap();
+
+        let opts = WalkOpts {
+            limit: 100,
+            ..Default::default()
+        };
+        let (entries, _) = walk::glob_with_report(&root, "**/*.js", &opts).unwrap();
+        assert!(entries.is_empty(), "默认应跳过 node_modules");
+
+        let opts = WalkOpts {
+            limit: 100,
+            no_ignore: true,
+            ..Default::default()
+        };
+        let (entries, _) = walk::glob_with_report(&root, "**/*.js", &opts).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(entries.len(), 1, "no_ignore 后应能看到依赖源码");
+        assert!(entries[0].path.contains("node_modules"));
+    }
+
+    #[test]
     fn 搜索命中并按文件分组() {
         let tmp = std::env::temp_dir().join(format!("fsops-grep-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
@@ -653,6 +964,52 @@ mod tests {
         let text = render(&r);
         assert!(text.contains("2:    let x = 1;"));
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn 并行与串行在边界文件上结果一致() {
+        // 两条路径现在共用 load_search_lines；这个测试防止它们再次分叉。
+        // 覆盖：CRLF、空文件、无末尾换行、中文、二进制（应跳过）。
+        let tmp = std::env::temp_dir().join(format!("fsops-par-edge-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(tmp.join("plain.txt"), "needle here\n").unwrap();
+        fs::write(tmp.join("crlf.txt"), "needle crlf\r\n").unwrap();
+        fs::write(tmp.join("empty.txt"), "").unwrap();
+        fs::write(tmp.join("nonl.txt"), "needle no trailing").unwrap();
+        fs::write(tmp.join("cn.txt"), "中文 needle\n").unwrap();
+        fs::write(tmp.join("bin.dat"), b"\x89PNG\r\n\x1a\n\x00\x00needle\x00").unwrap();
+        let root = FsPath::parse(&tmp.to_string_lossy()).unwrap();
+
+        let mut mismatches = Vec::new();
+        for output in [
+            GrepOutput::Files,
+            GrepOutput::Count,
+            GrepOutput::Matches,
+            GrepOutput::Snippets,
+        ] {
+            let base = GrepOpts {
+                pattern: "needle".to_string(),
+                context: 2,
+                ..Default::default()
+            };
+            let serial = grep(&root, &base).unwrap();
+            let parallel = grep(
+                &root,
+                &GrepOpts {
+                    parallel: true,
+                    ..base
+                },
+            )
+            .unwrap();
+            let a = render_mode(&serial, output, 8192);
+            let b = render_mode(&parallel, output, 8192);
+            if a.text != b.text {
+                mismatches.push(format!("{output:?}: 串行={:?} 并行={:?}", a.text, b.text));
+            }
+        }
+        let _ = fs::remove_dir_all(&tmp);
+        assert!(mismatches.is_empty(), "串行/并行结果分叉: {mismatches:?}");
     }
 
     #[test]
@@ -819,6 +1176,8 @@ mod tests {
             omitted_per_file: 0,
             truncated: false,
             timed_out: false,
+            files_skipped_large: 0,
+            largest_skipped: 0,
         };
 
         let rendered = render_mode(&r, GrepOutput::Files, 4096);
@@ -857,6 +1216,8 @@ mod tests {
             omitted_per_file: 0,
             truncated: false,
             timed_out: false,
+            files_skipped_large: 0,
+            largest_skipped: 0,
         };
 
         let rendered = render_mode(&r, GrepOutput::Count, 4096);
@@ -995,6 +1356,8 @@ mod tests {
             omitted_per_file: 0,
             truncated: false,
             timed_out: false,
+            files_skipped_large: 0,
+            largest_skipped: 0,
         }
     }
 }

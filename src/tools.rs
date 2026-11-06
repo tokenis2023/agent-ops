@@ -17,14 +17,15 @@ pub fn tool_defs() -> Vec<Value> {
     vec![
         json!({
             "name": "fs_read",
-            "description": "读取文件（POSIX 路径）。默认只返回前 12KB 并给出续读方式；支持行范围、多文件、自动识别 GBK/UTF-16/BOM 与 CRLF。",
+            "description": "读取文件。优先用本工具替代宿主 read_file/cat/head/tail/Get-Content。默认只返回前 12KB 并给出续读方式；支持行范围、多文件、DOCX/PDF 正文、自动识别 GBK/UTF-16/BOM 与 CRLF。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "文件路径，如 /d/repo/app/src/main.rs"},
                     "paths": {"type": "array", "items": {"type": "string"}, "description": "一次读多个文件（最多 20 个）"},
                     "start": {"type": "integer", "description": "起始行（1 基）"},
-                    "end": {"type": "integer", "description": "结束行（含）"},
+                    "end": {"type": "integer", "description": "结束行（含）；用 block=true 时可省略"},
+                    "block": {"type": "boolean", "description": "返回包含 start 行的整个代码块（自动向前找块起始、向后配平结束）；配合 fs_grep 的行号用，命中行在函数内部也能展开"},
                     "ranges": {
                         "type": "array",
                         "description": "单文件多段行区间，如 [[1,2],[8,9]]；优先于 start/end",
@@ -43,7 +44,7 @@ pub fn tool_defs() -> Vec<Value> {
         }),
         json!({
             "name": "fs_edit",
-            "description": "精确替换文本（old→new）。同文件多处用 edits，多文件用 files；全部预检通过才写入。自动处理 CRLF/LF 差异并保留原编码；失败时返回最接近的行号与内容。",
+            "description": "精确替换文本（old→new）。优先替代 patch/Edit/apply_patch。同文件多处用 edits，多文件用 files；全部预检通过才写入。自动处理 CRLF/LF 差异并保留原编码；DOCX 不支持精确替换，请用 fs_write 整体重建。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -56,7 +57,9 @@ pub fn tool_defs() -> Vec<Value> {
                             "properties": {
                                 "old": {"type": "string", "description": "原文片段（需唯一，除非 all=true）"},
                                 "new": {"type": "string", "description": "替换内容，空串表示删除"},
-                                "all": {"type": "boolean", "description": "替换全部出现位置"}
+                                "all": {"type": "boolean", "description": "替换全部出现位置"},
+                                "start": {"type": "integer", "description": "限定替换只发生在第 start..=end 行内（1 基）；配合 all=true 只改某个函数内的重复字面量"},
+                                "end": {"type": "integer", "description": "行范围结束行（含）；省略表示到文件末尾"}
                             },
                             "required": ["old"]
                         }
@@ -83,21 +86,22 @@ pub fn tool_defs() -> Vec<Value> {
         }),
         json!({
             "name": "fs_write",
-            "description": "写入文件（原子替换、自动建目录、保留原有编码与换行风格）。适合新建文件或整体覆盖。",
+            "description": "写入文件。优先替代 write_file/Write。原子替换、自动建目录、保留原有编码与换行风格；文本外也支持生成 DOCX（纯文本段落，整体重建）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
                     "content": {"type": "string"},
                     "normalize_eol": {"type": "boolean", "description": "新文件或原文件为混合换行时，显式归一为 LF；已有稳定文件始终沿用原换行"},
-                    "expect_hash": {"type": "string", "description": "并发保护：文件已变则拒绝覆盖"}
+                    "expect_hash": {"type": "string", "description": "并发保护：文件已变则拒绝覆盖"},
+                    "dry_run": {"type": "boolean", "description": "只做路径/编码/换行/hash 预检，不创建也不覆盖文件"}
                 },
                 "required": ["path", "content"]
             }
         }),
         json!({
             "name": "fs_glob",
-            "description": "按 glob 找文件（尊重 .gitignore，自动跳过 node_modules/target 等）。默认只给路径，detail=true 附大小与时间。",
+            "description": "按 glob 找文件。优先替代 find/Glob/Get-ChildItem。尊重 .gitignore，自动跳过 node_modules/target 等。默认只给路径，detail=true 附大小与时间。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -106,6 +110,8 @@ pub fn tool_defs() -> Vec<Value> {
                     "dirs": {"type": "boolean", "description": "是否包含目录"},
                     "detail": {"type": "boolean", "description": "是否附大小与修改时间（默认只给路径，省 token）"},
                     "limit": {"type": "integer", "description": "最多返回条数，默认 200；达到后提前停止"},
+                    "time_budget_ms": {"type": "integer", "description": "目录遍历时间预算，默认 5000 毫秒；超时返回已找到结果并标注"},
+                    "no_ignore": {"type": "boolean", "description": "忽略 .gitignore 与 node_modules/target 等默认跳过项；只在明确要查依赖源码或构建产物时用"},
                     "budget": {"type": "integer", "description": "最终响应最多字节数，默认 8192"}
                 },
                 "required": []
@@ -113,7 +119,7 @@ pub fn tool_defs() -> Vec<Value> {
         }),
         json!({
             "name": "fs_grep",
-            "description": "正则流式搜索文件内容并按文件稳定分组。output 可选 files/count/matches/snippets；截断时返回 next_offset。",
+            "description": "正则流式搜索。优先替代 grep/rg/Select-String。按文件稳定分组，支持文本和 DOCX/PDF 正文，output 可选 files/count/matches/snippets；截断时返回 next_offset。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -132,14 +138,15 @@ pub fn tool_defs() -> Vec<Value> {
                     "offset": {"type": "integer", "description": "跳过前 N 个命中，用于 next_offset 续取"},
                     "parallel": {"type": "boolean", "description": "大仓库并行扫描；输出与串行一致，默认 false"},
                     "budget": {"type": "integer", "description": "最终响应最多字节数，默认 8192"},
-                    "time_budget_ms": {"type": "integer", "description": "文件与目录遍历总时间预算，默认 5000 毫秒"}
+                    "time_budget_ms": {"type": "integer", "description": "文件与目录遍历总时间预算，默认 5000 毫秒"},
+                    "no_ignore": {"type": "boolean", "description": "忽略 .gitignore 与 node_modules/target 等默认跳过项；只在明确要搜依赖源码时用"}
                 },
                 "required": ["pattern"]
             }
         }),
         json!({
             "name": "fs_stat",
-            "description": "查看路径元信息：类型、大小、修改时间、换行风格、编码、内容指纹。",
+            "description": "查看路径元信息。优先替代 stat/ls/Get-Item。返回类型、大小、修改时间、换行风格、编码、内容指纹。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -155,6 +162,179 @@ pub fn tool_defs() -> Vec<Value> {
             }
         }),
     ]
+}
+
+fn read_document(
+    fp: &FsPath,
+    format: crate::documents::Format,
+) -> Result<crate::documents::Extracted, String> {
+    let bytes = io::read_bytes(&fp.wide())?;
+    let text = crate::documents::extract_bytes(format, &bytes)?;
+    Ok(crate::documents::Extracted {
+        text,
+        size: bytes.len() as u64,
+        hash: io::hash_hex(&bytes),
+    })
+}
+
+/// 合并重叠或相邻的区间：重叠的 ranges 会把同一批行输出多次，纯属浪费 token。
+/// 保持调用方给定的先后顺序（乱序 ranges 仍按原顺序输出）。
+fn merge_ranges(ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (from, to) in ranges {
+        // 只与已输出的区间比较；乱序时不做全局排序，保持用户预期。
+        if let Some(last) = out.last_mut() {
+            if from <= last.1 {
+                last.1 = last.1.max(to);
+                continue;
+            }
+            if from == last.1 + 1 {
+                last.1 = to;
+                continue;
+            }
+        }
+        out.push((from, to));
+    }
+    out
+}
+
+/// 求多个 POSIX 路径的公共目录前缀（含结尾 `/`）；没有公共目录时返回 None。
+fn common_dir_prefix(paths: &[String]) -> Option<String> {
+    if paths.len() < 2 {
+        return None;
+    }
+    let first = paths.first()?;
+    let mut cut = first.rfind('/')?;
+    for p in &paths[1..] {
+        let mut i = 0;
+        let bytes_a = first.as_bytes();
+        let bytes_b = p.as_bytes();
+        while i < cut && i < p.len() && bytes_a[i] == bytes_b[i] {
+            i += 1;
+        }
+        cut = cut.min(i);
+    }
+    if cut == 0 {
+        return None;
+    }
+    let prefix = &first[..cut];
+    // 收尾到最后一个 `/`，保证前缀是完整的目录
+    let trimmed = prefix.rfind('/').map(|i| &prefix[..=i])?;
+    if trimmed.len() <= 1 {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// 估算某一行完整渲染需要多少字节，用于在 E_LINE_TOO_LONG 里给出可执行的 budget 数值。
+fn line_need_bytes(text: &str, line_no: usize) -> usize {
+    text.split('\n')
+        .nth(line_no.saturating_sub(1))
+        .map(|l| l.trim_end_matches('\r').len())
+        .unwrap_or(0)
+}
+
+/// 找到包含 `start` 行的整个代码块，返回 (起始行, 结束行)，均 1 基。
+///
+/// 两种情形：
+/// - `start` 行自己开启一个跨行块 → 就是它本身（保持原有行为）
+/// - `start` 行在块内部（grep 的典型输出）→ 向前找最近的未闭合 `{` 所在行
+///
+/// 找不到时不猜测，调用方退回普通 start/end 语义。
+fn enclosing_block(lines: &[&str], start: usize) -> Option<(usize, usize)> {
+    // 情形一：本行开启跨行块。单行内自平衡（如字符串里有 `{hash}`）不算开启。
+    if let Some(end) = block_end(lines, start) {
+        if end > start {
+            return Some((start, end));
+        }
+    }
+    // 情形二：向前扫描。反向统计花括号，第一个"未闭合的 {" 就是块起始行。
+    let idx = start.checked_sub(1)?;
+    if idx == 0 {
+        return None;
+    }
+    let mut acc: i64 = 0;
+    let mut opener = None;
+    for i in (0..idx).rev() {
+        let line = lines[i];
+        let opens = line.matches('{').count() as i64;
+        let closes = line.matches('}').count() as i64;
+        acc += closes - opens;
+        if acc < 0 {
+            opener = Some(i + 1); // 转回 1 基
+            break;
+        }
+    }
+    let from = opener?;
+    let to = block_end(lines, from)?;
+    if to < start {
+        return None;
+    }
+    Some((from, to))
+}
+
+/// 从起始行按括号配平推算代码块的结束行。
+///
+/// 模型从 `fs_grep` 得知"fn foo 在第 N 行"后，无法预知函数有多长：
+/// 猜小了要重读，猜大了浪费字节。这个函数让 `fs_read block=true` 直接给出边界。
+/// 只对花括号语言有意义；找不到配平或起始行没有 `{` 时返回 None，调用方退回原逻辑。
+fn block_end(lines: &[&str], start: usize) -> Option<usize> {
+    let idx = start.checked_sub(1)?;
+    let first = lines.get(idx)?;
+    // 起始行必须开启一个块；否则（如纯声明、注释）不做猜测。
+    if !first.contains('{') {
+        return None;
+    }
+    let mut depth: i64 = 0;
+    let mut opened = false;
+    for (offset, line) in lines[idx..].iter().enumerate() {
+        // 跳过字符串与注释里的花括号是过度工程；按常见格式化代码足够准。
+        for ch in line.chars() {
+            match ch {
+                '{' => {
+                    depth += 1;
+                    opened = true;
+                }
+                '}' => depth -= 1,
+                _ => {}
+            }
+        }
+        if opened && depth <= 0 {
+            return Some(start + offset);
+        }
+        // 防御：超过 2000 行还没闭合，说明判断不可靠。
+        if offset > 2000 {
+            return None;
+        }
+    }
+    None
+}
+
+fn format_label(format: crate::documents::Format) -> &'static str {
+    match format {
+        crate::documents::Format::Docx => "docx",
+        crate::documents::Format::Pdf => "pdf",
+    }
+}
+
+/// 行数：空文件算 0 行，末尾换行不额外算一行。
+/// 旧实现用 `split('\n').count()`，空文件会报“1行”，让模型误以为有内容。
+fn line_count(text: &str) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+    let mut lines = text.split('\n').count();
+    if text.ends_with('\n') {
+        lines -= 1;
+    }
+    lines
+}
+
+fn doc_format_error(format: crate::documents::Format) -> &'static str {
+    match format {
+        crate::documents::Format::Docx => "E_DOCX",
+        crate::documents::Format::Pdf => "E_PDF",
+    }
 }
 
 fn arg_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
@@ -174,7 +354,63 @@ fn arg_bool(args: &Value, key: &str, default: bool) -> bool {
     args.get(key).and_then(Value::as_bool).unwrap_or(default)
 }
 
+/// 参数类型的中文名，用于给出可执行的错误信息。
+fn type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "布尔值",
+        Value::Number(_) => "数字",
+        Value::String(_) => "字符串",
+        Value::Array(_) => "数组",
+        Value::Object(_) => "对象",
+    }
+}
+
+/// 按 schema 校验参数类型。
+///
+/// 为什么必须有：类型写错时旧代码会用 `unwrap_or(default)` 静默退回默认值，
+/// 模型以为参数生效了却得到不同行为——这比直接报错危险得多。
+fn validate_args(name: &str, args: &Value) -> Option<String> {
+    let def = tool_defs().into_iter().find(|d| d["name"] == name)?;
+    let props = def["inputSchema"]["properties"].as_object()?;
+    let obj = args.as_object()?;
+    for (key, value) in obj {
+        let Some(spec) = props.get(key) else { continue };
+        let wanted = spec["type"].as_str().unwrap_or("");
+        let ok = match wanted {
+            "string" => value.is_string(),
+            "integer" | "number" => value.is_u64() || value.is_i64() || value.is_f64(),
+            "boolean" => value.is_boolean(),
+            "array" => value.is_array(),
+            "object" => value.is_object(),
+            _ => true,
+        };
+        if !ok {
+            let expected = match wanted {
+                "string" => "字符串",
+                "integer" | "number" => "数字",
+                "boolean" => "布尔值",
+                "array" => "数组",
+                "object" => "对象",
+                other => other,
+            };
+            return Some(format!(
+                "E_BAD_ARGS {}.{} 需要{}，收到 {}",
+                name,
+                key,
+                expected,
+                type_name(value)
+            ));
+        }
+    }
+    None
+}
+
 pub fn call(name: &str, args: &Value) -> String {
+    // 参数类型写错必须报错，不能静默退回默认值。
+    if let Some(err) = validate_args(name, args) {
+        return err;
+    }
     match name {
         "fs_read" => read(args),
         "fs_edit" => edit_tool(args),
@@ -187,7 +423,8 @@ pub fn call(name: &str, args: &Value) -> String {
 }
 
 fn read(args: &Value) -> String {
-    let budget = arg_usize(args, "budget", render::DEFAULT_BUDGET);
+    let budget_explicit = args.get("budget").is_some();
+    let mut budget = arg_usize(args, "budget", render::DEFAULT_BUDGET);
     let mut targets: Vec<String> = Vec::new();
     if let Some(p) = arg_str(args, "path") {
         targets.push(p.to_string());
@@ -200,7 +437,30 @@ fn read(args: &Value) -> String {
     if targets.is_empty() {
         return render::truncate_utf8("E_BAD_ARGS 需要 path 或 paths", budget).to_string();
     }
-    targets.truncate(20);
+    // 静默截断会让模型以为读到了全部文件；超上限必须显式拒绝。
+    if targets.len() > 20 {
+        return render::truncate_utf8(
+            &format!(
+                "E_BAD_ARGS 一次最多读 20 个文件，当前 {} 个；请分批读取，或改用 fs_grep 定位后只读命中文件",
+                targets.len()
+            ),
+            budget.max(200),
+        )
+        .to_string();
+    }
+    // 重复路径会让同一份内容在上下文里出现两次，纯属浪费 token。
+    let mut seen: Vec<String> = Vec::new();
+    targets.retain(|t| {
+        let key = FsPath::parse(t)
+            .map(|p| p.display())
+            .unwrap_or_else(|_| t.clone());
+        if seen.contains(&key) {
+            false
+        } else {
+            seen.push(key);
+            true
+        }
+    });
 
     let start = arg_usize(args, "start", 1);
     let end = args
@@ -234,12 +494,83 @@ fn read(args: &Value) -> String {
         if parsed.is_empty() {
             return render::truncate_utf8("E_BAD_ARGS ranges 不能为空", budget).to_string();
         }
-        parsed
+        merge_ranges(parsed)
     } else {
         vec![(start, end)]
     };
 
+    // 显式行区间是“要这些行”的契约；预算没显式给时，按行数估算，
+    // 避免 20 行中文被 12KB 字节预算截成十几行。仍保留 64KB 上限。
+    if !budget_explicit {
+        let requested_lines = if args.get("ranges").is_some() {
+            ranges
+                .iter()
+                .map(|(from, to)| to.saturating_sub(*from).saturating_add(1))
+                .sum()
+        } else if args.get("end").is_some() {
+            end.saturating_sub(start).saturating_add(1)
+        } else {
+            0
+        };
+        if requested_lines > 0 && requested_lines <= 500 {
+            let per_line = if max_line == 0 {
+                4096
+            } else {
+                max_line.saturating_mul(4).saturating_add(16)
+            };
+            budget = budget
+                .max(requested_lines.saturating_mul(per_line))
+                .min(64 * 1024);
+        }
+    }
+
+    // 多文件时每个文件至少要放得下一个文件头（约 80 字节）+ 几行正文。
+    // 否则会为每个文件各报一条 E_LINE_TOO_LONG，既没用又吃掉全部预算。
+    if targets.len() > 1 {
+        let per_file = budget / targets.len();
+        if per_file < 120 {
+            return render::truncate_utf8(
+                &format!(
+                    "E_BUDGET {} 个文件只有 {} 字节预算（每个约 {}），放不下文件头；请增大 budget 或分批读取",
+                    targets.len(),
+                    budget,
+                    per_file
+                ),
+                4096,
+            )
+            .to_string();
+        }
+    }
+
+    // 多文件且路径有公共目录时，只写一次前缀，各文件只显示剩余部分。
+    // 只在确实能省下可观字节时启用，避免给普通场景增加噪声。
+    let common_prefix = if targets.len() > 1 {
+        let shown: Vec<String> = targets
+            .iter()
+            .filter_map(|t| FsPath::parse(t).ok().map(|fp| fp.display().to_string()))
+            .collect();
+        let dir_prefix = common_dir_prefix(&shown);
+        // 只在前缀本身足够长（≥24 字符，约相当于两层以上真实目录）时才考虑省略。
+        // 这样 /d/code/fsops/src/ 这类常见仓库路径不会触发，
+        // 只有深层路径或长临时目录才启用，避免给普通场景增加噪声。
+        let worth = dir_prefix.as_ref().map(|p| p.len() >= 24).unwrap_or(false);
+        if worth {
+            dir_prefix
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let mut out = String::new();
+    // 超大文件分支内部已用 converge_budget 严格控制了长度；
+    // 标记后跳过最外层的二次硬切，否则会把续读参数 `end=` 切掉。
+    let mut budget_enforced = false;
+    // 用省略前缀时必须显式声明，否则 `== a.txt` 会被误读成相对当前目录。
+    if let Some(prefix) = &common_prefix {
+        out.push_str(&format!("… 以下路径省略公共前缀 {prefix}\n"));
+    }
     for (i, t) in targets.iter().enumerate() {
         // 每个后续结果（包括错误）都与前一文件正文分行。
         if i > 0 && !out.ends_with('\n') {
@@ -254,7 +585,10 @@ fn read(args: &Value) -> String {
         };
         // 超大文件流式读取：只加载一个连续行区间，hash 与总行数边扫边算。
         if let Ok(m) = io::meta(&fp) {
-            if m.kind == "file" && m.size > 32 * 1024 * 1024 {
+            if m.kind == "file"
+                && m.size > 32 * 1024 * 1024
+                && !crate::documents::is_document(fp.native())
+            {
                 if args.get("ranges").is_some() {
                     out.push_str(&format!(
                         "E_TOO_LARGE {} {}，超大文件一次只支持一个连续 start/end 区间\n",
@@ -265,7 +599,7 @@ fn read(args: &Value) -> String {
                 }
                 if end == usize::MAX {
                     out.push_str(&format!(
-                        "E_TOO_LARGE {} {}，请指定 end 后再按区间读取\n",
+                        "E_TOO_LARGE {} {}，超大文件一次只支持一个连续 start/end 区间；请先用 fs_grep 定位行号，再用 start/end 读取该区间\n",
                         fp.display(),
                         io::human_size(m.size)
                     ));
@@ -303,32 +637,54 @@ fn read(args: &Value) -> String {
                     window.total_lines,
                     window.hash
                 ));
+                // 已写入 out 的全部内容（含公共前缀声明、路径头、元信息）都要扣掉。
+                let header_len = out.len();
                 let want = if targets.len() > 1 {
                     (budget / targets.len().max(1)).saturating_sub(usize::from(i > 0))
                 } else {
                     budget
                 };
-                let target = render::converge_budget(want, |body_budget| {
+                // 文件头已经写进 out，必须从正文预算里扣掉，
+                // 否则正文按完整 budget 收敛，加上文件头就超了。
+                let want = want.saturating_sub(header_len);
+                // 尾注顺序很重要：续读参数最关键，必须优先占预算；
+                // 长行提示次要，放后面。若续读参数仍被挤压，下面会报 E_BUDGET，
+                // 而不是输出 `… 至 506/90001 行 | 续读: start=507 ` 这种缺 end 的碎片。
+                // 闭包返回「正文 + 尾注」整体，让 converge_budget 自己收敛。
+                // converge 保证返回值 ≤ budget，因此外层不必再硬切（硬切会吃掉 `end=`）。
+                // 尾部预留 8 字节余量：converge 按字节收敛，尾注中的多字节字符
+                // 可能让最后一轮刚好越过边界。
+                let mut rendered_last = 0usize;
+                let mut rendered_total = 0usize;
+                let mut line_cut = false;
+                let inner_budget = want.saturating_sub(8).max(1);
+                let target = render::converge_budget(inner_budget, |bb| {
                     let r = render::render_window(
                         &window.text,
                         RenderOpts {
                             start: 1,
                             end: window.lines,
-                            budget: body_budget,
+                            budget: bb,
                             max_line,
                             line_offset: window.first_line.saturating_sub(1),
                             ..Default::default()
                         },
                     );
+                    rendered_last = r.last_line;
+                    rendered_total = r.total_lines;
+                    line_cut = r.line_cut;
                     if r.body.is_empty() && !r.continuation.is_empty() {
+                        let line_no = window.first_line + r.continuation[0].0.saturating_sub(1);
+                        let need = line_need_bytes(&window.text, r.continuation[0].0);
                         return format!(
-                            "E_LINE_TOO_LONG 第 {} 行无法放入当前响应；请增大 budget 或调小 max_line",
-                            window.first_line + r.continuation[0].0.saturating_sub(1)
+                            "E_LINE_TOO_LONG 第 {} 行约 {} 字节，当前 budget={} 放不下；请设 max_line=0 并把 budget 提到至少 {}",
+                            line_no, need, bb, need + 200
                         );
                     }
                     let mut text = r.body;
-                    if r.last_line < r.total_lines {
-                        let absolute_last = window.first_line + r.last_line.saturating_sub(1);
+                    // 续读参数优先拼（预算紧张时最先保住它）。
+                    if rendered_last > 0 && rendered_last < rendered_total {
+                        let absolute_last = window.first_line + rendered_last.saturating_sub(1);
                         text.push_str(&format!(
                             "… 至 {}/{} 行 | 续读: start={} end={}\n",
                             absolute_last,
@@ -337,27 +693,82 @@ fn read(args: &Value) -> String {
                             end
                         ));
                     }
+                    if line_cut {
+                        let need = line_need_bytes(&window.text, 1);
+                        text.push_str(&format!(
+                            "… 有长行被截断；读全文用 max_line=0，并需 budget≈{}\n",
+                            need + 200
+                        ));
+                    }
                     text
                 });
-                if target.contains("续读:") && !target.contains(" end=") {
-                    out.push_str("E_BUDGET 续读参数被预算截断；请增大 budget\n");
+                // 兜底：续读参数被挤压时明确报错，不给缺 end 的碎片。
+                let broken = target.contains("续读:")
+                    && !(target.contains("start=") && target.contains("end="));
+                if broken {
+                    out.push_str(&format!(
+                        "E_BUDGET 续读参数被预算截断；请把 budget 提到至少 {}\n",
+                        want + 200
+                    ));
                 } else {
                     out.push_str(&target);
                 }
+                budget_enforced = true;
                 continue;
             }
         }
-        let snapshot = match io::read_snapshot(&fp) {
-            Ok(s) => s,
-            Err(e) => {
-                out.push_str(&format!("{e}\n"));
-                continue;
+        let snapshot = if let Some(format) = crate::documents::format_of(fp.native()) {
+            match read_document(&fp, format) {
+                Ok(doc) => io::Snapshot {
+                    bytes: Vec::new(),
+                    doc: crate::text::Doc {
+                        text: doc.text,
+                        encoding: format_label(format),
+                        eol: crate::text::Eol::Lf,
+                        bom: false,
+                        size: doc.size,
+                    },
+                    hash: doc.hash,
+                },
+                Err(e) => {
+                    out.push_str(&format!("{e}\n"));
+                    continue;
+                }
+            }
+        } else {
+            match io::read_snapshot(&fp) {
+                Ok(s) => s,
+                Err(e) => {
+                    out.push_str(&format!("{e}\n"));
+                    continue;
+                }
             }
         };
         let doc = &snapshot.doc;
-        let total_lines = doc.text.split('\n').count();
+        let total_lines = line_count(&doc.text);
+        // block=true：返回包含 start 行的整个代码块。
+        // grep 给出的行号通常在函数内部，直接按 start 展开只能拿到那一行；
+        // 这里先向外找到块起始行，再按括号配平确定结束行。
+        let per_file_ranges = if arg_bool(args, "block", false) && args.get("ranges").is_none() {
+            let lines: Vec<&str> = doc.text.split('\n').collect();
+            match enclosing_block(&lines, start) {
+                Some((from, to)) => vec![(from, to)],
+                None => ranges.clone(),
+            }
+        } else {
+            ranges.clone()
+        };
+        // 多文件时把公共目录前缀只写一次：深目录下 5 个文件能把 2KB 的路径开销
+        // 压到几百字节，而这些字节对模型判断毫无信息量。
         let mut header = if targets.len() > 1 {
-            format!("== {} ", fp.display())
+            match &common_prefix {
+                Some(prefix) => {
+                    let shown = fp.display().to_string();
+                    let rest = shown.strip_prefix(prefix.as_str()).unwrap_or(&shown);
+                    format!("== {rest} ")
+                }
+                None => format!("== {} ", fp.display()),
+            }
         } else {
             format!("{} ", fp.display())
         };
@@ -379,7 +790,7 @@ fn read(args: &Value) -> String {
             let mut target = header.clone();
             let r = render::render_ranges(
                 &doc.text,
-                &ranges,
+                &per_file_ranges,
                 RenderOpts {
                     budget: body_budget,
                     max_line,
@@ -387,12 +798,14 @@ fn read(args: &Value) -> String {
                 },
             );
             if r.body.is_empty() && !r.continuation.is_empty() {
+                let line_no = r.continuation[0].0;
+                let need = line_need_bytes(&doc.text, line_no);
                 return format!(
-                    "E_LINE_TOO_LONG 第 {} 行无法放入当前响应；请增大 budget 或调小 max_line",
-                    r.continuation[0].0
+                    "E_LINE_TOO_LONG 第 {} 行约 {} 字节，当前 budget={} 放不下；请设 max_line=0 并把 budget 提到至少 {}",
+                    line_no, need, body_budget, need + 200
                 );
             }
-            if r.body.is_empty() && r.continuation.is_empty() {
+            if r.body.is_empty() && r.continuation.is_empty() && r.total_lines > 0 {
                 return format!(
                     "E_RANGE {} 区间超出文件范围（共{}行）",
                     fp.display(),
@@ -400,10 +813,44 @@ fn read(args: &Value) -> String {
                 );
             }
             target.push_str(&r.body);
+            // 部分区间完全越界时明确提示，否则模型会以为那些行本来就不存在。
+            if let Some(raw) = args.get("ranges").and_then(Value::as_array) {
+                if r.total_lines > 0 {
+                    let dropped: Vec<String> = raw
+                        .iter()
+                        .filter_map(Value::as_array)
+                        .filter_map(|pair| {
+                            if pair.len() != 2 {
+                                return None;
+                            }
+                            let from = pair[0].as_u64()? as usize;
+                            let to = pair[1].as_u64()? as usize;
+                            (from > r.total_lines).then(|| format!("[{from},{to}]"))
+                        })
+                        .collect();
+                    if !dropped.is_empty() {
+                        target.push_str(&format!(
+                            "… 区间 {} 超出文件范围（共{}行），已跳过\n",
+                            dropped.join(" "),
+                            r.total_lines
+                        ));
+                    }
+                }
+            }
+            if r.line_cut {
+                // 每行都提示会白白吃掉预算，这里只说明一次。
+                // 同时给出真实成本：单行文件常达上百 KB，只说"用 max_line=0"
+                // 会让模型撞上 E_LINE_TOO_LONG。
+                let need = line_need_bytes(&doc.text, 1.max(r.first_line));
+                target.push_str(&format!(
+                    "… 有长行被截断；读全文用 max_line=0，并需 budget≈{}\n",
+                    need + 200
+                ));
+            }
             if !r.continuation.is_empty() {
                 target.push_str(&format!(
                     "… {}-{}/{} 行 | 续读: fs_read 同 path ",
-                    r.last_line.saturating_sub(9).max(1),
+                    r.first_line.max(1),
                     r.last_line,
                     r.total_lines,
                 ));
@@ -424,6 +871,10 @@ fn read(args: &Value) -> String {
             target
         });
         out.push_str(&target);
+    }
+    if budget_enforced {
+        // 超大文件路径自己已控制长度，不再二次硬切。
+        return out.trim_end().to_string();
     }
     render::truncate_utf8(out.trim_end(), budget).to_string()
 }
@@ -458,6 +909,236 @@ mod tests {
         ));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn 工具描述声明替代目标() {
+        let defs = tool_defs();
+        let desc = |name: &str| {
+            defs.iter()
+                .find(|d| d["name"] == name)
+                .and_then(|d| d["description"].as_str())
+                .unwrap_or("")
+        };
+        assert!(desc("fs_read").contains("替代宿主 read_file"));
+        assert!(desc("fs_edit").contains("替代 patch"));
+        assert!(desc("fs_write").contains("替代 write_file"));
+        assert!(desc("fs_glob").contains("替代 find"));
+        assert!(desc("fs_grep").contains("替代 grep"));
+        assert!(desc("fs_stat").contains("替代 stat"));
+    }
+
+    #[test]
+    fn 重叠区间合并后不重复输出() {
+        let path = 临时文本文件("1\n2\n3\n4\n5\n6\n7\n8\n");
+        let posix_path = path.to_string_lossy().replace('\\', "/");
+        let out = read(&json!({
+            "path": posix_path,
+            "ranges": [[1, 5], [3, 8]]
+        }));
+        // 合并成 1-8，每行只出现一次
+        for i in 1..=8 {
+            assert_eq!(
+                out.matches(&format!("{i}|")).count(),
+                1,
+                "第 {i} 行重复: {out}"
+            );
+        }
+        assert!(!out.contains("… 区间"), "合并后不应有越界提示: {out}");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn 部分区间越界时明确提示() {
+        let path = 临时文本文件("1\n2\n3\n");
+        let posix_path = path.to_string_lossy().replace('\\', "/");
+        let out = read(&json!({
+            "path": posix_path,
+            "ranges": [[1, 2], [100, 200]]
+        }));
+        assert!(out.contains("超出文件范围"), "越界区间应被提示: {out}");
+        assert!(out.contains("共3行"), "{out}");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn 编辑符号链接保留链接并修改目标() {
+        let dir = std::env::temp_dir().join(format!("fsops-link-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("real.txt");
+        let link = dir.join("link.txt");
+        fs::write(&real, "target content\n").unwrap();
+        #[cfg(windows)]
+        {
+            let ok = std::process::Command::new("cmd")
+                .args([
+                    "/c",
+                    "mklink",
+                    &link.to_string_lossy(),
+                    &real.to_string_lossy(),
+                ])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if !ok {
+                let _ = fs::remove_dir_all(&dir);
+                return; // 无权限建符号链接时跳过
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            if std::os::unix::fs::symlink(&real, &link).is_err() {
+                let _ = fs::remove_dir_all(&dir);
+                return;
+            }
+        }
+
+        let fp = FsPath::parse(&link.to_string_lossy()).unwrap();
+        io::atomic_write(&fp, b"viaLink content\n").unwrap();
+
+        let still_link = std::fs::symlink_metadata(&link)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
+        let real_text = fs::read_to_string(&real).unwrap_or_default();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(still_link, "符号链接被替换成了普通文件");
+        assert_eq!(real_text, "viaLink content\n", "目标文件未更新");
+    }
+
+    #[test]
+    fn 只读文件拒绝编辑并给原因() {
+        let path = 临时文本文件("line one\nline two\n");
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&path, perms).unwrap();
+        let posix_path = path.to_string_lossy().replace('\\', "/");
+        let out = edit_tool(&json!({
+            "path": posix_path,
+            "edits": [{"old": "line two", "new": "changed"}]
+        }));
+        // 恢复可写，否则临时文件删不掉
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        fs::set_permissions(&path, perms).unwrap();
+        let _ = fs::remove_file(path);
+        assert!(
+            out.starts_with("E_READONLY"),
+            "应明确报只读而不是 E_BATCH_PARTIAL: {out}"
+        );
+        assert!(!out.contains("E_BATCH_PARTIAL"));
+    }
+
+    #[test]
+    fn 截断尾注的行号范围与实际输出一致() {
+        let content = (1..=200)
+            .map(|i| format!("line{i} {}", "x".repeat(60)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let path = 临时文本文件(&content);
+        let posix_path = path.to_string_lossy().replace('\\', "/");
+        let out = read(&json!({
+            "path": posix_path,
+            "budget": 600
+        }));
+        let _ = fs::remove_file(path);
+
+        // 尾注必须写 1-<实际最后行>，不能按固定 10 行倒推
+        let note = out.lines().find(|l| l.contains("续读")).unwrap_or("");
+        assert!(note.starts_with("… 1-"), "起始行应为 1: {note}");
+        // 正文最后一行号必须与尾注结束行一致（尾注本身也含 `|`，要先排除）
+        let last_body = out
+            .lines()
+            .rev()
+            .find(|l| l.contains('|') && !l.starts_with('…'))
+            .unwrap_or("");
+        let line_no = last_body.split('|').next().unwrap_or("");
+        assert!(
+            note.contains(&format!("1-{line_no}/")),
+            "尾注 {note} 与正文末行 {line_no} 不一致"
+        );
+    }
+
+    #[test]
+    fn 空文件报零行而不是一行() {
+        let path = 临时文本文件("");
+        let posix_path = path.to_string_lossy().replace('\\', "/");
+        let out = read(&json!({"path": posix_path}));
+        assert!(out.contains(" 0B 0行 "), "空文件应报 0 行: {out}");
+        assert!(
+            !out.contains("1|\n") && !out.ends_with("1|"),
+            "不应输出空行内容: {out}"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn 重复路径只读一次() {
+        let path = 临时文本文件("x\n");
+        let posix_path = path.to_string_lossy().replace('\\', "/");
+        let out = read(&json!({"paths": [posix_path, posix_path]}));
+        assert_eq!(out.matches("1|x").count(), 1, "重复路径被读了两次: {out}");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn 稀疏零字节的小文件仍判为二进制() {
+        // 8 字节、仅 1 个 NUL：旧实现会误判成 UTF-16 文本。
+        assert!(crate::text::is_binary(b"ABC\x00\x01DEF"));
+        // 2 字节的 a\0 也无法证明是 UTF-16，按二进制拒绝更安全。
+        assert!(crate::text::is_binary(b"a\x00"));
+    }
+
+    #[test]
+    fn 二进制文件被拒绝当文本读写() {
+        let bin = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR".to_vec();
+        assert!(crate::text::is_binary(&bin));
+        assert!(!crate::text::is_binary("普通 UTF-8 文本".as_bytes()));
+        assert!(!crate::text::is_binary(&[]));
+        // UTF-16 文本天然含 NUL，不能误判成二进制
+        let utf16: Vec<u8> = "中文 abc"
+            .encode_utf16()
+            .flat_map(|u| u.to_le_bytes())
+            .collect();
+        assert!(!crate::text::is_binary(&utf16), "UTF-16 不应判为二进制");
+        // 纯中文的 UTF-16 带 BOM：字节流里几乎没有零字节，也必须认作文本
+        let mut cn_utf16 = vec![0xFF, 0xFE];
+        cn_utf16.extend(
+            "中文内容\n第二行\n"
+                .encode_utf16()
+                .flat_map(|u| u.to_le_bytes()),
+        );
+        assert!(
+            !crate::text::is_binary(&cn_utf16),
+            "带 BOM 的纯中文 UTF-16 不应判为二进制"
+        );
+        // UTF-8 BOM 同样应放行
+        let mut utf8_bom = vec![0xEF, 0xBB, 0xBF];
+        utf8_bom.extend("中文".as_bytes());
+        assert!(!crate::text::is_binary(&utf8_bom));
+    }
+
+    #[test]
+    fn 显式行区间自动按行数放宽预算() {
+        let content = (1..=20)
+            .map(|i| format!("第{i}行{}", "中".repeat(250)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let path = 临时文本文件(&content);
+        let posix_path = path.to_string_lossy().replace('\\', "/");
+        let all = read(&json!({"path": posix_path, "start": 1, "end": 20}));
+        assert!(
+            all.contains("20|"),
+            "20 行应完整返回: {}",
+            &all[..all.len().min(300)]
+        );
+        assert!(!all.contains("续读"), "行区间不应因默认预算截断");
+        let capped = read(&json!({
+            "path": posix_path, "start": 1, "end": 20, "budget": 2000
+        }));
+        assert!(capped.contains("续读"), "显式 budget 仍应生效");
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -515,16 +1196,32 @@ mod tests {
     }
 
     #[test]
-    fn 极小预算下错误响应也不超限() {
+    fn 极小预算下错误响应保持可解析() {
+        // 契约变更：错误消息不再被截成 `E_BAD_ARGS` 这样的碎片。
+        // 极小 budget 下仍保留能读懂错误的最短长度；正常内容仍严格受 budget 约束。
         for budget in 0..24 {
             let output = read(&json!({"budget": budget}));
+            assert!(output.starts_with("E_BAD_ARGS"), "{output}");
             assert!(
-                output.len() <= budget,
-                "budget={budget}，实际 {} 字节: {output}",
-                output.len()
+                output.len() >= 20,
+                "budget={budget} 时错误被截得无法解析: {output}"
             );
             assert!(std::str::from_utf8(output.as_bytes()).is_ok());
         }
+        // 非错误内容仍必须严格不超过 budget
+        let path = 临时文本文件("a\nb\nc\n");
+        let posix_path = path.to_string_lossy().replace('\\', "/");
+        for budget in [40, 80, 200] {
+            let output = read(&json!({"path": posix_path, "budget": budget}));
+            if !output.starts_with("E_") {
+                assert!(
+                    output.len() <= budget,
+                    "budget={budget}，内容超限 {} 字节: {output}",
+                    output.len()
+                );
+            }
+        }
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -585,6 +1282,563 @@ mod tests {
         assert!(output.starts_with("ok 2 个文件"), "{output}");
         assert_eq!(first_body, "changed\n");
         assert_eq!(second_body, "changed\nremoved\n");
+    }
+
+    #[test]
+    fn 参数类型错误给出可执行提示() {
+        // 类型写错时旧实现会静默退回默认值，模型以为生效却得到别的行为。
+        let path = 临时文本文件("a\nb\n");
+        let posix_path = path.to_string_lossy().replace('\\', "/");
+        let cases = [
+            (json!({"path": posix_path, "budget": "big"}), "需要数字"),
+            (json!({"path": posix_path, "start": "2"}), "需要数字"),
+            (json!({"path": 42}), "需要字符串"),
+        ];
+        for (args, want) in cases {
+            let out = call("fs_read", &args);
+            assert!(out.starts_with("E_BAD_ARGS"), "{out}");
+            assert!(out.contains(want), "缺少类型说明: {out}");
+        }
+        let _ = fs::remove_file(path);
+
+        let out = call(
+            "fs_write",
+            &json!({
+                "path": "/tmp/fsops-type-probe.txt",
+                "content": 123
+            }),
+        );
+        assert!(out.contains("content 需要字符串"), "{out}");
+    }
+
+    #[test]
+    fn 漏写new时拒绝而不是当作删除() {
+        // new 有默认值时，漏参数会静默变成"删除内容"，对 AI 是数据风险。
+        let path = 临时文本文件("keep me\n");
+        let posix_path = path.to_string_lossy().replace('\\', "/");
+        let out = edit_tool(&json!({
+            "path": posix_path,
+            "edits": [{"old": "keep me"}]
+        }));
+        let content = fs::read_to_string(&path).unwrap();
+        let _ = fs::remove_file(path);
+        assert!(out.starts_with("E_BAD_ARGS"), "应报参数错误: {out}");
+        assert!(out.contains("old 与 new"), "{out}");
+        assert_eq!(content, "keep me\n", "文件不应被改动");
+    }
+
+    #[test]
+    fn 同一行多处修改只算一次行数() {
+        // `+N -M` 表达"改动了几行"，不是"执行了几次替换"。
+        // 旧实现同一行改 3 处会报 +3 -3。
+        let dir = 临时目录("edit-same-line");
+        let f = dir.join("same.txt");
+        fs::write(&f, "fn foo(a: i32) -> i32 { a }\n").unwrap();
+        let fp = FsPath::parse(&f.to_string_lossy()).unwrap();
+        let out = edit_tool(&json!({
+            "path": fp.display(),
+            "edits": [
+                {"old": "foo", "new": "bar"},
+                {"old": "i32", "new": "u64", "all": true}
+            ]
+        }));
+        assert!(out.contains("3 处修改"), "替换次数仍是 3: {out}");
+        assert!(out.contains("(+1 -1)"), "只有 1 行变化: {out}");
+        assert!(out.contains("@ 1 "), "行号只标 1: {out}");
+
+        // 跨行 + 同行混合：a 拆成两行(+2 -1) + b 单行(+1 -1) = +3 -2
+        let m = dir.join("mix.txt");
+        fs::write(&m, "a\nb\nc\n").unwrap();
+        let fp = FsPath::parse(&m.to_string_lossy()).unwrap();
+        let out = edit_tool(&json!({
+            "path": fp.display(),
+            "edits": [
+                {"old": "a", "new": "A1\nA2"},
+                {"old": "b", "new": "B"}
+            ]
+        }));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(out.contains("(+3 -2)"), "跨行+同行应为 +3 -2: {out}");
+    }
+
+    #[test]
+    fn 差异统计反映真实行数变化() {
+        let dir = 临时目录("edit-diff");
+        // 单行替换：+1 -1，行号只标一个
+        let single = dir.join("single.txt");
+        fs::write(&single, "aaa\nbbb\nccc\n").unwrap();
+        let fp = FsPath::parse(&single.to_string_lossy()).unwrap();
+        let out = edit_tool(&json!({
+            "path": fp.display(),
+            "edits": [{"old": "bbb", "new": "XXX"}]
+        }));
+        assert!(out.contains("(+1 -1)"), "单行替换应为 +1 -1: {out}");
+        assert!(out.contains("@ 2 "), "行号应只标 2: {out}");
+
+        // 跨行合并：+1 -2
+        let merge = dir.join("merge.txt");
+        fs::write(&merge, "a\nb\nc\nd\n").unwrap();
+        let fp = FsPath::parse(&merge.to_string_lossy()).unwrap();
+        let out = edit_tool(&json!({
+            "path": fp.display(),
+            "edits": [{"old": "b\nc", "new": "BC"}]
+        }));
+        assert!(out.contains("(+1 -2)"), "两行合一应为 +1 -2: {out}");
+
+        // 一行拆成三行：+3 -1，行号区间 1-3
+        let split = dir.join("split.txt");
+        fs::write(&split, "a\nb\n").unwrap();
+        let fp = FsPath::parse(&split.to_string_lossy()).unwrap();
+        let out = edit_tool(&json!({
+            "path": fp.display(),
+            "edits": [{"old": "a", "new": "X\nY\nZ"}]
+        }));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(out.contains("(+3 -1)"), "一行拆三行应为 +3 -1: {out}");
+        assert!(out.contains("@ 1-3 "), "行号区间应为 1-3: {out}");
+    }
+
+    #[test]
+    fn 深路径多文件读取省略公共前缀() {
+        let deep = std::env::temp_dir().join("fsops-prefix-probe");
+        let mut dir = deep.clone();
+        for _ in 0..12 {
+            dir = dir.join("deep-directory-padding-segment");
+        }
+        let _ = fs::remove_dir_all(&deep);
+        fs::create_dir_all(&dir).unwrap();
+        let names = ["a.txt", "b.txt", "c.txt", "d.txt", "e.txt"];
+        let paths: Vec<String> = names
+            .iter()
+            .map(|n| {
+                let p = dir.join(n);
+                fs::write(&p, "content\n").unwrap();
+                FsPath::parse(&p.to_string_lossy())
+                    .unwrap()
+                    .display()
+                    .to_string()
+            })
+            .collect();
+
+        let out = read(&json!({ "paths": paths }));
+        // 浅路径（仓库 src 这类）不应触发省略
+        let shallow: Vec<String> = ["io.rs", "text.rs", "edit.rs"]
+            .iter()
+            .map(|n| {
+                let p = dir.join(n);
+                fs::write(&p, "content\n").unwrap();
+                FsPath::parse(&p.to_string_lossy())
+                    .unwrap()
+                    .display()
+                    .to_string()
+            })
+            .collect();
+        let _ = fs::remove_dir_all(&deep);
+
+        assert!(out.contains("省略公共前缀"), "深路径应省略公共前缀: {out}");
+        // 每个文件仍能看到自己的可辨识后缀，且正文完整
+        for n in names {
+            assert!(out.contains(n), "缺少 {n}: {out}");
+        }
+        assert!(out.contains("content"), "正文丢失: {out}");
+        // 单文件不省略
+        let single = read(&json!({ "path": shallow[0] }));
+        assert!(!single.contains("省略公共前缀"), "{single}");
+    }
+
+    #[test]
+    fn 参数超上限时显式拒绝而不是静默截断() {
+        // 静默截断会让模型以为处理了全部输入。
+        let dir = 临时目录("over-limit");
+        let mut many = Vec::new();
+        for i in 0..25 {
+            let p = dir.join(format!("f{i}.txt"));
+            fs::write(&p, "x\n").unwrap();
+            many.push(
+                FsPath::parse(&p.to_string_lossy())
+                    .unwrap()
+                    .display()
+                    .to_string(),
+            );
+        }
+        let out = read(&json!({ "paths": many, "budget": 4096 }));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(out.starts_with("E_BAD_ARGS"), "超上限应拒绝: {out}");
+        assert!(out.contains("最多读 20 个文件"), "{out}");
+        assert!(out.contains("当前 25 个"), "{out}");
+
+        // context 超上限不再静默夹到 5
+        let out = grep_tool(&json!({
+            "path": "/tmp",
+            "pattern": "x",
+            "context": 9
+        }));
+        assert!(out.starts_with("E_BAD_ARGS"), "{out}");
+        assert!(out.contains("context 最大 5"), "{out}");
+    }
+
+    #[test]
+    fn 多文件预算不足时给一条提示而不是逐文件报错() {
+        // 旧实现把预算平分后每个文件各报一条 E_LINE_TOO_LONG，
+        // 20 个文件会输出 348 字节的错误垃圾且被截成半截。
+        let dir = 临时目录("tiny-budget");
+        let mut files = Vec::new();
+        for i in 0..20 {
+            let p = dir.join(format!("f{i}.txt"));
+            fs::write(&p, format!("content{i}\n")).unwrap();
+            files.push(
+                FsPath::parse(&p.to_string_lossy())
+                    .unwrap()
+                    .display()
+                    .to_string(),
+            );
+        }
+        let out = read(&json!({ "paths": files, "budget": 400 }));
+        // 预算充足时可以正常读
+        let ok = read(&json!({ "paths": files, "budget": 5000 }));
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(out.starts_with("E_BUDGET"), "应给一条预算提示: {out}");
+        assert!(out.contains("放不下文件头"), "{out}");
+        assert_eq!(
+            out.matches("E_LINE_TOO_LONG").count(),
+            0,
+            "不应逐文件刷错误: {out}"
+        );
+        assert_eq!(ok.matches("E_LINE_TOO_LONG").count(), 0, "{ok}");
+        assert!(ok.contains("content0"), "预算充足应能读到内容");
+    }
+
+    #[test]
+    fn 读取失败时错误里带出具体路径() {
+        let dir = 临时目录("read-path-err");
+        let good = dir.join("good.txt");
+        let missing = dir.join("missing.txt");
+        fs::write(&good, "ok\n").unwrap();
+        let good_fp = FsPath::parse(&good.to_string_lossy()).unwrap();
+        let missing_fp = FsPath::parse(&missing.to_string_lossy()).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+
+        let err = read(&json!({ "path": missing_fp.display() }));
+        assert!(err.starts_with("E_READ"), "{err}");
+        assert!(
+            err.contains(&missing_fp.display().to_string()),
+            "错误必须带出具体路径: {err}"
+        );
+
+        // 多文件部分失败时也要能定位到失败的那个
+        let out = read(&json!({
+            "paths": [good_fp.display(), missing_fp.display()]
+        }));
+        assert!(
+            out.contains(&missing_fp.display().to_string()),
+            "多文件错误必须指明是哪个文件: {out}"
+        );
+    }
+
+    #[test]
+    fn 长行截断时提示一次全文读法() {
+        let content = "x".repeat(5000);
+        let path = 临时文本文件(&content);
+        let posix_path = path.to_string_lossy().replace('\\', "/");
+        let out = read(&json!({
+            "path": posix_path,
+            "max_line": 80
+        }));
+        // 不截断时不应有提示
+        let full = read(&json!({
+            "path": posix_path,
+            "max_line": 0
+        }));
+        let _ = fs::remove_file(path);
+
+        assert_eq!(
+            out.matches("max_line=0").count(),
+            1,
+            "截断提示只应出现一次: {out}"
+        );
+        assert!(out.contains("有长行被截断"), "{out}");
+        assert!(!full.contains("有长行被截断"), "未截断时不应提示: {full}");
+    }
+
+    #[test]
+    fn 每个声明参数都有对应实现分支() {
+        // 防止再出现「schema 声明了 dry_run 但代码没实现」或「实现了但模型看不到」。
+        // 这里只校验最容易漏的布尔/可选开关，必须同时出现在 schema 与参数读取里。
+        let src = include_str!("tools.rs");
+        let defs = tool_defs();
+        let mut problems = Vec::new();
+        for def in &defs {
+            let name = def["name"].as_str().unwrap_or("");
+            let props = def["inputSchema"]["properties"]
+                .as_object()
+                .cloned()
+                .unwrap_or_default();
+            for key in props.keys() {
+                // 实际调用形如 arg_bool(args, "dirs", false)，引号后跟逗号而不是右括号，
+                // 因此只匹配到引号为止。
+                let used = [
+                    format!("arg_str(args, \"{key}\""),
+                    format!("arg_bool(args, \"{key}\""),
+                    format!("arg_usize(args, \"{key}\""),
+                    format!("args.get(\"{key}\")"),
+                    format!("\"{key}\" =>"),
+                ]
+                .iter()
+                .any(|pat| src.contains(pat.as_str()))
+                    || key == "path"
+                    || key == "content"
+                    || key == "pattern"
+                    || key == "old"
+                    || key == "new"
+                    || key == "all";
+                if !used {
+                    problems.push(format!("{name}.{key}"));
+                }
+            }
+        }
+        assert!(
+            problems.is_empty(),
+            "schema 声明了但代码从未读取的参数: {problems:?}"
+        );
+        // 反向：dry_run 必须在 fs_write 与 fs_edit 的 schema 里可见
+        for tool in ["fs_write", "fs_edit"] {
+            let def = defs
+                .iter()
+                .find(|d| d["name"] == tool)
+                .unwrap_or_else(|| panic!("缺少 {tool}"));
+            assert!(
+                def["inputSchema"]["properties"]["dry_run"].is_object(),
+                "{tool} 的 schema 缺少 dry_run"
+            );
+        }
+    }
+
+    #[test]
+    fn 长行截断提示给出可执行的budget() {
+        // 只说"读全文用 max_line=0"是死路：单行文件常达上百 KB，
+        // 模型照做会撞上 E_LINE_TOO_LONG，然后在两条消息之间来回试。
+        let content = "var a=1;".repeat(20000); // 约 160KB 单行
+        let path = 临时文本文件(&content);
+        let posix_path = path.to_string_lossy().replace('\\', "/");
+
+        let default_out = read(&json!({"path": posix_path}));
+        let hint_out = read(&json!({"path": posix_path, "max_line": 0}));
+        let _ = fs::remove_file(path);
+
+        assert!(default_out.contains("有长行被截断"), "{default_out}");
+        assert!(
+            default_out.contains("budget≈"),
+            "尾注必须给出所需 budget: {default_out}"
+        );
+        assert!(hint_out.contains("E_LINE_TOO_LONG"), "{hint_out}");
+        assert!(
+            hint_out.contains("至少"),
+            "错误必须给出可执行的 budget 数值: {hint_out}"
+        );
+    }
+
+    #[test]
+    fn block参数按括号配平定位代码块() {
+        // 模型从 grep 得知行号后无法预知函数多长：猜小了要重读，猜大了浪费字节。
+        let content = "\
+fn outer() {
+    let x = 1;
+    if x > 0 {
+        println!(\"hi\");
+    }
+    let y = 2;
+}
+fn next_fn() {
+    let z = 3;
+}
+";
+        let path = 临时文本文件(content);
+        let posix_path = path.to_string_lossy().replace('\\', "/");
+        // 从第 1 行开始应定位到第 7 行（outer 的闭合括号）
+        let out = read(&json!({
+            "path": posix_path,
+            "start": 1,
+            "block": true,
+            "budget": 100000
+        }));
+        // grep 典型输出：命中行在函数内部（第 2 行是 let，没有 {），
+        // 应向外扩展到整个 outer，而不是只给这一行。
+        let inside = read(&json!({
+            "path": posix_path,
+            "start": 2,
+            "block": true,
+            "budget": 100000
+        }));
+        // 命中行在嵌套块内部（第 4 行在 if 里）→ 扩展为最近的 if 块
+        let nested = read(&json!({
+            "path": posix_path,
+            "start": 4,
+            "block": true,
+            "budget": 100000
+        }));
+        let _ = fs::remove_file(path);
+
+        let body: Vec<&str> = out.lines().filter(|l| l.contains('|')).collect();
+        assert_eq!(body.len(), 7, "应读到 outer 的 7 行: {out}");
+        assert!(body[6].starts_with("7|"), "末行应为第 7 行: {out}");
+        assert!(!out.contains("fn next_fn"), "不应越界到下一个函数: {out}");
+
+        let ib: Vec<&str> = inside.lines().filter(|l| l.contains('|')).collect();
+        assert_eq!(ib.len(), 7, "块内命中应扩展到整个 outer: {inside}");
+        assert!(
+            ib[0].starts_with("1|fn outer"),
+            "应从 outer 开头开始: {inside}"
+        );
+
+        let nb: Vec<&str> = nested.lines().filter(|l| l.contains('|')).collect();
+        assert_eq!(nb.len(), 3, "嵌套块内命中应扩展到最近的 if: {nested}");
+        assert!(nb[0].starts_with("3|"), "应从 if 行开始: {nested}");
+    }
+
+    #[test]
+    fn count模式默认不受limit截断() {
+        // count 是"统计"：受 limit=100 截断会得出错误数字（203 处被报成 100）。
+        let dir = std::env::temp_dir().join(format!("fsops-count-full-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("many.txt"), "needle\n".repeat(150)).unwrap();
+        let root = FsPath::parse(&dir.to_string_lossy()).unwrap();
+
+        // 默认（不传 limit）应给出完整的 150
+        let out = grep_tool(&json!({
+            "path": root.display(),
+            "pattern": "needle",
+            "output": "count"
+        }));
+        // 显式 limit=100 仍截断并标注
+        let capped = grep_tool(&json!({
+            "path": root.display(),
+            "pattern": "needle",
+            "output": "count",
+            "limit": 100
+        }));
+        // matches 模式默认仍受 limit 约束
+        let matches = grep_tool(&json!({
+            "path": root.display(),
+            "pattern": "needle",
+            "output": "matches"
+        }));
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(
+            out.contains("many.txt:150"),
+            "默认 count 应给完整数字: {out}"
+        );
+        assert!(!out.contains("本页可见"), "未截断不应标注: {out}");
+        assert!(capped.contains("本页可见"), "显式 limit 仍应标注: {capped}");
+        assert!(
+            matches.contains("next_offset"),
+            "matches 仍受 limit 约束: {matches}"
+        );
+    }
+
+    #[test]
+    fn glob预算截断时说明已给多少条() {
+        // 只报"输出截断"而不说给了多少/共多少，模型无法判断要不要继续。
+        let dir = std::env::temp_dir().join(format!("fsops-glob-trunc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        for i in 0..120 {
+            fs::write(dir.join(format!("file-with-name-{i:03}.txt")), "x").unwrap();
+        }
+        let root = FsPath::parse(&dir.to_string_lossy()).unwrap();
+        let out = glob_tool(&json!({
+            "path": root.display(),
+            "pattern": "*.txt",
+            "limit": 500,
+            "budget": 900
+        }));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(out.contains("输出截断"), "{out}");
+        assert!(out.contains("已给"), "应说明已给多少条: {out}");
+        assert!(out.contains("120"), "应给出总匹配数: {out}");
+    }
+
+    #[test]
+    fn 写入目录时报目录错误而不是拒绝访问() {
+        // 旧实现会在 rename 阶段报 `E_RENAME 拒绝访问`，模型看不出真正原因。
+        let dir = 临时目录("write-to-dir");
+        let fp = FsPath::parse(&dir.to_string_lossy()).unwrap();
+        let out = write(&json!({
+            "path": fp.display(),
+            "content": "x\n"
+        }));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(out.starts_with("E_IS_DIR"), "应报目录错误: {out}");
+        assert!(out.contains("是目录"), "{out}");
+        assert!(!out.contains("E_RENAME"), "不应泄漏底层 rename 错误: {out}");
+    }
+
+    #[test]
+    fn 符号链接stat报出目标与大小() {
+        // 链接自身 size 是 0；只报 0B 会让模型以为目标文件是空的。
+        let dir = 临时目录("stat-link");
+        let real = dir.join("real.txt");
+        let link = dir.join("link.txt");
+        fs::write(&real, "content\n").unwrap();
+        let made = std::process::Command::new("cmd")
+            .args([
+                "/c",
+                "mklink",
+                &link.to_string_lossy(),
+                &real.to_string_lossy(),
+            ])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !made {
+            let _ = fs::remove_dir_all(&dir);
+            return; // 无权限建符号链接时跳过
+        }
+        let fp = FsPath::parse(&link.to_string_lossy()).unwrap();
+        let out = stat(&json!({ "path": fp.display(), "detail": "full" }));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(out.contains(" link "), "应标记为 link: {out}");
+        assert!(out.contains("->"), "应给出目标: {out}");
+        // 目标大小必须出现（链接自身是 0B，目标是 8B）
+        let after_arrow = out.split("->").nth(1).unwrap_or("");
+        assert!(after_arrow.contains('B'), "箭头后应给出目标大小: {out}");
+        assert!(!out.contains("//?/"), "不应泄漏长路径前缀: {out}");
+    }
+
+    #[test]
+    fn 写入dry_run不落盘() {
+        let dir = std::env::temp_dir().join(format!("fsops-wdry-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let keep = dir.join("keep.txt");
+        fs::write(&keep, "IMPORTANT DATA\n").unwrap();
+        let fp = FsPath::parse(&keep.to_string_lossy()).unwrap();
+
+        let out = write(&json!({
+            "path": fp.display(),
+            "content": "CLOBBERED\n",
+            "dry_run": true
+        }));
+        assert!(out.starts_with("ok dry_run"), "{out}");
+        assert_eq!(
+            fs::read_to_string(&keep).unwrap(),
+            "IMPORTANT DATA\n",
+            "dry_run 不应改动已有文件"
+        );
+
+        let fresh = dir.join("brand-new.txt");
+        let fp2 = FsPath::parse(&fresh.to_string_lossy()).unwrap();
+        let out = write(&json!({
+            "path": fp2.display(),
+            "content": "hi\n",
+            "dry_run": true
+        }));
+        let created = fresh.exists();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(out.starts_with("ok dry_run"), "{out}");
+        assert!(!created, "dry_run 不应创建新文件");
     }
 
     #[test]
@@ -669,6 +1923,41 @@ mod tests {
     }
 
     #[test]
+    fn 超大文件续读尾注不被预算截断() {
+        // 大区间强制截断：尾注必须同时含 start= 和 end=，
+        // 且总长度不超 budget（此前会出现 `续读: start=112` 缺 end 的碎片）。
+        use std::io::Write;
+        let dir = 临时目录("read-large-note");
+        let path = dir.join("large.txt");
+        let line = format!("{}\n", "y".repeat(1023));
+        let mut file = fs::File::create(&path).unwrap();
+        for _ in 0..34_000 {
+            file.write_all(line.as_bytes()).unwrap();
+        }
+        file.sync_all().unwrap();
+        drop(file);
+
+        let mut problems = Vec::new();
+        for budget in [700usize, 1000, 2000, 2048] {
+            let out = read(&json!({
+                "path": path.to_string_lossy(),
+                "start": 100,
+                "end": 2000,
+                "max_line": 50,
+                "budget": budget
+            }));
+            if out.len() > budget {
+                problems.push(format!("budget={budget} 超限 {} 字节", out.len()));
+            }
+            if out.contains("续读") && !(out.contains("start=") && out.contains("end=")) {
+                problems.push(format!("budget={budget} 续读参数被截断: {out}"));
+            }
+        }
+        fs::remove_dir_all(dir).unwrap();
+        assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    #[test]
     fn 读取区间完全越界时给出错误() {
         let path = 临时文本文件("one\ntwo\nthree\n");
         let posix_path = path.to_string_lossy().replace('\\', "/");
@@ -677,7 +1966,7 @@ mod tests {
 
         assert!(output.starts_with("E_RANGE"), "{output}");
         assert!(
-            output.contains("超出文件范围") && output.contains("共4行"),
+            output.contains("超出文件范围") && output.contains("共3行"),
             "{output}"
         );
     }
@@ -1083,7 +2372,11 @@ mod tests {
             !output.contains("next_offset"),
             "空页不得推进 offset: {output}"
         );
-        assert!(output.len() <= 30, "预算超限: {output}");
+        // 错误消息保证可解析，因此按 ERROR_MIN_BUDGET 而非原始 budget 判定
+        assert!(
+            output.len() <= crate::render::ERROR_MIN_BUDGET.max(30),
+            "预算超限: {output}"
+        );
     }
 
     #[test]
@@ -1202,13 +2495,14 @@ mod tests {
     }
 
     #[test]
-    fn grep极小预算下错误响应也不超限() {
+    fn grep极小预算下错误响应保持可解析() {
+        // 契约变更：错误消息保留能读懂的最短长度，不再被截成 `E_BAD_ARGS`。
         for budget in 0..24 {
             let output = grep_tool(&json!({ "budget": budget }));
+            assert!(output.starts_with("E_BAD_ARGS"), "{output}");
             assert!(
-                output.len() <= budget,
-                "budget={budget}，实际 {} 字节: {output}",
-                output.len()
+                output.len() >= 20,
+                "budget={budget} 时错误被截得无法解析: {output}"
             );
             assert!(std::str::from_utf8(output.as_bytes()).is_ok());
         }
@@ -1234,6 +2528,32 @@ mod tests {
         let paths: Vec<&str> = r.hits.iter().map(|hit| hit.path.as_str()).collect();
         assert_eq!(paths, vec!["B.txt", "a.txt"], "文件顺序不稳定: {paths:?}");
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn grep_报告被跳过的大文件() {
+        let tmp = std::env::temp_dir().join(format!("fsops-grep-large-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(tmp.join("small.txt"), "needle\n").unwrap();
+        let big = "x".repeat(9 * 1024 * 1024);
+        fs::write(tmp.join("big.log"), &big).unwrap();
+
+        let root = FsPath::parse(&tmp.to_string_lossy()).unwrap();
+        let r = crate::search::grep(
+            &root,
+            &GrepOpts {
+                pattern: "needle".into(),
+                limit: 10,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let _ = fs::remove_dir_all(&tmp);
+
+        assert_eq!(r.match_count, 1, "只有小文件命中");
+        assert_eq!(r.files_skipped_large, 1, "大文件必须被计数而不是静默跳过");
+        assert!(r.largest_skipped >= 9 * 1024 * 1024);
     }
 
     #[test]
@@ -1301,8 +2621,27 @@ struct EditRequest {
 }
 
 fn parse_edits(value: &Value) -> Result<Vec<EditSpec>, String> {
-    let edits: Vec<EditSpec> = serde_json::from_value(value.clone())
-        .map_err(|e| format!("E_BAD_ARGS edits 解析失败: {e}"))?;
+    // 参数错误要给出可执行的修法，而不是漏出 serde 内部诊断。
+    let edits: Vec<EditSpec> = serde_json::from_value(value.clone()).map_err(|e| {
+        if value.is_null() {
+            "E_BAD_ARGS 缺少 edits；需要 [{\"old\":\"原文\",\"new\":\"替换\"}, ...]".to_string()
+        } else if let Some(list) = value.as_array() {
+            let bad = list.iter().position(|item| {
+                item.get("old").and_then(Value::as_str).is_none()
+                    || item.get("new").and_then(Value::as_str).is_none()
+            });
+            match bad {
+                Some(i) => format!(
+                    "E_BAD_ARGS edits[{}] 必须同时有字符串 old 与 new；当前={}",
+                    i,
+                    list.get(i).map(|v| v.to_string()).unwrap_or_default()
+                ),
+                None => format!("E_BAD_ARGS edits 解析失败: {e}"),
+            }
+        } else {
+            "E_BAD_ARGS edits 必须是数组，每项形如 {\"old\":\"原文\",\"new\":\"替换\"}".to_string()
+        }
+    })?;
     if edits.is_empty() {
         return Err("E_BAD_ARGS edits 不能为空".into());
     }
@@ -1316,6 +2655,19 @@ fn prepare_edit(
     expect_hash: Option<&str>,
     normalize_eol: bool,
 ) -> Result<PreparedEdit, String> {
+    // 写前预检：只读文件在 rename 阶段才会失败，提前拒绝并给出原因，
+    // 避免把“一处都没写”误报成 E_BATCH_PARTIAL。
+    if fp
+        .native()
+        .metadata()
+        .map(|m| m.permissions().readonly())
+        .unwrap_or(false)
+    {
+        return Err(format!(
+            "E_READONLY {} 是只读文件；先去掉只读属性再编辑",
+            fp.display()
+        ));
+    }
     let io::Snapshot { doc, hash, .. } = io::read_snapshot(fp)?;
     let eol = if doc.eol == crate::text::Eol::Mixed {
         if normalize_eol {
@@ -1382,6 +2734,13 @@ fn edit_tool(args: &Value) -> String {
                 Ok(fp) => fp,
                 Err(e) => return format!("E_BATCH {path}: E_BAD_PATH {e}"),
             };
+            if let Some(format) = crate::documents::format_of(fp.native()) {
+                return format!(
+                    "{} 不支持精确替换 {}；请用 fs_write 整体重建",
+                    doc_format_error(format),
+                    fp.display()
+                );
+            }
             let shown = fp.display();
             if seen.contains(&shown) {
                 return format!("E_BATCH 重复路径 {shown}；同一文件请合并到一组 edits");
@@ -1413,6 +2772,13 @@ fn edit_tool(args: &Value) -> String {
             Ok(fp) => fp,
             Err(e) => return format!("E_BAD_PATH {e}"),
         };
+        if let Some(format) = crate::documents::format_of(fp.native()) {
+            return format!(
+                "{} 不支持精确替换 {}；请用 fs_write 整体重建",
+                doc_format_error(format),
+                fp.display()
+            );
+        }
         requests.push(EditRequest {
             path: path.to_string(),
             fp,
@@ -1516,7 +2882,16 @@ fn write(args: &Value) -> String {
     };
     let content = match args.get("content").and_then(Value::as_str) {
         Some(c) => c,
-        None => return "E_BAD_ARGS 缺少 content".into(),
+        // 类型写错时也要说清是类型问题，否则模型会以为漏传了参数而反复重试。
+        None => match args.get("content") {
+            Some(other) => {
+                return format!(
+                    "E_BAD_ARGS content 必须是字符串；当前是 {}",
+                    type_name(other)
+                )
+            }
+            None => return "E_BAD_ARGS 缺少 content".into(),
+        },
     };
     let fp = match FsPath::parse(path) {
         Ok(p) => p,
@@ -1527,9 +2902,47 @@ fn write(args: &Value) -> String {
         Err(e) => return e,
     };
 
+    // DOCX 只支持整体重建，不做文本编辑；这避免把 Word 的复杂格式静默拍平。
+    if let Some(format) = crate::documents::format_of(fp.native()) {
+        if format == crate::documents::Format::Pdf {
+            return format!(
+                "E_PDF 不支持写入 {}；PDF 目前只读，请生成新的 DOCX 或文本文件",
+                fp.display()
+            );
+        }
+        if let Some(expect) = arg_str(args, "expect_hash") {
+            if !fp.exists() {
+                return "E_STALE 目标文件不存在，无法校验 hash".into();
+            }
+            let bytes = match io::read_bytes(&fp.wide()) {
+                Ok(bytes) => bytes,
+                Err(e) => return e,
+            };
+            if io::hash_hex(&bytes) != expect {
+                return format!("E_STALE 文件已变化（当前 hash={}）", io::hash_hex(&bytes));
+            }
+        }
+        if arg_bool(args, "dry_run", false) {
+            return format!(
+                "ok dry_run: 将重建 DOCX {}（{}字符，未写入）",
+                fp.display(),
+                content.chars().count()
+            );
+        }
+        return match crate::documents::write_docx(&fp, content) {
+            Ok(out) => out,
+            Err(e) => e,
+        };
+    }
+
     // 已有文件：沿用其编码与换行风格，避免把 CRLF 仓库改成 LF
     let existing = if fp.exists() && !fp.is_dir() {
-        io::read_snapshot(&fp).ok()
+        // 不能吞掉 E_BINARY：二进制文件被当文本读回再写会直接毁掉内容。
+        match io::read_snapshot(&fp) {
+            Ok(snapshot) => Some(snapshot),
+            Err(e) if e.starts_with("E_BINARY") => return e,
+            Err(_) => None,
+        }
     } else {
         None
     };
@@ -1581,6 +2994,22 @@ fn write(args: &Value) -> String {
         None => content.as_bytes().to_vec(),
     };
 
+    if arg_bool(args, "dry_run", false) {
+        // 预检已完成（路径、编码、换行、hash），这里不落盘。
+        let note = if existing.is_some() {
+            "将覆盖已有文件"
+        } else {
+            "将新建文件"
+        };
+        return format!(
+            "ok dry_run: {} {} {}行 hash={}（{note}，未写入）",
+            fp.display(),
+            io::human_size(bytes.len() as u64),
+            line_count(content),
+            io::hash_hex(&bytes)
+        );
+    }
+
     if let Err(e) = io::atomic_write(&fp, &bytes) {
         return e;
     }
@@ -1588,7 +3017,7 @@ fn write(args: &Value) -> String {
         "ok 写入 {} {} {}行 hash={}",
         fp.display(),
         io::human_size(bytes.len() as u64),
-        content.split('\n').count(),
+        line_count(content),
         io::hash_hex(&bytes)
     )
 }
@@ -1609,23 +3038,65 @@ fn glob_tool(args: &Value) -> String {
         include_dirs: arg_bool(args, "dirs", false),
         limit,
         follow_links: false,
+        time_budget_ms: arg_usize(args, "time_budget_ms", 5000) as u128,
+        no_ignore: arg_bool(args, "no_ignore", false),
     };
-    match walk::glob(&root, pattern, &opts) {
-        Ok(entries) => {
+    match walk::glob_with_report(&root, pattern, &opts) {
+        Ok((entries, report)) => {
+            let timed_out = report.timed_out;
             if entries.is_empty() {
-                format!("ok 无匹配（{} pattern={pattern}）", root.display())
+                if timed_out {
+                    format!(
+                        "E_TIMEOUT 遍历 {} 用尽 {}ms 时间预算（已访问 {} 项），未找到匹配；\
+                         缩小 path 或加更具体的 pattern 再试",
+                        root.display(),
+                        opts.time_budget_ms,
+                        report.entries_visited
+                    )
+                } else {
+                    format!("ok 无匹配（{} pattern={pattern}）", root.display())
+                }
             } else {
                 let body = walk::render_entries(&entries, arg_bool(args, "detail", false));
                 let body = body.trim_end();
-                if body.len() <= budget {
-                    return body.to_string();
-                }
-                let marker = "\n… 输出截断：减小 limit 或添加 pattern";
-                let room = budget.saturating_sub(marker.len());
-                if room == 0 {
-                    return render::truncate_utf8(body, budget).to_string();
-                }
-                format!("{}{marker}", render::truncate_utf8(body, room))
+                let note = if timed_out {
+                    format!(
+                        "\n… 时间预算用尽（{}ms，已访问 {} 项），结果可能不完整",
+                        opts.time_budget_ms, report.entries_visited
+                    )
+                } else {
+                    String::new()
+                };
+                let allowed = budget.saturating_sub(note.len());
+                let rendered = if body.len() <= allowed {
+                    body.to_string()
+                } else {
+                    // 截断时说明"已输出多少 / 共多少"，否则模型无法判断
+                    // 是"全部就这些"还是"被切掉了很多"。
+                    let room = allowed.saturating_sub(80);
+                    let shown = if room == 0 {
+                        0
+                    } else {
+                        render::truncate_utf8(body, room).lines().count()
+                    };
+                    let marker = if report.stopped && entries.len() >= opts.limit {
+                        format!(
+                            "\n… 输出截断：已给 {shown} 条，limit={}；减小 detail、加 pattern 或增大 budget",
+                            opts.limit
+                        )
+                    } else {
+                        format!(
+                            "\n… 输出截断：已给 {shown} 条（共 {} 条匹配）；增大 budget",
+                            entries.len()
+                        )
+                    };
+                    if room == 0 {
+                        render::truncate_utf8(body, allowed).to_string()
+                    } else {
+                        format!("{}{marker}", render::truncate_utf8(body, room))
+                    }
+                };
+                format!("{rendered}{note}")
             }
         }
         Err(e) => e,
@@ -1654,15 +3125,28 @@ fn grep_tool(args: &Value) -> String {
         }
     };
     let context = match args.get("context").and_then(Value::as_u64) {
+        Some(value) if value > 5 => {
+            // 静默夹到 5 会让模型以为拿到了 9 行上下文；超限直接报错。
+            return render::truncate_utf8(
+                &format!("E_BAD_ARGS context 最大 5，当前 {value}"),
+                budget.max(120),
+            )
+            .to_string();
+        }
         Some(value) => value as usize,
         None if output == GrepOutput::Snippets => 2,
         None => 0,
-    }
-    .min(5);
-    let limit = arg_usize(args, "limit", 100);
+    };
+    let mut limit = arg_usize(args, "limit", 100);
     if limit == 0 {
         return render::truncate_utf8("E_BAD_ARGS limit 必须大于 0；省略表示默认 100", budget)
             .to_string();
+    }
+    // count 模式是"统计"，受 limit 截断会得出错误的数字
+    // （例如 203 处命中被 limit=100 截成 100）。它只有每个文件一行输出，
+    // 预算由 budget 兜底，因此不受 limit 约束。
+    if output == GrepOutput::Count && args.get("limit").is_none() {
+        limit = usize::MAX;
     }
     let root = match FsPath::parse(arg_str(args, "path").unwrap_or(".")) {
         Ok(p) => p,
@@ -1679,10 +3163,22 @@ fn grep_tool(args: &Value) -> String {
         budget,
         parallel: arg_bool(args, "parallel", false),
         time_budget_ms: arg_usize(args, "time_budget_ms", 5000) as u128,
+        no_ignore: arg_bool(args, "no_ignore", false),
         ..Default::default()
     };
     match search::grep(&root, &opts) {
         Ok(r) => {
+            // 大文件被跳过时必须回报，否则模型会把“没搜到”当成“不存在”。
+            let skip_note = if r.files_skipped_large > 0 {
+                format!(
+                    "\n… 跳过 {} 个超过 {} 的文件（最大 {}）：需要时用 fs_read 直接读取",
+                    r.files_skipped_large,
+                    io::human_size(opts.max_file_size),
+                    io::human_size(r.largest_skipped)
+                )
+            } else {
+                String::new()
+            };
             if r.hits.is_empty() {
                 if r.timed_out {
                     return render::truncate_utf8(
@@ -1709,7 +3205,7 @@ fn grep_tool(args: &Value) -> String {
                     return render::truncate_utf8(&text, budget).to_string();
                 }
                 return render::truncate_utf8(
-                    &format!("ok 无命中（扫描 {} 个文件）", r.files_scanned),
+                    &format!("ok 无命中（扫描 {} 个文件）{}", r.files_scanned, skip_note),
                     budget,
                 )
                 .to_string();
@@ -1721,6 +3217,9 @@ fn grep_tool(args: &Value) -> String {
                 rendered_matches = rendered.matches_rendered;
                 render_cut = rendered.truncated;
                 let mut text = rendered.text.trim_end().to_string();
+                if !skip_note.is_empty() {
+                    text.push_str(&skip_note);
+                }
                 if r.timed_out {
                     text.push_str(&format!(
                         "\n… 时间预算用尽（已扫 {} 个文件）：缩小 path 或加 glob 再试",
@@ -1796,6 +3295,51 @@ fn stat(args: &Value) -> String {
                 ));
                 continue;
             }
+            if let Some(format) = crate::documents::format_of(fp.native()) {
+                let doc = match read_document(&fp, format) {
+                    Ok(doc) => doc,
+                    Err(e) => {
+                        out.push_str(&format!("{e}\n"));
+                        continue;
+                    }
+                };
+                if detail == "hash" {
+                    out.push_str(&format!(
+                        "{} file {} {} {} LF {} hash={}\n",
+                        fp.display(),
+                        io::human_size(m.size),
+                        io::fmt_time(m.mtime),
+                        format_label(format),
+                        if m.readonly { "ro" } else { "rw" },
+                        doc.hash
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "{} file {} {} {} LF {} {}行 hash={}\n",
+                        fp.display(),
+                        io::human_size(m.size),
+                        io::fmt_time(m.mtime),
+                        format_label(format),
+                        if m.readonly { "ro" } else { "rw" },
+                        line_count(&doc.text),
+                        doc.hash
+                    ));
+                }
+                continue;
+            }
+            if let Ok(bytes) = io::read_bytes(&fp.wide()) {
+                if crate::text::is_binary(&bytes) {
+                    out.push_str(&format!(
+                        "{} file {} {} binary {} hash={}\n",
+                        fp.display(),
+                        io::human_size(m.size),
+                        io::fmt_time(m.mtime),
+                        if m.readonly { "ro" } else { "rw" },
+                        io::hash_hex(&bytes)
+                    ));
+                    continue;
+                }
+            }
             match io::read_snapshot(&fp) {
                 Ok(snapshot) => {
                     let d = &snapshot.doc;
@@ -1819,7 +3363,7 @@ fn stat(args: &Value) -> String {
                             d.encoding,
                             d.eol.as_str(),
                             if m.readonly { "ro" } else { "rw" },
-                            d.text.split('\n').count(),
+                            line_count(&d.text),
                             snapshot.hash
                         ));
                     }
@@ -1831,13 +3375,25 @@ fn stat(args: &Value) -> String {
                 )),
             }
         } else {
-            out.push_str(&format!(
-                "{} {} {} {}\n",
-                fp.display(),
-                m.kind,
-                io::human_size(m.size),
-                io::fmt_time(m.mtime)
-            ));
+            // 符号链接自身 size 是 0，只报 0B 会让模型以为目标文件是空的。
+            match &m.link {
+                Some((target, target_size)) => out.push_str(&format!(
+                    "{} {} {} {} -> {} {}\n",
+                    fp.display(),
+                    m.kind,
+                    io::human_size(m.size),
+                    io::fmt_time(m.mtime),
+                    target,
+                    io::human_size(*target_size)
+                )),
+                None => out.push_str(&format!(
+                    "{} {} {} {}\n",
+                    fp.display(),
+                    m.kind,
+                    io::human_size(m.size),
+                    io::fmt_time(m.mtime)
+                )),
+            }
         }
     }
     out.trim_end().to_string()
