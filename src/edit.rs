@@ -125,24 +125,37 @@ pub fn apply(original: &str, eol: Eol, edits: &[EditSpec]) -> Result<(String, Ed
                 .take(8)
                 .map(|p| line_of(&work, *p).to_string())
                 .collect();
+            // 同一行多处时行号重复，区分列号才能区分出是第几处。
+            let col_list: Vec<String> = positions
+                .iter()
+                .take(8)
+                .map(|p| col_of(&work, *p).to_string())
+                .collect();
             // 前几处附上下文片段：模型不必再 fs_read 就能构造出唯一的 old。
             let rows: Vec<&str> = work.split('\n').collect();
             let mut snippets = String::new();
             for p in positions.iter().take(3) {
                 let hit = line_of(&work, *p);
+                let col = col_of(&work, *p);
                 let from = hit.saturating_sub(2).max(1);
                 let to = (hit + 2).min(rows.len());
                 for n in from..=to {
                     let text = rows.get(n - 1).copied().unwrap_or("");
-                    snippets.push_str(&format!("\n  {n}|{}", snippet_line(text)));
+                    let text = if n == hit {
+                        mark_column(text, col)
+                    } else {
+                        snippet_line(text)
+                    };
+                    snippets.push_str(&format!("\n  {n}|{}", text));
                 }
                 snippets.push('\n');
             }
             return Err(format!(
-                "E_AMBIGUOUS 第{}处匹配到 {} 个位置（行 {}）；加更多上下文，或设 all=true 全部替换，或用 start/end 限定行范围{}",
+                "E_AMBIGUOUS 第{}处匹配到 {} 个位置（行 {} 列 {}）；加更多上下文，或设 all=true 全部替换，或用 start/end 限定行范围{}",
                 i + 1,
                 positions.len(),
                 line_list.join(","),
+                col_list.join(","),
                 snippets
             ));
         }
@@ -471,6 +484,31 @@ fn col_of(s: &str, pos: usize) -> usize {
     s[..pos].rfind('\n').map(|i| pos - i).unwrap_or(pos + 1)
 }
 
+/// 在片段中的命中行上标出列号：不改变行内容，在命中列下加一个 ^ 指针行。
+fn mark_column(text: &str, col: usize) -> String {
+    let base = snippet_line(text);
+    let shown_len = base.chars().count();
+    if col > shown_len || col == 0 {
+        return base;
+    }
+    let mut out = String::new();
+    let mut current = 0usize;
+    for ch in base.chars() {
+        current += 1;
+        if current == col {
+            out.push('^');
+            break;
+        }
+        out.push(ch);
+    }
+    if current == col {
+        for ch in base.chars().skip(col) {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// 歧义片段里的单行截断：定位用，不需要完整长行。
 fn snippet_line(text: &str) -> String {
     const MAX_CHARS: usize = 160;
@@ -667,6 +705,7 @@ mod tests {
         let err = apply(src, Eol::Lf, &[spec("x();", "y();")]).unwrap_err();
         assert!(err.starts_with("E_AMBIGUOUS"));
         assert!(err.contains("1,2"));
+        assert!(err.contains("1,1"), "同行多处应带列号: {err}");
         // 附上下文片段：模型不必再 fs_read 就能构造出唯一的 old。
         assert!(err.contains("1|x();"), "应含命中行片段: {err}");
         assert!(err.contains("2|x();"), "应含命中行片段: {err}");
