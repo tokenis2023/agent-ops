@@ -52,17 +52,7 @@ pub fn tool_defs() -> Vec<Value> {
                     "edits": {
                         "type": "array",
                         "description": "单文件的修改列表",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "old": {"type": "string", "description": "原文片段（需唯一，除非 all=true）"},
-                                "new": {"type": "string", "description": "替换内容，空串表示删除"},
-                                "all": {"type": "boolean", "description": "替换全部出现位置"},
-                                "start": {"type": "integer", "description": "限定替换只发生在第 start..=end 行内（1 基）；配合 all=true 只改某个函数内的重复字面量"},
-                                "end": {"type": "integer", "description": "行范围结束行（含）；省略表示到文件末尾"}
-                            },
-                            "required": ["old"]
-                        }
+                        "items": edit_item_schema()
                     },
                     "files": {
                         "type": "array",
@@ -71,7 +61,7 @@ pub fn tool_defs() -> Vec<Value> {
                             "type": "object",
                             "properties": {
                                 "path": {"type": "string"},
-                                "edits": {"type": "array", "items": {"type": "object"}},
+                                "edits": {"type": "array", "items": edit_item_schema()},
                                 "expect_hash": {"type": "string", "description": "该文件的并发保护指纹"}
                             },
                             "required": ["path", "edits"]
@@ -308,6 +298,24 @@ fn block_end(lines: &[&str], start: usize) -> Option<usize> {
         }
     }
     None
+}
+
+/// `fs_edit` 单条修改的 schema。
+///
+/// `edits` 与 `files[].edits` 必须同形：分开手写会出现一处更新、另一处漂移，
+/// 模型在 `files` 里只能看到一个空对象，只能靠猜字段名。
+fn edit_item_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "old": {"type": "string", "description": "原文片段（需唯一，除非 all=true）"},
+            "new": {"type": "string", "description": "替换内容，空串表示删除"},
+            "all": {"type": "boolean", "description": "替换全部出现位置"},
+            "start": {"type": "integer", "description": "限定替换只发生在第 start..=end 行内（1 基）；配合 all=true 只改某个函数内的重复字面量"},
+            "end": {"type": "integer", "description": "行范围结束行（含）；省略表示到文件末尾"}
+        },
+        "required": ["old"]
+    })
 }
 
 fn format_label(format: crate::documents::Format) -> &'static str {
@@ -2229,6 +2237,31 @@ fn next_fn() {
             }
         }
         assert_eq!(continuation, expected_continuation, "{output}");
+    }
+
+    #[test]
+    fn edit_schema两处嵌套结构一致() {
+        // `edits` 与 `files[].edits` 分开手写会漂移；
+        // 嵌套处若只剩 {"type":"object"}，模型只能猜字段名。
+        let defs = tool_defs();
+        let edit = defs
+            .iter()
+            .find(|def| def["name"] == "fs_edit")
+            .expect("缺少 fs_edit");
+        let props = &edit["inputSchema"]["properties"];
+        let single = &props["edits"]["items"];
+        let nested = &props["files"]["items"]["properties"]["edits"]["items"];
+        assert_eq!(
+            single["properties"], nested["properties"],
+            "两处 items 必须同形"
+        );
+        assert_eq!(nested["required"], json!(["old"]));
+        for name in ["old", "new", "all", "start", "end"] {
+            assert!(
+                nested["properties"][name].is_object(),
+                "files[].edits 缺少字段 {name}"
+            );
+        }
     }
 
     #[test]

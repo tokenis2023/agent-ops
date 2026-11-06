@@ -48,6 +48,17 @@ pub fn is_document(path: &Path) -> bool {
 }
 
 pub fn extract_bytes(format: Format, bytes: &[u8]) -> Result<String, String> {
+    // 0 字节不是"格式损坏"，而是文件根本没内容（下载/生成失败）。
+    // 报底层解析错误会把模型引向"修复格式"，方向错了。
+    if bytes.is_empty() {
+        let kind = match format {
+            Format::Docx => "E_DOCX",
+            Format::Pdf => "E_PDF",
+        };
+        return Err(format!(
+            "{kind} 文件为空（0 字节）；可能下载或生成未完成，请确认来源后重试"
+        ));
+    }
     match format {
         Format::Docx => extract_docx_bytes(bytes),
         Format::Pdf => extract_pdf_bytes(bytes),
@@ -273,6 +284,16 @@ mod tests {
     fn pdf_抽取英文正文() {
         let text = extract_pdf_bytes(&minimal_pdf("(hello) Tj")).unwrap();
         assert!(text.contains("hello"), "实际: {text}");
+    }
+
+    #[test]
+    fn 空文件报文件为空而不是格式错误() {
+        // 0 字节是"没内容"，不是"格式损坏"；报解析错误会把模型引向修格式。
+        for (fmt, code) in [(Format::Docx, "E_DOCX"), (Format::Pdf, "E_PDF")] {
+            let err = extract_bytes(fmt, b"").unwrap_err();
+            assert!(err.starts_with(code), "{err}");
+            assert!(err.contains("0 字节"), "应说明是空文件: {err}");
+        }
     }
 
     #[test]

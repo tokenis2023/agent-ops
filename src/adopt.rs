@@ -25,6 +25,9 @@ const RULE_BODY: &str = "## 文件操作：优先使用 fsops\n\n\
 - 只要 fsops 可用，就不要用宿主内置文件工具或 shell 的 cat/head/tail/grep/find/sed 处理文本。\n\
 - DOCX 是例外：`fs_read` 可读正文，`fs_write` 可整体重建。\n\
 - 读取长文件用 `start`/`end`/`ranges`；搜索用 `fs_grep` 的分页参数。\n\
+- 先用 `fs_grep` 拿行号，再 `fs_read start=N block=true` 一次拿到包含该行的整个函数/代码块，不要猜 `end`。\n\
+- 同一字面量在文件里多处出现、只想改其中几处时，用 `fs_edit` 的 `start`/`end` 限定行范围。\n\
+- 统计命中数用 `fs_grep output=count`（不受 `limit` 截断）。\n\
 - 局部修改只用 `fs_edit`，不要整文件读回再 `fs_write`。\n\
 - 仅当 fsops 不可用、超时，或目标不是文本（图片/PDF/二进制/压缩包）时才回退。\n\
 - 如果 fsops 工具尚未出现在当前工具列表，先调用宿主的工具发现（如 tool_search）加载 fs_* schema；不要先用内置 Read/Bash 试一遍。\n\
@@ -201,6 +204,9 @@ fn parse_integrate(args: &[String]) -> Result<IntegrateOpts, String> {
         i += 1;
     }
 
+    // `--check` / `--remove` / `--dry-run` 已隐含"对规则块操作"，
+    // 再强制要求 --rules 只是多一次试错；--rules 作为唯一子模式可以推出来。
+    let rules = rules || mode != Mode::Install || dry_run;
     if !rules {
         return Err("需要 --rules；用法见 fsops integrate --help".into());
     }
@@ -252,13 +258,7 @@ fn run_target(opts: &IntegrateOpts, target: &'static Target) -> Result<Outcome, 
     let current = read_optional(&path)?;
 
     if opts.mode == Mode::Check {
-        let (status, ok) = match current.as_deref() {
-            None => ("缺失".to_string(), false),
-            Some(text) => {
-                let st = block_status(text);
-                (st.to_string(), st == "ok")
-            }
-        };
+        let (status, ok) = check_outcome(current.as_deref(), target)?;
         return Ok(Outcome {
             file: target.file,
             status,
@@ -469,6 +469,32 @@ fn trim_end_newlines(text: &str) -> &str {
 
 fn trim_start_newlines(text: &str) -> &str {
     text.trim_start_matches(['\r', '\n'])
+}
+
+/// 判定规则文件当前状态，供 `integrate --check` 与测试共用。
+///
+/// 只校验标记不够：fsops 升级后规则正文会变，标记仍是 v1 却内容陈旧。
+/// 因此标记正确时还要比对"现在写入会得到什么"。
+fn check_outcome(current: Option<&str>, target: &Target) -> Result<(String, bool), String> {
+    let text = match current {
+        None => return Ok(("缺失".to_string(), false)),
+        Some(t) => t,
+    };
+    let st = block_status(text);
+    if st != "ok" {
+        let label = match st {
+            "stale" => "过期",
+            "broken" => "损坏",
+            _ => "无块",
+        };
+        return Ok((label.to_string(), false));
+    }
+    let expected = upsert_block(text, target)?;
+    if expected == text {
+        Ok(("ok".to_string(), true))
+    } else {
+        Ok(("过期".to_string(), false))
+    }
 }
 
 fn rule_checks(root: &Path) -> Vec<RuleCheck> {
@@ -962,6 +988,44 @@ mod tests {
             block_status(&format!("{BEGIN}\n{END}\n{BEGIN}\n{END}")),
             "broken"
         );
+    }
+
+    #[test]
+    fn check_能识别正文过期() {
+        // 标记仍是 v1、但正文被删了一行时，只校验标记会误报 ok。
+        let target = TARGETS.iter().find(|t| t.key == "agents").unwrap();
+        let fresh = upsert_block("", target).unwrap();
+        assert_eq!(check_outcome(Some(&fresh), target).unwrap().0, "ok");
+
+        let stale = fresh.replace(
+            "- 统计命中数用 `fs_grep output=count`（不受 `limit` 截断）。\n",
+            "",
+        );
+        assert_ne!(stale, fresh, "测试前提：正文确实被改动");
+        let (label, ok) = check_outcome(Some(&stale), target).unwrap();
+        assert_eq!(label, "过期");
+        assert!(!ok);
+
+        assert_eq!(check_outcome(None, target).unwrap().0, "缺失");
+        assert_eq!(
+            check_outcome(Some("用户自己的规则\n"), target).unwrap().0,
+            "无块"
+        );
+    }
+
+    #[test]
+    fn integrate_check_remove_无需显式_rules() {
+        // --check / --remove 已表明要对规则块操作，再强制 --rules 只是多一次试错。
+        assert!(matches!(
+            parse_integrate(&["--check".to_string()]).unwrap().mode,
+            Mode::Check
+        ));
+        assert!(matches!(
+            parse_integrate(&["--remove".to_string()]).unwrap().mode,
+            Mode::Remove
+        ));
+        // 裸 integrate 仍应提示需要 --rules
+        assert!(parse_integrate(&[]).is_err());
     }
 
     #[test]

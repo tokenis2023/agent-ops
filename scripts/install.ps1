@@ -53,10 +53,19 @@ if (-not [Environment]::Is64BitOperatingSystem) {
 function Resolve-Release {
     param([string]$Requested)
     if ($Requested -eq "latest" -or [string]::IsNullOrWhiteSpace($Requested)) {
-        return Invoke-RestMethod -Uri "$ApiBase/releases/latest" -Headers $Headers
+        try {
+            return Invoke-RestMethod -Uri "$ApiBase/releases/latest" -Headers $Headers
+        } catch {
+            throw "E_NETWORK 无法查询最新 Release（$ApiBase/releases/latest）：$($_.Exception.Message)`n请检查网络，或用 -Version vX.Y.Z 指定版本。"
+        }
     }
     $tag = if ($Requested.StartsWith("v")) { $Requested } else { "v$Requested" }
-    return Invoke-RestMethod -Uri "$ApiBase/releases/tags/$tag" -Headers $Headers
+    try {
+        return Invoke-RestMethod -Uri "$ApiBase/releases/tags/$tag" -Headers $Headers
+    } catch {
+        # 版本不存在时原样抛 PowerShell 堆栈，用户和 Agent 都看不出是版本号写错。
+        throw "E_VERSION 找不到版本 $tag。`n可用：-Version latest，或在 https://github.com/tokenis2023/agent-ops/releases 查看已发布版本。"
+    }
 }
 
 function Add-UserPath {
@@ -116,7 +125,12 @@ if (-not $exeAsset -or -not $shaAsset) {
 }
 
 $InstallDir = [Environment]::ExpandEnvironmentVariables($InstallDir)
-$destination = Join-Path $InstallDir "fsops.exe"
+# 盘符不存在时 Join-Path 会抛 DriveNotFoundException 堆栈，看不出是安装目录写错。
+try {
+    $destination = Join-Path $InstallDir "fsops.exe"
+} catch {
+    throw "E_INSTALL_DIR 安装目录无效：$InstallDir`n请检查盘符是否存在，或用 -InstallDir 指定一个已存在的目录。"
+}
 Write-Host "fsops $($release.tag_name)" -ForegroundColor Cyan
 Write-Host "  来源: $($exeAsset.browser_download_url)"
 Write-Host "  安装到: $destination"

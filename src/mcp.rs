@@ -45,7 +45,7 @@ pub fn serve() -> io::Result<()> {
                     "protocolVersion": requested,
                     "capabilities": {"tools": {"listChanged": false}},
                     "serverInfo": {"name": "fsops", "version": crate::VERSION},
-                    "instructions": "文件读写、搜索、编辑、元信息操作优先使用 fs_* 工具。只要 fsops 可用，不要用宿主内置 read_file/write_file/search_files 或 shell 的 cat/head/tail/grep/find/sed 处理文本；仅当 fsops 不可用、超时，或目标是图片/PDF/二进制时回退。局部修改用 fs_edit，不要整文件读回再 fs_write。",
+                    "instructions": "文件读写、搜索、编辑、元信息操作优先使用 fs_* 工具。只要 fsops 可用，不要用宿主内置 read_file/write_file/search_files 或 shell 的 cat/head/tail/grep/find/sed 处理文本；仅当 fsops 不可用、超时，或目标是图片/PDF/二进制时回退。局部修改用 fs_edit，不要整文件读回再 fs_write。用 fs_grep 拿到行号后，用 fs_read start=N block=true 一次取回整个代码块，不必猜 end。",
                 }))
             }
             "ping" => Ok(json!({})),

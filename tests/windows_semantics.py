@@ -564,6 +564,29 @@ text, err = call("fs_edit", path=posix(gbk_path),
 check("编码损失报出码位与行号",
       err is True and "U+1F600" in text and "第 1 行" in text and "UTF-8" in text, text)
 
+# DOCX 往返：写入生成真 docx，读回正文，grep 命中，edit 拒绝
+docx_path = os.path.join(root, "probe.docx")
+text, err = call("fs_write", path=posix(docx_path), content="第一段\n含 needle 的行\n")
+check("fs_write 生成 DOCX", err is False and os.path.exists(docx_path), text)
+text, err = call("fs_read", path=posix(docx_path))
+check("fs_read 读回 DOCX 正文",
+      err is False and "第一段" in text and "needle" in text, text)
+text, err = call("fs_grep", path=posix(docx_path), pattern="needle")
+check("fs_grep 搜 DOCX 正文", err is False and "needle" in text, text)
+text, err = call("fs_edit", path=posix(docx_path), edits=[{"old": "第一段", "new": "改"}])
+check("fs_edit 拒绝 DOCX", err is True and "E_DOCX" in text, text)
+
+# 畸形文档不能让 MCP 进程退出
+for bad_name, bad_data in [("bad.pdf", b"%PDF-1.4\nbroken\n"),
+                           ("bad.docx", b"PK\x03\x04" + b"\x00" * 100),
+                           ("empty.pdf", b""),
+                           ("empty.docx", b"")]:
+    bp = os.path.join(root, bad_name)
+    open(bp, "wb").write(bad_data)
+    text, err = call("fs_read", path=posix(bp))
+    expect = "E_PDF" if bad_name.endswith(".pdf") else "E_DOCX"
+    check(f"畸形 {bad_name} 返回错误不崩溃", err is True and expect in text, text)
+
 # 长行截断提示必须给出可执行的 budget，否则"用 max_line=0"是死路
 minjs = os.path.join(root, "min.js")
 open(minjs, "w", encoding="utf-8").write("var a=1;" * 14000)

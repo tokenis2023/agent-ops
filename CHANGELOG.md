@@ -6,6 +6,16 @@
 
 （暂无）
 
+## [0.2.3] - 2026-11-06
+
+- `fs_edit` 的 `files[].edits` 嵌套 schema 补全字段：此前只写 `{"type":"object"}`，模型在批量编辑时看不到 `old/new/all/start/end`，只能猜。两处现在共用同一个 schema 函数，避免再漂移。
+- 0 字节的 DOCX/PDF 报「文件为空（0 字节）；可能下载或生成未完成」，不再抛底层解析错误把模型引向「修复格式」。
+- `install.ps1` 失败时给出可执行的错误（`E_VERSION` 版本不存在、`E_INSTALL_DIR` 安装目录无效、`E_NETWORK` 无法查询 Release），不再只抛 PowerShell 堆栈。
+- 规则正文与 `initialize.instructions` 补上三项高价值用法：`fs_grep` 拿行号 → `fs_read block=true` 取整个代码块、`fs_edit` 的 `start`/`end` 限定行范围、`fs_grep output=count` 统计。此前这些能力只在参数描述里，模型不会主动用。
+- `integrate --check` 现在比对规则正文，不再只看标记：fsops 升级后正文变化会报「过期」，此前标记仍是 v1 就报 `ok`。
+- `fsops integrate --check` / `--remove` / `--dry-run` 不再强制要求同时给出 `--rules`（意图已由参数本身表明）；裸 `fsops integrate` 仍提示需要 `--rules`。
+- `fsops integrate --check` 的状态文案改为中文（`无块`/`过期`/`损坏`），与 `fsops doctor` 一致；此前同一语义一处报 `missing` 一处报「缺失」。
+
 ## [0.2.2] - 2026-11-05
 
 ### 新增
