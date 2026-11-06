@@ -2,6 +2,10 @@
 
 本项目使用语义化版本。日期为发布日。
 
+## [Unreleased]
+
+- 修复 `fs_exec` 的 schema 把 `program` 标为必填：只轮询/终止后台任务的 `{"job":1}` 会在宿主 schema 校验处就被拒，而运行时本就允许省略。DSH 插件与工具参考同步。
+
 ## [0.3.0] - 2026-11-06
 
 - 修复 `fs_file copy/move` 的输出把目标路径写成 Windows 反斜杠（`C:\...`），与「输出统一 POSIX」的约定不一致；新增 `paths::display_native`，transfer/extract/collect_files 的全部中间路径输出统一走它。

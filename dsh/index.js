@@ -157,7 +157,7 @@ const TOOL_SPECS = [
     description:
       '执行程序（argv 数组，不经过 shell）。替代 PowerShell 跑 cargo/git/npm/python：没有引号/插值、2>&1、ErrorRecord、$LASTEXITCODE 问题。非零退出不是错误；超时结束整个进程树。后台任务 background/job/kill 只在长驻 MCP 服务内有效；DSH 插件每次调用是新进程，会返回 E_NO_JOB。',
     parameters: {
-      program: { type: 'string', description: '可执行文件，如 cargo、git、python；走 PATH', required: true },
+      program: { type: 'string', description: '可执行文件，如 cargo、git、python；走 PATH。启动新任务时必填，只轮询/终止 job 时可省略' },
       args: { type: 'array', items: { type: 'string' }, description: '参数数组，每个参数独立，不拼字符串' },
       cwd: { type: 'string', description: '工作目录，默认当前目录' },
       timeout_ms: { type: 'integer', description: '超时毫秒，默认 120000，最大 600000' },

@@ -190,7 +190,7 @@ pub fn tool_defs() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "program": {"type": "string", "description": "可执行文件，如 cargo、git、python；走 PATH"},
+                    "program": {"type": "string", "description": "可执行文件，如 cargo、git、python；走 PATH。启动新任务时必填，只轮询/终止 job 时可省略"},
                     "args": {"type": "array", "items": {"type": "string"}, "description": "参数数组，每个参数独立，不拼字符串"},
                     "cwd": {"type": "string", "description": "工作目录，默认当前目录"},
                     "timeout_ms": {"type": "integer", "description": "超时毫秒，默认 120000，最大 600000；超时结束进程树"},
@@ -202,7 +202,7 @@ pub fn tool_defs() -> Vec<Value> {
                     "job": {"type": "integer", "description": "轮询/终止后台任务：传启动时返回的 job id"},
                     "kill": {"type": "boolean", "description": "配合 job 使用：结束该任务的整个进程树"}
                 },
-                "required": ["program"]
+                "required": []
             }
         }),
         json!({
@@ -2905,6 +2905,16 @@ fn next_fn() {
         }
         fs::remove_dir_all(dir).unwrap();
         assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    #[test]
+    fn fs_exec_schema允许只传job轮询() {
+        // 轮询/终止后台任务只需要 job；若 schema 强制 program，
+        // 宿主会在发出调用前就拒掉 {"job":1}。
+        let defs = tool_defs();
+        let def = defs.iter().find(|d| d["name"] == "fs_exec").unwrap();
+        let required = def["inputSchema"]["required"].as_array().unwrap();
+        assert!(required.is_empty(), "fs_exec.required 应为空: {required:?}");
     }
 
     #[test]
