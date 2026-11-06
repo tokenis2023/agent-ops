@@ -155,18 +155,19 @@ pub fn apply(original: &str, eol: Eol, edits: &[EditSpec]) -> Result<(String, Ed
         // 单趟线性构建：一次扫描同时算行号并拼接结果。
         // 旧实现逐次 replace_range + 每次 line_of 从头扫，在大文件上是 O(n*m)。
         let (next, lines) = replace_at(&work, &needle, &repl, &targets);
-        for line_no in lines {
+        // 同一行多处匹配时行号重复，给列号才能区分出是第几处。
+        for (line_no, pos) in lines.iter().zip(targets.iter()) {
             // 同一行上的多处修改只算一次：`+N -M` 表达的是"改动了几行"，
             // 而不是"执行了几次替换"。否则同一行改三处会报 +3 -3。
-            if touched_lines.insert(line_no) {
+            if touched_lines.insert(*line_no) {
                 res.removed_lines += count_lines(&needle);
                 res.added_lines += count_lines(&repl);
             }
             res.applied += 1;
-            push_locus(&mut res.loci, line_no, &repl);
+            push_locus(&mut res.loci, *line_no, col_of(&work, *pos), &repl);
             if res.hunks.len() < MAX_HUNKS {
                 res.hunks.push(Hunk {
-                    line: line_no,
+                    line: *line_no,
                     old: needle.clone(),
                     new: repl.clone(),
                 });
@@ -236,7 +237,7 @@ fn apply_regex(
             res.added_lines += count_lines(&expanded);
         }
         res.applied += 1;
-        push_locus(&mut res.loci, line_no, &expanded);
+        push_locus(&mut res.loci, line_no, col_of(scope, m.start()), &expanded);
         if res.hunks.len() < MAX_HUNKS {
             res.hunks.push(Hunk {
                 line: line_no,
@@ -443,21 +444,31 @@ fn replace_at(work: &str, needle: &str, repl: &str, positions: &[usize]) -> (Str
     (out, lines)
 }
 
-fn push_locus(loci: &mut Vec<String>, line_no: usize, repl: &str) {
+fn push_locus(loci: &mut Vec<String>, line_no: usize, col_no: usize, repl: &str) {
     if loci.len() >= MAX_LOCI {
         return;
     }
     // 行号区间只取决于替换文本跨了几行（单行替换就只标一个行号）。
     let span = newline_count(repl);
-    let entry = if span > 0 {
+    let base = if span > 0 {
         format!("{line_no}-{}", line_no + span)
     } else {
         format!("{line_no}")
+    };
+    // 只有同一行已经出现过其它替换时才带列号；常规单处修改保持简洁的 "12"。
+    let entry = if loci.iter().any(|l| l == &base) {
+        format!("{base}:{col_no}")
+    } else {
+        base
     };
     // 只在前 MAX_LOCI 条内去重，规模可控，避免 O(n²) 的 contains 扫描。
     if !loci.contains(&entry) {
         loci.push(entry);
     }
+}
+
+fn col_of(s: &str, pos: usize) -> usize {
+    s[..pos].rfind('\n').map(|i| pos - i).unwrap_or(pos + 1)
 }
 
 /// 歧义片段里的单行截断：定位用，不需要完整长行。
@@ -659,6 +670,18 @@ mod tests {
         // 附上下文片段：模型不必再 fs_read 就能构造出唯一的 old。
         assert!(err.contains("1|x();"), "应含命中行片段: {err}");
         assert!(err.contains("2|x();"), "应含命中行片段: {err}");
+    }
+
+    #[test]
+    fn 同行多处匹配给列号() {
+        let src = "a foo b foo c\n";
+        let mut s = spec("foo", "bar");
+        s.all = true;
+        let (out, res) = apply(src, Eol::Lf, &[s]).unwrap();
+        assert_eq!(out, "a bar b bar c\n");
+        assert_eq!(res.applied, 2);
+        // 第一处不带列号（还没有重复行号），第二处起同一线路号带上列号以区分。
+        assert_eq!(res.loci, vec!["1", "1:9"]);
     }
 
     #[test]

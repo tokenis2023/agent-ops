@@ -2110,7 +2110,7 @@ mod tests {
         }));
         assert!(out.contains("3 处修改"), "替换次数仍是 3: {out}");
         assert!(out.contains("(+1 -1)"), "只有 1 行变化: {out}");
-        assert!(out.contains("@ 1 "), "行号只标 1: {out}");
+        assert!(out.contains("@ 1,1:11,1:19"), "同行多处给列号: {out}");
 
         // 跨行 + 同行混合：a 拆成两行(+2 -1) + b 单行(+1 -1) = +3 -2
         let m = dir.join("mix.txt");
