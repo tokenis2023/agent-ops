@@ -23,13 +23,15 @@ const RULE_BODY: &str = "## 文件操作：优先使用 fsops\n\n\
 - 元信息：`fs_stat`（替代 stat / ls / Get-Item）\n\n\
 规则：\n\
 - 只要 fsops 可用，就不要用宿主内置文件工具或 shell 的 cat/head/tail/grep/find/sed 处理文本。\n\
-- DOCX 是例外：`fs_read` 可读正文，`fs_write` 可整体重建。\n\
+- DOCX/PDF 正文都可以直接用 `fs_read` 读取（PDF 只读）；`fs_write` 可整体重建 DOCX。\n\
 - 读取长文件用 `start`/`end`/`ranges`；搜索用 `fs_grep` 的分页参数。\n\
 - 先用 `fs_grep` 拿行号，再 `fs_read start=N block=true` 一次拿到包含该行的整个函数/代码块，不要猜 `end`。\n\
 - 同一字面量在文件里多处出现、只想改其中几处时，用 `fs_edit` 的 `start`/`end` 限定行范围。\n\
-- 统计命中数用 `fs_grep output=count`（不受 `limit` 截断）。\n\
+- 只知道文本形状、不知道确切原文时，用 `fs_edit` 的 `pattern`/`replacement` 正则替换（支持 `$1`），不要先读全文抄原文。\n\
+- 结构调整后用 `fs_edit diff=true` 自查改动片段，省掉一次全文回读。\n\
+- 统计命中数用 `fs_grep output=count`：默认完整统计；显式传 `limit` 时按命中截断并标注“本页可见”，不要当成总数。\n\
 - 局部修改只用 `fs_edit`，不要整文件读回再 `fs_write`。\n\
-- 仅当 fsops 不可用、超时，或目标不是文本（图片/PDF/二进制/压缩包）时才回退。\n\
+- 仅当 fsops 不可用、超时，或目标是图片/不支持的二进制（旧版 `.doc`、压缩包等）时才回退。\n\
 - 如果 fsops 工具尚未出现在当前工具列表，先调用宿主的工具发现（如 tool_search）加载 fs_* schema；不要先用内置 Read/Bash 试一遍。\n\
 - 如果宿主不支持工具发现或加载失败，直接用 `fsops read/grep/glob/stat/call` CLI，仍然不要退回 cat/grep/find。\n";
 
@@ -898,6 +900,31 @@ mod tests {
     }
 
     #[test]
+    fn 规则正文覆盖_pdf_与正则编辑() {
+        // 规则正文是 Agent 每轮都会读的短引导，必须和 initialize 同路由：
+        // PDF 正文走 fs_read；正则编辑与 diff 自查要写明，否则学不到新用法。
+        assert!(RULE_BODY.contains("DOCX/PDF"), "{RULE_BODY}");
+        assert!(RULE_BODY.contains("fs_read"), "{RULE_BODY}");
+        assert!(
+            !RULE_BODY.contains("图片/PDF") && !RULE_BODY.contains("PDF/二进制"),
+            "PDF 不应与图片/二进制一起回退: {RULE_BODY}"
+        );
+        assert!(
+            RULE_BODY.contains("pattern") && RULE_BODY.contains("replacement"),
+            "缺少正则编辑引导: {RULE_BODY}"
+        );
+        assert!(
+            RULE_BODY.contains("diff=true"),
+            "缺少 diff 自查引导: {RULE_BODY}"
+        );
+        // output=count 默认是被工具层放宽成全量统计的；写成“不受 limit 截断”会误导。
+        assert!(
+            RULE_BODY.contains("默认完整统计") && RULE_BODY.contains("本页可见"),
+            "count 规则应与实现一致: {RULE_BODY}"
+        );
+    }
+
+    #[test]
     fn 更新规则块保留用户内容() {
         let target = &TARGETS[0];
         let old = format!("# 项目\n\n{BEGIN}\n旧规则\n{END}\n\n## 其他\n内容\n");
@@ -998,7 +1025,7 @@ mod tests {
         assert_eq!(check_outcome(Some(&fresh), target).unwrap().0, "ok");
 
         let stale = fresh.replace(
-            "- 统计命中数用 `fs_grep output=count`（不受 `limit` 截断）。\n",
+            "- 统计命中数用 `fs_grep output=count`：默认完整统计；显式传 `limit` 时按命中截断并标注“本页可见”，不要当成总数。\n",
             "",
         );
         assert_ne!(stale, fresh, "测试前提：正文确实被改动");

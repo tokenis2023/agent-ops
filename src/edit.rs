@@ -184,25 +184,55 @@ fn apply_regex(
         .ok_or_else(|| format!("E_BAD_EDIT 第{ordinal}处：pattern 模式需要同时给出 replacement"))?;
     let re = regex::Regex::new(pat)
         .map_err(|err| format!("E_BAD_REGEX 第{ordinal}处 pattern 无效: {err}"))?;
-    // 可匹配空位置的正则会命中每一处，等于把文件改烂。
-    if re.is_match("") {
+    // 可匹配空位置的正则会命中每一处，等于把文件改烂。守卫与 fs_grep 共用：
+    // 只看 `is_match("")` 会放过 `\b`（空串没有词边界，但每个词边界都命中）。
+    if crate::search::matches_everywhere(&re) {
         return Err(format!(
-            "E_BAD_REGEX 第{ordinal}处 pattern 可匹配空位置（如 ^ $ a* .*）；请写出具体字符"
+            "E_BAD_REGEX 第{ordinal}处 pattern 可匹配空位置（如 ^ $ a* .* `\\b`）；请写出具体字符"
         ));
     }
+    // regex 对未知引用不报错，而是展开成空串（`$1_x` 直接变成空）：
+    // 静默丢内容比报错危险，写盘前先校验。
+    validate_replacement(replacement, &re, ordinal)?;
 
     let (from, to) = line_span(work, e.start, e.end);
     let scope = &work[from..to];
-    let hits: Vec<(usize, usize, String, String)> = re
-        .captures_iter(scope)
-        .map(|caps| {
-            let m = caps.get(0).unwrap();
-            let mut expanded = String::new();
-            caps.expand(replacement, &mut expanded);
-            (m.start(), m.end(), m.as_str().to_string(), expanded)
-        })
-        .collect();
-    if hits.is_empty() {
+    let base_line = line_of(work, from);
+    let mut out = String::with_capacity(work.len());
+    out.push_str(&work[..from]);
+    // 单趟游标：`line_cursor` 之前已数过换行，`line_no` 只向前累加。
+    // 旧实现每个命中都从范围起点重数换行，批量替换是 O(n²)。
+    let mut line_cursor = 0usize;
+    let mut line_no = base_line;
+    let mut last = 0usize;
+    let mut hits = 0usize;
+    // 复用同一个展开缓冲，避免每个命中都新建 String。
+    let mut expanded = String::new();
+    for caps in re.captures_iter(scope) {
+        let m = caps.get(0).unwrap();
+        line_no += newline_count(&scope[line_cursor..m.start()]);
+        line_cursor = m.start();
+        out.push_str(&scope[last..m.start()]);
+        expanded.clear();
+        caps.expand(replacement, &mut expanded);
+        out.push_str(&expanded);
+        last = m.end();
+        hits += 1;
+        if touched_lines.insert(line_no) {
+            res.removed_lines += count_lines(m.as_str());
+            res.added_lines += count_lines(&expanded);
+        }
+        res.applied += 1;
+        push_locus(&mut res.loci, line_no, &expanded);
+        if res.hunks.len() < MAX_HUNKS {
+            res.hunks.push(Hunk {
+                line: line_no,
+                old: m.as_str().to_string(),
+                new: expanded.clone(),
+            });
+        }
+    }
+    if hits == 0 {
         return Err(if e.start.is_some() {
             format!(
                 "E_NO_MATCH 第{ordinal}处：在 {}..={} 行内没有匹配；去掉 start/end 可搜全文",
@@ -218,33 +248,131 @@ fn apply_regex(
         });
     }
 
-    let base_line = line_of(work, from);
-    let mut out = String::with_capacity(work.len());
-    out.push_str(&work[..from]);
-    let mut last = 0usize;
-    for (start, end, matched, expanded) in &hits {
-        out.push_str(&scope[last..*start]);
-        out.push_str(expanded);
-        last = *end;
-        let line_no = base_line + scope[..*start].matches('\n').count();
-        if touched_lines.insert(line_no) {
-            res.removed_lines += count_lines(matched);
-            res.added_lines += count_lines(expanded);
-        }
-        res.applied += 1;
-        push_locus(&mut res.loci, line_no, expanded);
-        if res.hunks.len() < MAX_HUNKS {
-            res.hunks.push(Hunk {
-                line: line_no,
-                old: matched.clone(),
-                new: expanded.clone(),
-            });
-        }
-    }
     out.push_str(&scope[last..]);
     out.push_str(&work[to..]);
     *work = out;
     Ok(())
+}
+
+/// 替换文本里的一个 `$` 引用。
+#[derive(Debug, PartialEq, Eq)]
+enum ReplRef {
+    /// `$1` 或 `${1}`
+    Number(usize),
+    /// `$name` 或 `${name}`
+    Name(String),
+}
+
+/// 校验替换文本里的 `$` 引用都能展开成本次匹配里存在的捕获组。
+///
+/// `regex::Captures::expand` 对未定义的引用不会失败，而是展开成空串：
+/// `(a)` 配 `$1_x` 会被当成组名 `1_x`，匹配到的 `a` 整段消失。
+/// 用户以为在写“组号 + 后缀”，实际得到静默丢内容，所以必须提前报错。
+fn validate_replacement(repl: &str, re: &regex::Regex, ordinal: usize) -> Result<(), String> {
+    let refs = parse_replacement_refs(repl)
+        .map_err(|detail| format!("E_BAD_REPLACEMENT 第{ordinal}处：{detail}"))?;
+    let names: Vec<&str> = re.capture_names().flatten().collect();
+    for reference in refs {
+        match reference {
+            ReplRef::Number(index) if index >= re.captures_len() => {
+                return Err(format!(
+                    "E_BAD_REPLACEMENT 第{ordinal}处：替换文本引用了 ${index}，\
+                     但模式只有 {} 个捕获组（含 $0，可用 $0-${}）",
+                    re.captures_len(),
+                    re.captures_len().saturating_sub(1)
+                ));
+            }
+            ReplRef::Name(name) => {
+                if names.iter().any(|known| *known == name) {
+                    continue;
+                }
+                // `$1_x` 是最常见的写法错误：regex 把整串当成组名 `1_x`。
+                // 指向正确写法，模型下一次就能改对。
+                let message = if name.starts_with(|c: char| c.is_ascii_digit()) {
+                    let digits_len = name.chars().take_while(|c| c.is_ascii_digit()).count();
+                    let (digits, rest) = name.split_at(digits_len);
+                    let suggestion = format!("${{{digits}}}{rest}");
+                    format!(
+                        "E_BAD_REPLACEMENT 第{ordinal}处：替换文本里的 ${name} 不是捕获组；\
+                         组号后紧跟字母/数字/下划线会被当成组名，请写 `{suggestion}`"
+                    )
+                } else {
+                    format!(
+                        "E_BAD_REPLACEMENT 第{ordinal}处：替换文本里的 ${name} 不是捕获组\
+                         （模式里没有名为 `{name}` 的组）"
+                    )
+                };
+                return Err(message);
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// 解析替换文本里的 `$` 引用，规则与 regex 的展开保持一致：
+/// `$1`/`${1}`/`$name`/`${name}` 是引用，`$$` 是字面 `$`，其余 `$` 按字面保留。
+/// 区别只在遇到畸形引用（`${1`、`${}`）时直接报错，而不是当成字面量。
+fn parse_replacement_refs(repl: &str) -> Result<Vec<ReplRef>, String> {
+    fn is_cap_letter(c: char) -> bool {
+        c.is_ascii_alphanumeric() || c == '_'
+    }
+    let chars: Vec<char> = repl.chars().collect();
+    let mut refs = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] != '$' {
+            i += 1;
+            continue;
+        }
+        if i + 1 >= chars.len() {
+            break; // 末尾单独的 `$` 按字面保留
+        }
+        match chars[i + 1] {
+            '$' => i += 2, // `$$` → 字面 `$`
+            '{' => {
+                let mut j = i + 2;
+                let mut name = String::new();
+                while j < chars.len() && chars[j] != '}' {
+                    name.push(chars[j]);
+                    j += 1;
+                }
+                if j >= chars.len() {
+                    return Err(format!(
+                        "替换文本里的 `${{{name}` 缺少右花括号；\
+                         命名组写 `${{name}}`，组号写 `${{1}}`"
+                    ));
+                }
+                if name.is_empty() || !name.chars().all(is_cap_letter) {
+                    return Err(format!(
+                        "替换文本里的 `${{{name}}}` 不是合法捕获组名；\
+                         只允许字母、数字、下划线"
+                    ));
+                }
+                refs.push(classify_ref(&name));
+                i = j + 1;
+            }
+            c if is_cap_letter(c) => {
+                let mut j = i + 1;
+                let mut name = String::new();
+                while j < chars.len() && is_cap_letter(chars[j]) {
+                    name.push(chars[j]);
+                    j += 1;
+                }
+                refs.push(classify_ref(&name));
+                i = j;
+            }
+            _ => i += 1, // `$` 后不是引用（如 "US$ 5"）：按字面保留
+        }
+    }
+    Ok(refs)
+}
+
+fn classify_ref(name: &str) -> ReplRef {
+    match name.parse::<usize>() {
+        Ok(index) => ReplRef::Number(index),
+        Err(_) => ReplRef::Name(name.to_string()),
+    }
 }
 
 /// 取 [start,end] 行范围对应的字节区间（1 基，含端点）。
@@ -386,6 +514,9 @@ fn no_match_error(work: &str, needle: &str, idx: usize) -> String {
             msg.push_str(&format!("\n{n}|{t}"));
         }
     }
+    // 多个 agent 并行时，“找不到目标”可能是因为别人刚改过。
+    // 不说这句，模型会以为自己的 old 写错了，反复重试同一个文本。
+    msg.push_str("；若他人刚改过此文件，重新 fs_read 取新 hash 后用 expect_hash 重试");
     msg
 }
 
@@ -529,6 +660,98 @@ mod tests {
         assert_eq!(out, "a YY\ny YY\nz YY\n");
         assert_eq!(res.applied, 3);
         assert_eq!(res.loci, vec!["1", "2", "3"]);
+    }
+
+    #[test]
+    fn 跨行正则匹配后行号仍正确() {
+        // 单趟游标必须把命中消耗掉的换行计入下一个命中的行号；
+        // 跨行命中后若重新从命中末尾计数，后续行号会整体前移。
+        let src = "l1\nl2\nfoo\nbar\nbaz\nl6\n";
+        let (out, res) = apply(src, Eol::Lf, &[regex_spec("foo\nbar|baz", "OK")]).unwrap();
+        assert_eq!(out, "l1\nl2\nOK\nOK\nl6\n");
+        assert_eq!(res.applied, 2);
+        assert_eq!(
+            res.hunks.iter().map(|h| h.line).collect::<Vec<_>>(),
+            vec![3, 5]
+        );
+        assert_eq!(res.loci, vec!["3", "5"]);
+    }
+
+    #[test]
+    fn 命中数超过hunk上限时计数仍完整() {
+        let src = "hit\n".repeat(150);
+        let (_out, res) = apply(src.as_str(), Eol::Lf, &[regex_spec("hit", "HIT")]).unwrap();
+        assert_eq!(res.applied, 150);
+        assert_eq!(res.hunks.len(), MAX_HUNKS);
+        assert_eq!(res.loci.len(), MAX_LOCI);
+        assert_eq!(res.removed_lines, 150);
+        assert_eq!(res.added_lines, 150);
+    }
+
+    #[test]
+    fn 正则大文件批量替换是线性的() {
+        // 旧实现每个命中都从范围起点重数换行（O(n²)）；这个规模旧代码需要数十秒。
+        // 单趟游标版本应在 5 秒内完成。
+        let n = 60_000usize;
+        let src = "key=value\n".repeat(n);
+        let started = std::time::Instant::now();
+        let (out, res) = apply(
+            src.as_str(),
+            Eol::Lf,
+            &[regex_spec(r"key=(\w+)", "key=${1}_x")],
+        )
+        .unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(res.applied, n);
+        assert_eq!(res.hunks.len(), MAX_HUNKS);
+        assert!(out.starts_with("key=value_x\n"), "{}", &out[..16]);
+        assert_eq!(out.matches("key=value_x").count(), n);
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "正则批量替换耗时 {elapsed:?}，应线性"
+        );
+    }
+
+    #[test]
+    fn 正则空位置守卫覆盖词边界() {
+        // `\b` 在空串上不匹配，只查 `is_match("")` 会放过它：
+        // 4 个词边界都会命中，等于把文件改烂。必须与 fs_grep 共用同一守卫。
+        let err = apply("a b\nc d\n", Eol::Lf, &[regex_spec(r"\b", "X")]).unwrap_err();
+        assert!(err.starts_with("E_BAD_REGEX"), "{err}");
+        assert!(err.contains("空位置"), "{err}");
+    }
+
+    #[test]
+    fn 未闭合替换引用错误保留原始片段() {
+        // 报错文案不能把用户没写的右花括号补进去，否则前后对不上。
+        let err = apply("a\n", Eol::Lf, &[regex_spec("(a)", "${1")]).unwrap_err();
+        assert!(err.starts_with("E_BAD_REPLACEMENT"), "{err}");
+        assert!(err.contains("`${1` 缺少"), "应回显原始片段: {err}");
+        assert!(
+            !err.contains("`${1}` 缺少"),
+            "不应在原始片段后补出右花括号: {err}"
+        );
+    }
+
+    #[test]
+    fn 替换文本未知引用报错而不是静默丢内容() {
+        // regex 把 `$1_x` 当成组名 `1_x`，展开成空串：匹配内容无声消失。
+        let err = apply("a\n", Eol::Lf, &[regex_spec("(a)", "$1_x")]).unwrap_err();
+        assert!(err.starts_with("E_BAD_REPLACEMENT"), "{err}");
+        assert!(err.contains("${1}_x"), "应提示正确写法: {err}");
+
+        // 组号超界、未闭合的 `${` 同样必须报错，而不是变成空串。
+        let err = apply("a\n", Eol::Lf, &[regex_spec("(a)", "$2")]).unwrap_err();
+        assert!(err.starts_with("E_BAD_REPLACEMENT"), "{err}");
+        let err = apply("a\n", Eol::Lf, &[regex_spec("(a)", "${1")]).unwrap_err();
+        assert!(err.starts_with("E_BAD_REPLACEMENT"), "{err}");
+    }
+
+    #[test]
+    fn 替换文本合法引用保持不变() {
+        let (out, res) = apply("a\n", Eol::Lf, &[regex_spec("(?P<x>a)", "$x/${1}_x/$$")]).unwrap();
+        assert_eq!(out, "a/a_x/$\n");
+        assert_eq!(res.applied, 1);
     }
 
     #[test]

@@ -69,12 +69,10 @@
 
 ## 本仓库开发规则
 
-- Rust 1.75+，Windows 原生。
+- Rust 1.88+，Windows 原生。
 - 修改行为前先写失败测试。
-- 提交前运行：
-  - `cargo fmt --all -- --check`
-  - `cargo clippy --all-targets -- -D warnings`
-  - `cargo test`
-  - `python tests/windows_semantics.py`
+- 编辑过程中只跑改动模块的单测（`cargo test --lib <模块>::`），不要每改一行跑全套。
+- 提交前运行 `.\scripts\check.ps1 commit`（fmt + clippy + 完整 cargo test）；
+  push 前、或改动 `io`/`text`/`edit`/`render` 时运行 `.\scripts\check.ps1 full`。
 - 不提交本机绝对路径、用户名、工具链安装位置、构建产物或凭据。
 - 中文注释、中文文档、中文提交信息。

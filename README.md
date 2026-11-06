@@ -89,11 +89,40 @@ args = ["mcp"]
 
 完整安装、校验、升级和排障见 **[使用指南](docs/使用指南.md)**。
 
+## DeepSeek Harness 插件
+
+仓库根同时是一个标准 DSH bundle：`package.json` 的 `dsh.bundle.patch` 指向 `cordis.patch.yml`，
+patch 插入 `dsh/index.js` 这个 Host 插件。在 Harness 的 **插件 → 添加插件 → 安装第三方插件** 里
+粘贴仓库地址即可：
+
+```text
+https://github.com/tokenis2023/agent-ops
+```
+
+安装后默认启用，提供 6 个 `fs_*` 工具——与 MCP 形态同名、同契约、同错误码。
+
+- **二进制来源**：优先用 `%LOCALAPPDATA%\fsops` 或 PATH 上已有的 `fsops.exe`；都没有时按本仓库版本
+  从 GitHub Release 下载并校验 SHA-256（该版本还没发 Release 时回退到 latest），缓存在
+  `%LOCALAPPDATA%\fsops-dsh\<版本>\`。
+- **离线或自定义**：在 profile 的 `cordis.patch.yml` 里按 `fsops-tools` 覆盖配置
+  `binary: D:\tools\fsops.exe`，或设环境变量 `FSOPS_BIN`，或用 `autoDownload: false` 关闭下载。
+- **平台**：`dsh.bundle.platforms` 声明为 `win32`，非 Windows 宿主不会展示也不允许启用。
+- **安全边界**：与 MCP 接入一致——fsops 没有路径沙箱，权限等于 Harness 进程用户；需要隔离时
+  依赖 Harness 自己的沙箱策略或限定工作区。
+
+本地验证插件（桩替代 Harness 服务，真跑 fsops.exe）：
+
+```bash
+cargo build
+node tests/dsh_plugin_smoke.mjs --exe target/debug/fsops.exe
+```
+
 ## 能力声明
 
 | 能力 | 说明 |
 |---|---|
 | 双形态 | MCP stdio 服务 + Unix 风格 CLI |
+| DSH 插件 | 仓库根即标准 DSH bundle；插件管理里粘贴仓库地址即可安装 |
 | 单文件分发 | Rust 编译的独立 Windows 可执行文件，无 Node/Python 运行时依赖 |
 | 文本编码 | UTF-8 / BOM / GBK / GB18030 / UTF-16 自动识别并原编码写回 |
 | 换行保持 | 匹配层归一 LF，写入层还原原文件 CRLF/LF/CR |
@@ -102,7 +131,7 @@ args = ["mcp"]
 | 并发保护 | 内容 hash + 跨进程命名互斥锁 |
 | 搜索 | `.gitignore` 感知、流式扫描、分页、并行、时间预算 |
 | Token 控制 | 行号窗口、字节预算、紧凑输出、续读参数 |
-| 大文件 | >32 MB 文本按连续行区间流式读取 |
+| 大文件 | >32 MB 文本按连续行区间流式读取；默认 `scan=window` 只扫请求窗口，`full` 才全扫给 hash/总行数 |
 | 可移植性 | 仓库和文档不包含开发机绝对路径或环境配置 |
 
 ## 兼容性
@@ -122,11 +151,11 @@ args = ["mcp"]
 
 | 工具 | 用途 | 关键参数 |
 |---|---|---|
-| `fs_read` | 读文件、行区间、多文件、大文件窗口、DOCX/PDF 正文 | `path`/`paths`、`start`、`end`、`ranges`、`max_line`、`budget` |
-| `fs_edit` | 精确替换、多文件批量、dry run、并发保护 | `edits`、`files`、`expect_hash`、`normalize_eol` |
+| `fs_read` | 读文件、行区间、多文件、大文件窗口、结构摘要、DOCX/PDF 正文 | `path`/`paths`、`start`、`end`、`ranges`、`scan`、`summary`、`max_line`、`budget` |
+| `fs_edit` | 精确替换、正则替换、diff 自查、多文件批量、并发保护 | `edits`（`old/new` 或 `pattern/replacement`）、`files`、`diff`、`expect_hash`、`normalize_eol` |
 | `fs_write` | 新建或整体覆盖，原子写入，可生成 DOCX | `content`、`expect_hash`、`normalize_eol` |
-| `fs_glob` | 按 glob 找文件，尊重 `.gitignore`，带遍历时间预算 | `pattern`、`path`、`dirs`、`detail`、`limit`、`time_budget_ms`、`budget` |
-| `fs_grep` | 正则搜索、四种输出、分页、并行，支持 DOCX/PDF 正文 | `pattern`、`output`、`context`、`max_per_file`、`offset`、`parallel` |
+| `fs_glob` | 按 glob 找文件，尊重 `.gitignore`，带遍历时间预算 | `pattern`、`path`、`dirs`、`detail`、`limit`、`offset`、`time_budget_ms`、`budget` |
+| `fs_grep` | 正则搜索、四种输出、分页、并行，支持 DOCX/PDF 正文 | `pattern`、`output`、`context`、`max_per_file`、`max_file_size`、`offset`、`parallel` |
 | `fs_stat` | 元信息、编码、换行、hash | `path`/`paths`、`detail=meta/hash/full` |
 
 完整参数、输出和错误码见 **[工具参考](docs/工具参考.md)**。
@@ -169,14 +198,16 @@ fsops harden claude --remove
 ```text
 fs_grep output=files
   → fs_grep output=snippets
-  → fs_read ranges
+  → fs_read ranges（DOCX/PDF 正文同样走 fs_read）
   → fs_edit edits/files + expect_hash
-  → 仅在需要时复查
+     └ 只知道文本形状：pattern/replacement 正则替换，不必先抄原文
+  → fs_edit diff=true 自查改动（省一次全文回读）
 ```
 
 关键规则：
 
 - 局部修改只用 `fs_edit`，不要读全文后 `fs_write`。
+- 只有图片和不支持的二进制回退宿主；DOCX/PDF 正文由 `fs_read` 读取。
 - 多文件修改一次批量提交。
 - 截断时使用返回的 `next_offset` 或 `ranges`。
 - `E_STALE`、`E_LOCKED`、`E_AMBIGUOUS` 不要原样重试。
@@ -210,13 +241,13 @@ fsops 可以替代 Agent 对 `Get-Content`、`Set-Content`、`Select-String`、`
 
 | 场景 | baseline | fsops | 省 |
 |---|---:|---:|---:|
-| 列出命中文件 | 4,269 | 509 | 88.1% |
-| 定位单行（只要位置） | 135 | 57 | 57.8% |
-| 定位 + 4 行上下文 | 679 | 177 | 73.9% |
-| 读前 10 行 | 944 | 410 | 56.6% |
-| 改 3 处（读全文+写回 vs 单次 edit） | 1,888 | 353 | 81.3% |
-| 列出全部文件 | 4,269 | 509 | 88.1% |
-| **合计** | **12,184** | **2,015** | **83.5%** |
+| 列出命中文件 | 2,829 | 509 | 82.0% |
+| 定位单行（只要位置） | 99 | 57 | 42.4% |
+| 定位 + 4 行上下文 | 499 | 177 | 64.5% |
+| 读前 10 行 | 944 | 374 | 60.4% |
+| 改 3 处（读全文+写回 vs 单次 edit） | 1,888 | 317 | 83.2% |
+| 列出全部文件 | 2,829 | 509 | 82.0% |
+| **合计** | **9,088** | **1,943** | **78.6%** |
 
 **真实仓库**（fsops 自身源码）：
 
@@ -225,10 +256,10 @@ fsops 可以替代 Agent 对 `Get-Content`、`Set-Content`、`Select-String`、`
 | 列出命中文件 | 28 | 17 | 39.3% |
 | 定位单行（只要位置） | 76 | 78 | **−2.6%** |
 | 定位 + 4 行上下文 | 357 | 243 | 31.9% |
-| 读前 10 行 | 27,799 | 324 | **98.8%** |
-| 改 3 处 | 55,598 | 144 | **99.7%** |
-| 列出全部文件 | 468 | 188 | 59.8% |
-| **合计** | **84,326** | **994** | **98.8%** |
+| 读前 10 行 | 4,369 | 399 | **90.9%** |
+| 改 3 处 | 8,738 | 164 | **98.1%** |
+| 列出全部文件 | 501 | 188 | 62.5% |
+| **合计** | **14,069** | **1,089** | **92.3%** |
 
 结论：**读得少、改得省**是主要收益。纯定位单行时 fsops 可能持平甚至略亏（工具输出带路径头），这类查询直接给 `pattern` 已经足够，不必期待零成本。
 
@@ -257,7 +288,7 @@ python tests/bench.py /path/to/repo    # 额外在真实代码上跑一轮
 - PDF 只读取正文；扫描版（无文本层）和加密 PDF 无法抽取，`fs_write`/`fs_edit` 对 PDF 明确拒绝。
 - 图片、旧版 `.doc` 和二进制文件不解析：`fs_read`/`fs_edit`/`fs_write` 返回 `E_BINARY`，`fs_stat` 标记 `binary`。UTF-16 文本不会被误判。
 - 超大 UTF-16 文件暂不支持流式读取。
-- 超大文件只支持一个连续 `start`/`end` 区间，不支持多区间。
+- 超大文件只支持一个连续 `start`/`end` 区间，不支持多区间；默认 `scan=window` 只做窗口扫描，需要全文 hash/总行数时用 `scan=full`。
 - `fs_edit` 遇到混合换行默认拒绝，必须显式 `normalize_eol=true`。
 - 多文件编辑不是跨文件事务，写入阶段失败会返回 `E_BATCH_PARTIAL`。
 - `fs_edit` 的摘要只列前 64 处落点，其余用总数表示。

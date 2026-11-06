@@ -14,6 +14,7 @@ pub mod mcp;
 pub mod paths;
 pub mod render;
 pub mod search;
+pub mod summary;
 pub mod text;
 pub mod tools;
 pub mod walk;

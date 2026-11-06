@@ -2,9 +2,14 @@
 
 本项目使用语义化版本。日期为发布日。
 
-## [Unreleased]
+## [0.2.6] - 2026-11-06
 
-（暂无）
+- 开发：新增 `scripts/check.ps1` 分级检查（`fast`/`commit`/`full`），并按档位更新 `CONTRIBUTING.md` 与 `AGENTS.md`：编辑过程中只跑改动模块单测，提交前跑 `commit`，push 前或改 I/O 内核跑 `full`，不再每次改动都跑全套。
+- `fs_read summary=true`：输出「行号|声明」的结构摘要，不展开函数体。按扩展名识别 Rust/Python/JS/TS/Go/Java/C#/C/C++/Ruby/Shell，跳过 Rust 的 `mod tests`。配合 `block=true start=<行号>` 形成「先看地图再进门」，省掉为定位而做的一次全文读取；实测 183 KB 的 `tools.rs` 摘要 5.8 KB（省 96.8%）。
+- 仓库根新增标准 DSH 插件（`package.json` + `cordis.patch.yml` + `dsh/`）：在 DeepSeek Harness 的插件管理里粘贴仓库地址即可安装，6 个 `fs_*` 工具与 MCP 形态同名、同契约。二进制优先复用已安装的 fsops，缺失时按版本从 GitHub Release 下载并校验 SHA-256。
+- `fsops call <tool> -` 支持从标准输入读 JSON：Windows 命令行约 32 KB 上限，DSH 插件用它传大段 `content`/`edits`。
+- `E_NO_MATCH` 补一句「若他人刚改过此文件，重新 fs_read 取新 hash 后用 expect_hash 重试」：多个 agent 并行时，失败方原先会以为自己的原文写错。
+- 文档新增「多个 Agent 同时使用」：写锁是按文件的跨进程命名互斥量，读-改-写与 hash 校验都在锁内；实测 20 进程并行改不同行 20/20 成功、同改一行时失败方得 `E_NO_MATCH` 且文件不损坏、各种路径写法映射同一把锁。同时说明单宿主请求串行、锁限于同一登录会话、符号链接不归一这几个边界。
 
 ## [0.2.5] - 2026-11-06
 

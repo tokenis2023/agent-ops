@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "fsops 文件工具",
+    "description": "面向 Agent 的 Windows 原生文件操作：POSIX 路径写法、CRLF/LF 自动归一、GBK/UTF-16 编码保真、原子写入与并发指纹。"
+  }
+}

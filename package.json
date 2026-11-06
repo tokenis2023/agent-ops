@@ -1,0 +1,47 @@
+{
+  "name": "@tokenis2023/fsops",
+  "version": "0.2.6",
+  "description": "面向 AI Agent 的 Windows 原生文件操作层。以 DSH 插件形态提供 fs_read / fs_edit / fs_write / fs_glob / fs_grep / fs_stat。",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=24"
+  },
+  "exports": {
+    ".": "./dsh/index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dsh",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml",
+      "platforms": [
+        "win32"
+      ]
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tokenis2023/agent-ops.git"
+  },
+  "homepage": "https://github.com/tokenis2023/agent-ops#readme",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "filesystem",
+    "windows",
+    "agent"
+  ]
+}

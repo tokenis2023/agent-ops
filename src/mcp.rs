@@ -45,7 +45,7 @@ pub fn serve() -> io::Result<()> {
                     "protocolVersion": requested,
                     "capabilities": {"tools": {"listChanged": false}},
                     "serverInfo": {"name": "fsops", "version": crate::VERSION},
-                    "instructions": "文件读写、搜索、编辑、元信息操作优先使用 fs_* 工具。只要 fsops 可用，不要用宿主内置 read_file/write_file/search_files 或 shell 的 cat/head/tail/grep/find/sed 处理文本；仅当 fsops 不可用、超时，或目标是图片/PDF/二进制时回退。局部修改用 fs_edit，不要整文件读回再 fs_write。用 fs_grep 拿到行号后，用 fs_read start=N block=true 一次取回整个代码块，不必猜 end。",
+                    "instructions": instructions(),
                 }))
             }
             "ping" => Ok(json!({})),
@@ -85,6 +85,15 @@ fn err_resp(id: Value, code: i64, msg: &str) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": msg}})
 }
 
+/// initialize 返回的系统级引导。
+///
+/// 与 `adopt::RULE_BODY` 保持同一套路由：DOCX/PDF 正文都走 `fs_read`，
+/// 只有图片和不支持的二进制回退宿主；正则编辑和 diff 自查写进短句，
+/// 不再复制整份文档。
+pub fn instructions() -> &'static str {
+    "文件读写、搜索、编辑、元信息操作优先使用 fs_* 工具。只要 fsops 可用，不要用宿主内置 read_file/write_file/search_files 或 shell 的 cat/head/tail/grep/find/sed 处理文本；仅当 fsops 不可用、超时，或目标是图片/不支持的二进制时回退。DOCX/PDF 正文走 fs_read。局部修改用 fs_edit，不要整文件读回再 fs_write；只知道文本形状时用 pattern/replacement 正则替换，不必先抄原文，改结构后用 diff=true 自查。用 fs_grep 拿到行号后，用 fs_read start=N block=true 一次取回整个代码块，不必猜 end。"
+}
+
 /// 多文件响应里错误可能出现在任意一行；识别 `E_XXX ` 形式的错误码行。
 fn has_error_line(text: &str) -> bool {
     text.lines().any(|line| {
@@ -103,6 +112,24 @@ fn has_error_line(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 引导明确_pdf_正文走_fs_read() {
+        // PDF 有文本层，和 DOCX 一样属于 fsops 该接管的正文；
+        // 写成“图片/PDF 回退”会让 Agent 把整份 PDF 丢回宿主 Read。
+        let text = instructions();
+        assert!(text.contains("DOCX/PDF"), "{text}");
+        assert!(text.contains("fs_read"), "{text}");
+        assert!(
+            !text.contains("图片/PDF") && !text.contains("PDF/二进制"),
+            "PDF 不应与图片/二进制一起回退: {text}"
+        );
+        assert!(
+            text.contains("pattern") && text.contains("replacement"),
+            "缺少正则编辑引导: {text}"
+        );
+        assert!(text.contains("diff=true"), "缺少 diff 自查引导: {text}");
+    }
 
     #[test]
     fn 识别夹在正文中的错误行() {

@@ -27,6 +27,8 @@ pub struct WalkOpts {
     pub include_dirs: bool,
     pub limit: usize,
     pub follow_links: bool,
+    /// glob 分页时跳过的匹配条目数；visit 不使用该字段。
+    pub offset: usize,
     /// 遍历时间预算；无匹配时也要能及时返回，避免全盘扫描把 Agent 卡死。
     pub time_budget_ms: u128,
     /// 忽略 .gitignore 与硬跳过目录。只在明确要查依赖源码/构建产物时打开：
@@ -40,6 +42,7 @@ impl Default for WalkOpts {
             include_dirs: false,
             limit: usize::MAX,
             follow_links: false,
+            offset: 0,
             time_budget_ms: 5000,
             no_ignore: false,
         }
@@ -71,7 +74,16 @@ pub struct WalkReport {
     pub stopped: bool,
     /// 是否因时间预算耗尽而停止；与“没有匹配”区分开。
     pub timed_out: bool,
+    /// 因 offset 跳过的匹配条目数；用于区分“本页为空”和“完全无匹配”。
+    pub offset_skipped: usize,
+    /// 达到 limit 后只探测了有限个后续原始目录项，仍未确认是否存在下一页。
+    /// 与 timed_out 分开：这不是时间预算耗尽，而是主动限制探测成本。
+    pub lookahead_limited: bool,
 }
+
+/// 达到 limit 后，为确认“是否还有下一页”最多再看多少个后续原始目录项。
+/// 全量探测会把大仓库里的即时返回拖到时间预算上限。
+const LOOKAHEAD_ITEMS: usize = 1024;
 
 /// 拆分逗号分隔的 glob，但忽略花括号/方括号内部的逗号。
 ///
@@ -143,10 +155,13 @@ where
         entries_visited: 0,
         stopped: opts.limit == 0,
         timed_out: false,
+        offset_skipped: 0,
+        lookahead_limited: false,
     };
     // 入口就检查 deadline：预算为 0 时必须立刻返回，
     // 否则要等第一个 256 项检查点，白扫 256 项（且错误信息会误导成"已访问 256 项"）。
-    if std::time::Instant::now() > opts.deadline() {
+    let deadline = opts.deadline();
+    if std::time::Instant::now() > deadline {
         report.timed_out = true;
         report.stopped = true;
         return Ok(report);
@@ -196,7 +211,15 @@ where
                 .unwrap_or(false)
         });
 
+    let mut raw_entries = 0usize;
     for entry in walker.build() {
+        raw_entries += 1;
+        // deadline 由遍历层自己执行，不依赖匹配后的 visitor 被调用。
+        if raw_entries.is_multiple_of(256) && std::time::Instant::now() > deadline {
+            report.timed_out = true;
+            report.stopped = true;
+            return Ok(report);
+        }
         let entry = match entry {
             Ok(e) => e,
             Err(_) => continue,
@@ -232,6 +255,8 @@ where
             break;
         }
     }
+    // 不再在循环结束后按耗时补判 timed_out：遍历已经完整走完，
+    // 慢不等于没走完；visitor 自己的 deadline 由调用方检查。
     Ok(report)
 }
 
@@ -251,6 +276,8 @@ pub fn glob_with_report(
         entries_visited: 0,
         stopped: false,
         timed_out: false,
+        offset_skipped: 0,
+        lookahead_limited: false,
     };
     let (entries, timed_out) = glob_inner(root, pattern, opts, deadline, &mut report)?;
     report.timed_out = timed_out;
@@ -291,6 +318,11 @@ fn glob_inner(
         if has_pattern && !set.is_match(&rel_posix) {
             return Ok((Vec::new(), false));
         }
+        if opts.offset > 0 {
+            // 这里确实存在 1 个匹配条目，只是被本页 offset 跳过。
+            report.offset_skipped = 1;
+            return Ok((Vec::new(), false));
+        }
         let m = match meta(root) {
             Ok(m) => m,
             Err(_) => return Ok((Vec::new(), false)),
@@ -329,6 +361,9 @@ fn glob_inner(
         });
 
     let mut out = Vec::new();
+    let mut skipped = 0usize;
+    // 达到 limit 后用于“是否还有下一页”的有限探测计数。
+    let mut probed = 0usize;
     for entry in walker.build() {
         let entry = match entry {
             Ok(e) => e,
@@ -337,6 +372,16 @@ fn glob_inner(
         let path = entry.path();
         if path == base {
             continue;
+        }
+        if out.len() >= opts.limit {
+            // 已满页：只为确认下一页探测有限个后续原始目录项。
+            // 全量走到底会把大仓库里本应即时返回的 glob 拖到时间预算上限。
+            if probed >= LOOKAHEAD_ITEMS {
+                report.lookahead_limited = true;
+                report.stopped = true;
+                break;
+            }
+            probed += 1;
         }
         report.entries_visited += 1;
         // 每 256 项检查一次 deadline：全盘无匹配时也能按时返回。
@@ -352,6 +397,16 @@ fn glob_inner(
         if has_pattern && !set.is_match(&rel_posix) {
             continue;
         }
+        if skipped < opts.offset {
+            skipped += 1;
+            report.offset_skipped = skipped;
+            continue;
+        }
+        if out.len() >= opts.limit {
+            // 真正观察到下一个匹配条目才报告还有下一页。
+            report.stopped = true;
+            break;
+        }
         let fp = FsPath::parse(&path.to_string_lossy())?;
         let m = match meta(&fp) {
             Ok(m) => m,
@@ -364,25 +419,9 @@ fn glob_inner(
             size: m.size,
             mtime: m.mtime,
         });
-        if out.len() >= opts.limit {
-            break;
-        }
     }
 
-    let mut timed_out = false;
-    if std::time::Instant::now() > deadline && out.len() < opts.limit {
-        timed_out = true;
-    }
-    if out.len() == opts.limit {
-        // 无法在不继续遍历的情况下确认是否还有更多，明确提示而不是静默截断。
-        out.push(Entry {
-            path: format!("… 达到 limit={}，可能还有更多", opts.limit),
-            is_dir: false,
-            size: 0,
-            mtime: std::time::SystemTime::UNIX_EPOCH,
-        });
-    }
-    Ok((out, timed_out))
+    Ok((out, false))
 }
 
 /// 紧凑列表：默认只给路径（目录带 `/`），`detail` 时补大小与时间。
@@ -528,6 +567,7 @@ mod tests {
             include_dirs: false,
             limit: usize::MAX,
             follow_links: false,
+            offset: 0,
             time_budget_ms: 0,
             no_ignore: false,
         };
@@ -549,6 +589,7 @@ mod tests {
             include_dirs: false,
             limit: usize::MAX,
             follow_links: false,
+            offset: 0,
             time_budget_ms: 0,
             no_ignore: false,
         };
@@ -564,7 +605,7 @@ mod tests {
     }
 
     #[test]
-    fn glob_limit提前停止并标注可能有更多() {
+    fn glob_limit提前停止并确认真实后续条目() {
         let tmp = std::env::temp_dir().join(format!("fsops-glob-limit-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
@@ -573,7 +614,7 @@ mod tests {
         }
 
         let root = FsPath::parse(&tmp.to_string_lossy()).unwrap();
-        let got = glob(
+        let (got, report) = glob_with_report(
             &root,
             "**/*.txt",
             &WalkOpts {
@@ -584,9 +625,39 @@ mod tests {
         .unwrap();
         let _ = fs::remove_dir_all(&tmp);
 
-        assert_eq!(got.len(), 2, "返回条目数不符");
+        assert_eq!(got.len(), 1, "返回条目数不符");
         assert!(got[0].path.ends_with(".txt"));
-        assert!(got[1].path.contains("还有更多"), "{:?}", got[1].path);
+        assert!(report.stopped, "已观察到第二个匹配，应标记停止");
+    }
+
+    #[test]
+    fn visit无匹配且visitor不调用时也能超时() {
+        let dir = std::env::temp_dir().join(format!("fsops-visit-timeout-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        for i in 0..600 {
+            fs::write(dir.join(format!("f{i}.txt")), "x").unwrap();
+        }
+        let root = FsPath::parse(&dir.to_string_lossy()).unwrap();
+        let mut calls = 0usize;
+        let report = visit(
+            &root,
+            "**/*.zzz",
+            &WalkOpts {
+                include_dirs: false,
+                time_budget_ms: 1,
+                ..Default::default()
+            },
+            |_| {
+                calls += 1;
+                VisitControl::Continue
+            },
+        )
+        .unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(calls, 0, "无匹配时 visitor 不应调用");
+        assert!(report.timed_out, "遍历内部未执行 deadline");
+        assert!(report.stopped, "超时应报告停止");
     }
 
     #[test]
@@ -618,6 +689,72 @@ mod tests {
         assert_eq!(report.entries_visited, 1);
         assert!(report.stopped);
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn 完整遍历即使超过预算也不误报超时() {
+        // 遍历已经自然结束：即使耗时超过预算，也不能谎报 timed_out。
+        // grep 的 visitor 自己会检查 deadline；walk 只对“没走完”负责。
+        let tmp = std::env::temp_dir().join(format!("fsops-visit-done-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            fs::write(tmp.join(name), "x").unwrap();
+        }
+        let root = FsPath::parse(&tmp.to_string_lossy()).unwrap();
+        let report = visit(
+            &root,
+            "**/*.txt",
+            &WalkOpts {
+                time_budget_ms: 10,
+                ..Default::default()
+            },
+            |_| {
+                std::thread::sleep(std::time::Duration::from_millis(15));
+                VisitControl::Continue
+            },
+        )
+        .unwrap();
+        let _ = fs::remove_dir_all(&tmp);
+        assert_eq!(report.entries_visited, 3, "三项都应访问到");
+        assert!(!report.timed_out, "遍历已完整结束，不应误报超时");
+        assert!(!report.stopped, "自然结束不是被截断");
+    }
+
+    #[test]
+    fn glob达到limit后只探测有限后续项() {
+        // 1 个匹配 + 大量后续项：不能为了确认“有没有下一页”全量走到底。
+        // 上限是 1024 个后续原始目录项；超出后必须给出明确状态而不是假装末页。
+        let tmp = std::env::temp_dir().join(format!("fsops-lookahead-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(tmp.join("a_match.txt"), "x").unwrap();
+        for i in 0..1200 {
+            fs::write(tmp.join(format!("zzz{i:04}.txt")), "x").unwrap();
+        }
+        let root = FsPath::parse(&tmp.to_string_lossy()).unwrap();
+        let (entries, report) = glob_with_report(
+            &root,
+            "**/a_match.txt",
+            &WalkOpts {
+                limit: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let _ = fs::remove_dir_all(&tmp);
+        assert_eq!(entries.len(), 1);
+        assert!(
+            report.entries_visited <= 1 + 1024,
+            "lookahead 只应探测 1024 个后续项，实际访问 {} 项",
+            report.entries_visited
+        );
+        assert!(report.stopped, "探测到上限应停止并报告");
+        assert!(
+            report.lookahead_limited,
+            "未探测完必须用独立字段说明，不能伪装成末页或超时"
+        );
+        assert!(!report.timed_out, "这不是时间预算耗尽，不应标 timed_out");
     }
 
     #[test]

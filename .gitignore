@@ -1,5 +1,6 @@
 /target
 /dist
+node_modules/
 /.planning
 __pycache__/
 *.pyc

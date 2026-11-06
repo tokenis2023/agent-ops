@@ -10,11 +10,12 @@ case "${1:-build}" in
   test)    cargo test ;;
   e2e)     cargo build && "$PYTHON" tests/windows_semantics.py ;;
   bench)   "$PYTHON" tests/bench.py "${2:-}" ;;
+  dsh)     cargo build && node tests/dsh_plugin_smoke.mjs --exe target/debug/fsops.exe ;;
   all)
     cargo test
     cargo build
     "$PYTHON" tests/windows_semantics.py
     cargo build --release
     ;;
-  *) echo "用法: scripts/build.sh [build|test|e2e|bench|all]"; exit 1 ;;
+  *) echo "用法: scripts/build.sh [build|test|e2e|bench|dsh|all]"; exit 1 ;;
 esac

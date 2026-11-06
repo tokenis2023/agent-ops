@@ -902,6 +902,27 @@ check("harden 移除后不再接管",
       code == 0 and "hook claude" not in open(hard_settings, encoding="utf-8").read(),
       out + err)
 
+# 19. fs_read summary：只给结构，不给正文
+summary_file = os.path.join(root, "summary_sample.rs")
+open(summary_file, "w", encoding="utf-8", newline="\n").write(
+    "use std::x;\n\npub struct Demo {\n    value: u8,\n}\n\n"
+    "impl Demo {\n    pub fn new() -> Self { Self { value: 0 } }\n}\n\n"
+    "#[cfg(test)]\nmod tests {\n    #[test]\n    fn t1() {}\n}\n\n"
+    "pub fn tail() {}\n"
+)
+text, _ = call("fs_read", path=posix(summary_file), summary=True)
+check("summary 只输出声明与行号",
+      "结构摘要" in text and "3|pub struct Demo" in text
+      and "8|    pub fn new" in text and "pub fn tail" in text, text)
+check("summary 跳过测试模块", "fn t1" not in text, text)
+check("summary 给出继续读的入口", "block=true" in text, text)
+text, _ = call("fs_read", path=posix(summary_file), summary=True, block=True)
+check("summary 与 block 互斥", text.startswith("E_BAD_ARGS"), text)
+data_file = os.path.join(root, "summary_data.json")
+open(data_file, "w", encoding="utf-8").write('{"a": 1}\n')
+text, _ = call("fs_read", path=posix(data_file), summary=True)
+check("summary 拒绝数据文件", text.startswith("E_BAD_ARGS") and "数据文件" in text, text)
+
 passed = sum(1 for _, c, _ in results if c)
 print(f"\n{passed}/{len(results)} 通过   目录={root}")
 # 用完即清：临时夹具不留在磁盘上

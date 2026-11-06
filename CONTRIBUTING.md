@@ -9,13 +9,28 @@
 
 ## 本地验证
 
+按改动范围选档位，不要每次编辑都跑全套：
+
+```powershell
+.\scripts\check.ps1 fast     # 格式 + clippy + 改动模块单测        约 1–7 秒
+.\scripts\check.ps1 commit   # fast + 完整 cargo test              约 8 秒
+.\scripts\check.ps1 full     # commit + 构建 + 真实 MCP e2e + 任务级基准 + DSH 插件冒烟  约 16 秒
+```
+
+- 编辑过程中用 `fast`（改动模块自动推断，也可用 `-Module tools` 指定）。
+- 提交前跑 `commit`。
+- push 前，或改动 `io`/`text`/`edit`/`render` 等 I/O 内核时跑 `full`。
+
+等价的底层命令：
+
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 cargo build
 python tests/windows_semantics.py
-cargo build --release
+python tests/task_bench.py --exe target/debug/fsops.exe
+node tests/dsh_plugin_smoke.mjs --exe target/debug/fsops.exe
 ```
 
 也可以运行：
@@ -37,12 +52,10 @@ bash scripts/build.sh all
 
 ## 提交前检查
 
-1. `cargo fmt --check` 通过。
-2. `cargo clippy --all-targets -- -D warnings` 通过。
-3. `cargo test` 全部通过。
-4. `python tests/windows_semantics.py` 全部通过。
-5. `git diff --check` 无空白错误。
-6. 没有新增未跟踪的临时文件。
+1. `.\scripts\check.ps1 commit` 通过（等价于 fmt + clippy + 完整 cargo test）。
+2. 准备 push 或改动 I/O 内核时，`.\scripts\check.ps1 full` 通过。
+3. `git diff --check` 无空白错误。
+4. 没有新增未跟踪的临时文件。
 
 ## 重新构建 release
 

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "fsops file tools",
+    "description": "Windows-native file operations for agents: POSIX path forms, CRLF/LF normalization, GBK/UTF-16 encoding fidelity, atomic writes and concurrency fingerprints."
+  }
+}

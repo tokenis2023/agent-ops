@@ -8,6 +8,7 @@
 
 use crate::tools;
 use serde_json::{json, Value};
+use std::io::Read;
 
 pub fn run(args: &[String]) -> i32 {
     let cmd = args.first().map(String::as_str).unwrap_or("");
@@ -150,12 +151,34 @@ fn cmd_stat(args: &[String]) -> String {
     tools::call("fs_stat", &json!({"paths": paths}))
 }
 
+/// 读取 `fsops call` 的 JSON 载荷：`-` 或 `--stdin` 表示从标准输入读。
+///
+/// 进程参数在 Windows 上有约 32 KB 上限，大段 `content`/`edits` 必须走 stdin；
+/// 插件（DSH 等）也用它传参，避免命令行长度问题。
+fn read_call_payload(arg: Option<&str>, stdin: &mut dyn Read) -> Result<String, String> {
+    match arg {
+        Some("-") | Some("--stdin") => {
+            let mut buf = String::new();
+            stdin
+                .read_to_string(&mut buf)
+                .map_err(|e| format!("E_BAD_ARGS 读取标准输入失败: {e}"))?;
+            Ok(buf)
+        }
+        Some(value) => Ok(value.to_string()),
+        None => Ok("{}".into()),
+    }
+}
+
 fn cmd_call(args: &[String]) -> String {
     let name = match args.first() {
         Some(n) => n.clone(),
         None => return "E_BAD_ARGS 用法: fsops call <tool> '<json>'".into(),
     };
-    let raw = args.get(1).cloned().unwrap_or_else(|| "{}".into());
+    let mut stdin = std::io::stdin();
+    let raw = match read_call_payload(args.get(1).map(String::as_str), &mut stdin) {
+        Ok(raw) => raw,
+        Err(e) => return e,
+    };
     let value: Value = match serde_json::from_str(&raw) {
         Ok(v) => v,
         Err(e) => return format!("E_BAD_ARGS JSON 解析失败: {e}"),
@@ -195,4 +218,33 @@ fn install(args: &[String]) -> i32 {
         ),
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_call_payload;
+    use std::io::Cursor;
+
+    #[test]
+    fn call载荷从标准输入读取() {
+        let mut input = Cursor::new(b"{\"path\":\"/d/a.txt\"}".to_vec());
+        let payload = read_call_payload(Some("-"), &mut input).expect("读取 stdin 不应失败");
+        assert_eq!(payload, "{\"path\":\"/d/a.txt\"}");
+    }
+
+    #[test]
+    fn call载荷保留位置参数与缺省空对象() {
+        let mut input = Cursor::new(Vec::new());
+        assert_eq!(read_call_payload(Some("{}"), &mut input).unwrap(), "{}");
+        assert_eq!(read_call_payload(None, &mut input).unwrap(), "{}");
+    }
+
+    #[test]
+    fn call载荷支持长别名stdin() {
+        let mut input = Cursor::new(b"{\"pattern\":\"x\"}".to_vec());
+        assert_eq!(
+            read_call_payload(Some("--stdin"), &mut input).unwrap(),
+            "{\"pattern\":\"x\"}"
+        );
+    }
 }
