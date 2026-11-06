@@ -609,6 +609,25 @@ body = [l for l in text.splitlines() if "|" in l]
 check("block=true 嵌套块内展开到最近的 if",
       err is False and len(body) == 3 and body[0].startswith("3|"), text)
 
+# fs_edit diff=true：改完直接看到变更片段，省一次回读
+diff_path = os.path.join(root, "diff-probe.rs")
+open(diff_path, "w", encoding="utf-8").write("fn f() {\n    let t = 30;\n}\n")
+text, err = call("fs_edit", path=posix(diff_path),
+                 edits=[{"old": "let t = 30", "new": "let t = 60"}], diff=True)
+check("fs_edit diff=true 输出 @@ 片段",
+      err is False and "@@ 2" in text and "-let t = 30" in text
+      and "+let t = 60" in text, text)
+text, err = call("fs_edit", path=posix(diff_path),
+                 edits=[{"old": "let t = 60", "new": "let t = 90"}])
+check("fs_edit 默认不输出 diff", err is False and "@@" not in text, text)
+before = open(diff_path, encoding="utf-8").read()
+text, err = call("fs_edit", path=posix(diff_path),
+                 edits=[{"old": "let t = 90", "new": "let t = 120"}],
+                 diff=True, dry_run=True)
+check("dry_run+diff 不改文件",
+      err is False and "@@ 2" in text
+      and open(diff_path, encoding="utf-8").read() == before, text)
+
 # fs_edit 行范围限定：同一字面量多处出现时只改指定区间
 range_path = os.path.join(root, "range-edit.rs")
 open(range_path, "w", encoding="utf-8").write(

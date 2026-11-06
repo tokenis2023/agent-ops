@@ -24,6 +24,14 @@ pub struct EditSpec {
     pub end: Option<usize>,
 }
 
+/// 一处改动的原文与新文，供 `diff=true` 的紧凑展示。
+#[derive(Debug, Default)]
+pub struct Hunk {
+    pub line: usize,
+    pub old: String,
+    pub new: String,
+}
+
 #[derive(Debug, Default)]
 pub struct EditResult {
     pub applied: usize,
@@ -31,12 +39,17 @@ pub struct EditResult {
     pub removed_lines: i64,
     /// 每处修改的落点，如 `12`、`40-52`
     pub loci: Vec<String>,
+    /// 每处改动的原文与新文，按 MAX_HUNKS 截断
+    pub hunks: Vec<Hunk>,
     pub encoding: String,
     pub eol: String,
 }
 
 /// loci 只用于展示摘要，保留前若干个即可；全量保存会让大文件批量替换变成 O(n²)。
 const MAX_LOCI: usize = 64;
+
+/// diff 展示的改动块上限，避免大文件批量替换把响应撑爆。
+const MAX_HUNKS: usize = 32;
 
 /// 在已解码文本上按原换行风格匹配、修改，返回新文本与摘要。
 pub fn apply(original: &str, eol: Eol, edits: &[EditSpec]) -> Result<(String, EditResult), String> {
@@ -113,6 +126,13 @@ pub fn apply(original: &str, eol: Eol, edits: &[EditSpec]) -> Result<(String, Ed
             }
             res.applied += 1;
             push_locus(&mut res.loci, line_no, &repl);
+            if res.hunks.len() < MAX_HUNKS {
+                res.hunks.push(Hunk {
+                    line: line_no,
+                    old: needle.clone(),
+                    new: repl.clone(),
+                });
+            }
         }
         work = next;
     }
@@ -257,6 +277,17 @@ mod tests {
             start: None,
             end: None,
         }
+    }
+
+    #[test]
+    fn 记录改动块用于diff() {
+        let mut e = spec("b", "BB");
+        e.all = true;
+        let (_out, res) = apply("a\nb\nc\n", Eol::Lf, &[e]).unwrap();
+        assert_eq!(res.hunks.len(), 1);
+        assert_eq!(res.hunks[0].line, 2);
+        assert_eq!(res.hunks[0].old, "b");
+        assert_eq!(res.hunks[0].new, "BB");
     }
 
     #[test]

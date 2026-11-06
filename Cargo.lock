@@ -301,7 +301,7 @@ dependencies = [
 
 [[package]]
 name = "fsops"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "blake3",
  "encoding_rs",

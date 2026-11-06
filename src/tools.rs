@@ -68,6 +68,7 @@ pub fn tool_defs() -> Vec<Value> {
                         }
                     },
                     "dry_run": {"type": "boolean", "description": "只校验不落盘"},
+                    "diff": {"type": "boolean", "description": "附带被替换的原文/新文片段（`@@ 行号` + `-原文` / `+新文`）；默认关闭，改结构后想自查时打开，可省一次 fs_read"},
                     "normalize_eol": {"type": "boolean", "description": "混合换行时显式归一为 LF"},
                     "expect_hash": {"type": "string", "description": "单文件并发保护：文件已变则拒绝写入"}
                 },
@@ -1333,6 +1334,45 @@ mod tests {
         assert!(out.starts_with("E_BAD_ARGS"), "应报参数错误: {out}");
         assert!(out.contains("old 与 new"), "{out}");
         assert_eq!(content, "keep me\n", "文件不应被改动");
+    }
+
+    #[test]
+    fn diff参数输出改动片段() {
+        // 改完结构想自查时，diff=true 省掉一次 fs_read 回读。
+        let dir = 临时目录("edit-diff");
+        let f = dir.join("a.rs");
+        fs::write(&f, "fn f() {\n    let timeout = 30;\n}\n").unwrap();
+        let fp = FsPath::parse(&f.to_string_lossy()).unwrap();
+
+        let plain = edit_tool(&json!({
+            "path": fp.display(),
+            "edits": [{"old": "let timeout = 30", "new": "let timeout = 60"}]
+        }));
+        assert!(!plain.contains("@@"), "默认不应输出 diff: {plain}");
+
+        let with_diff = edit_tool(&json!({
+            "path": fp.display(),
+            "edits": [{"old": "let timeout = 60", "new": "let timeout = 90"}],
+            "diff": true
+        }));
+        assert!(with_diff.contains("@@ 2"), "{with_diff}");
+        assert!(with_diff.contains("-let timeout = 60"), "{with_diff}");
+        assert!(with_diff.contains("+let timeout = 90"), "{with_diff}");
+
+        // dry_run + diff：能看到将改什么，且不落盘
+        let before = fs::read_to_string(&f).unwrap();
+        let dry = edit_tool(&json!({
+            "path": fp.display(),
+            "edits": [{"old": "let timeout = 90", "new": "let timeout = 120"}],
+            "diff": true,
+            "dry_run": true
+        }));
+        assert!(dry.contains("@@ 2"), "{dry}");
+        assert_eq!(
+            fs::read_to_string(&f).unwrap(),
+            before,
+            "dry_run 不应改文件"
+        );
     }
 
     #[test]
@@ -2865,6 +2905,9 @@ fn edit_tool(args: &Value) -> String {
                 item.fp.display(),
                 format_loci(&item.result.loci)
             ));
+            if arg_bool(args, "diff", false) {
+                out.push_str(&render_hunks(&item.result.hunks));
+            }
         }
         return out;
     }
@@ -2882,7 +2925,7 @@ fn edit_tool(args: &Value) -> String {
 
     if file_count == 1 {
         let item = &prepared[0];
-        return format!(
+        let mut out = format!(
             "ok {} 处修改 (+{} -{}) @ {}  {}  hash={}",
             item.result.applied,
             item.result.added_lines,
@@ -2891,6 +2934,10 @@ fn edit_tool(args: &Value) -> String {
             item.fp.display(),
             io::hash_hex(&item.bytes)
         );
+        if arg_bool(args, "diff", false) {
+            out.push_str(&render_hunks(&item.result.hunks));
+        }
+        return out;
     }
 
     let mut out = format!(
@@ -2904,6 +2951,40 @@ fn edit_tool(args: &Value) -> String {
             format_loci(&item.result.loci),
             io::hash_hex(&item.bytes)
         ));
+        if arg_bool(args, "diff", false) {
+            out.push_str(&render_hunks(&item.result.hunks));
+        }
+    }
+    out
+}
+
+/// 把改动渲染成紧凑 @@ 片段；`fs_edit diff=true` 用它省掉一次回读。
+fn render_hunks(hunks: &[crate::edit::Hunk]) -> String {
+    const MAX_LINES: usize = 60;
+    let mut out = String::new();
+    let mut shown = 0usize;
+    for h in hunks {
+        if shown >= MAX_LINES {
+            break;
+        }
+        out.push_str(&format!("\n@@ {}", h.line));
+        for l in h.old.split('\n') {
+            if shown >= MAX_LINES {
+                break;
+            }
+            out.push_str(&format!("\n-{l}"));
+            shown += 1;
+        }
+        for l in h.new.split('\n') {
+            if shown >= MAX_LINES {
+                break;
+            }
+            out.push_str(&format!("\n+{l}"));
+            shown += 1;
+        }
+    }
+    if shown >= MAX_LINES {
+        out.push_str("\n… diff 已截断");
     }
     out
 }

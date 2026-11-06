@@ -6,6 +6,11 @@
 
 （暂无）
 
+## [0.2.4] - 2026-11-06
+
+- `fs_edit` 新增 `diff=true`：返回被替换的原文/新文片段（`@@ 行号` + `-原文` / `+新文`），改完结构可立即自查，省掉一次 `fs_read` 回读；`dry_run` 也能配合使用，先看后写。默认关闭，单次最多 60 行，超出标「已截断」。
+- 文档：`使用指南` 的 Hermes 章节按实测重写——`tools.tool_search.defer: []` 对 MCP 工具无效；真强制只能靠专用 profile 关掉 `file`/`coding` 工具集，或用 CLI 兜底；升级后需 `/reload-mcp` 才加载新 schema；用 `state.db` 里的 `mcp__fsops__%` 计数确认是否真被调用（`hermes mcp test` 只证明能握手）。
+
 ## [0.2.3] - 2026-11-06
 
 - `fs_edit` 的 `files[].edits` 嵌套 schema 补全字段：此前只写 `{"type":"object"}`，模型在批量编辑时看不到 `old/new/all/start/end`，只能猜。两处现在共用同一个 schema 函数，避免再漂移。
