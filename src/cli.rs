@@ -14,7 +14,15 @@ pub fn run(args: &[String]) -> i32 {
     let cmd = args.first().map(String::as_str).unwrap_or("");
     let rest = &args[1..];
     let out = match cmd {
-        "mcp" => return crate::mcp::serve().map(|_| 0).unwrap_or(1),
+        "mcp" => {
+            return match mcp_jobs(rest) {
+                Ok(jobs) => crate::mcp::serve_with(jobs).map(|_| 0).unwrap_or(1),
+                Err(e) => {
+                    println!("{e}");
+                    2
+                }
+            }
+        }
         "read" => cmd_read(rest),
         "grep" => cmd_grep(rest),
         "glob" => cmd_glob(rest),
@@ -42,7 +50,7 @@ fn usage() -> String {
         "fsops {} — 面向 AI Agent 的 Windows 文件操作层
 
 用法:
-  fsops mcp                              以 MCP 服务运行（stdio）
+  fsops mcp [--jobs N]                   以 MCP 服务运行（stdio；默认 4 并发，0/1 串行）
   fsops read <path> [--start N] [--end N] [--budget N]
   fsops grep <pattern> [--path DIR] [--glob G] [--context N] [--ignore-case]
   fsops glob [pattern] [--path DIR] [--dirs] [--limit N]
@@ -68,6 +76,17 @@ fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 
 fn has(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
+}
+
+/// fsops mcp --jobs N：默认 4；0/1 表示串行。
+fn mcp_jobs(args: &[String]) -> Result<usize, String> {
+    let Some(raw) = flag(args, "--jobs") else {
+        return Ok(4);
+    };
+    match raw.parse::<usize>() {
+        Ok(n) if n <= 64 => Ok(n),
+        _ => Err(format!("E_BAD_ARGS --jobs 需要 0-64 的整数，当前 {raw}")),
+    }
 }
 
 fn positional(args: &[String]) -> Vec<String> {
@@ -183,6 +202,8 @@ fn cmd_call(args: &[String]) -> String {
         Ok(v) => v,
         Err(e) => return format!("E_BAD_ARGS JSON 解析失败: {e}"),
     };
+    // 一次性进程没有长驻任务表：后台任务在这里必须明确拒绝，避免留下孤儿进程。
+    crate::jobs::disable();
     tools::call(&name, &value)
 }
 
@@ -222,7 +243,7 @@ fn install(args: &[String]) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::read_call_payload;
+    use super::{mcp_jobs, read_call_payload};
     use std::io::Cursor;
 
     #[test]
@@ -237,6 +258,21 @@ mod tests {
         let mut input = Cursor::new(Vec::new());
         assert_eq!(read_call_payload(Some("{}"), &mut input).unwrap(), "{}");
         assert_eq!(read_call_payload(None, &mut input).unwrap(), "{}");
+    }
+
+    #[test]
+    fn mcp参数解析jobs() {
+        assert_eq!(mcp_jobs(&[] as &[String]).unwrap(), 4);
+        assert_eq!(
+            mcp_jobs(&["--jobs".to_string(), "8".to_string()]).unwrap(),
+            8
+        );
+        assert_eq!(
+            mcp_jobs(&["--jobs".to_string(), "1".to_string()]).unwrap(),
+            1
+        );
+        assert!(mcp_jobs(&["--jobs".to_string(), "x".to_string()]).is_err());
+        assert!(mcp_jobs(&["--jobs".to_string(), "999".to_string()]).is_err());
     }
 
     #[test]

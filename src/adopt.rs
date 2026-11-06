@@ -20,12 +20,18 @@ const RULE_BODY: &str = "## 文件操作：优先使用 fsops\n\n\
 - 查找文件：`fs_glob`（替代 find / Glob / Get-ChildItem）\n\
 - 修改：`fs_edit`（替代 patch / Edit / apply_patch）\n\
 - 覆盖或新建：`fs_write`（替代 write_file / Write）\n\
-- 元信息：`fs_stat`（替代 stat / ls / Get-Item）\n\n\
+- 元信息：`fs_stat`（替代 stat / ls / Get-Item）\n\
+- 执行命令：`fs_exec`（argv 数组，不经过 shell；替代 PowerShell 的 cmd 字符串）\n\
+- 文件管理：`fs_file`（copy/move/remove/mkdir/convert；替代 Copy-Item / Move-Item / Remove-Item / New-Item）\n\n\
 规则：\n\
 - 只要 fsops 可用，就不要用宿主内置文件工具或 shell 的 cat/head/tail/grep/find/sed 处理文本。\n\
 - DOCX/PDF 正文都可以直接用 `fs_read` 读取（PDF 只读）；`fs_write` 可整体重建 DOCX。\n\
 - 读取长文件用 `start`/`end`/`ranges`；搜索用 `fs_grep` 的分页参数。\n\
 - 先用 `fs_grep` 拿行号，再 `fs_read start=N block=true` 一次拿到包含该行的整个函数/代码块，不要猜 `end`。\n\
+- 同一次回复里可以并行发起多个只读 `fs_read`/`fs_grep`；已知多个文件时用 `fs_read reads=[{path,start,end},...]` 一次读完，不要一个文件一轮。\n\
+- 只想按模式取代码块时用 `fs_read focus=<正则>`：它会把命中行展开成完整代码块，省掉 grep 再 block 两步。\n\
+- 大仓库先 `fs_glob map=true focus=<关键词>` 看结构，再决定 grep/read，避免多轮试探。\n\
+- 跑 cargo/git/npm/python 用 `fs_exec` 的 argv 数组，不要用 PowerShell 拼命令行；复制/移动/删除/建目录用 `fs_file`。\n\
 - 同一字面量在文件里多处出现、只想改其中几处时，用 `fs_edit` 的 `start`/`end` 限定行范围。\n\
 - 只知道文本形状、不知道确切原文时，用 `fs_edit` 的 `pattern`/`replacement` 正则替换（支持 `$1`），不要先读全文抄原文。\n\
 - 结构调整后用 `fs_edit diff=true` 自查改动片段，省掉一次全文回读。\n\
@@ -916,6 +922,19 @@ mod tests {
         assert!(
             RULE_BODY.contains("diff=true"),
             "缺少 diff 自查引导: {RULE_BODY}"
+        );
+        assert!(
+            RULE_BODY.contains("并行") && RULE_BODY.contains("reads="),
+            "缺少并行/批量读取引导: {RULE_BODY}"
+        );
+        assert!(RULE_BODY.contains("focus="), "缺少 focus 引导: {RULE_BODY}");
+        assert!(
+            RULE_BODY.contains("map=true"),
+            "缺少 repo map 引导: {RULE_BODY}"
+        );
+        assert!(
+            RULE_BODY.contains("fs_exec") && RULE_BODY.contains("fs_file"),
+            "缺少执行/文件管理引导: {RULE_BODY}"
         );
         // output=count 默认是被工具层放宽成全量统计的；写成“不受 limit 截断”会误导。
         assert!(

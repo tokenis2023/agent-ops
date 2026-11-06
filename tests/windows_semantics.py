@@ -4,10 +4,12 @@
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import zipfile
 from pathlib import Path
 
@@ -490,8 +492,8 @@ check("fs_write 的 dry_run 对模型可见",
       "dry_run" in schemas.get("fs_write", {}), str(schemas.get("fs_write")))
 check("fs_edit 的 dry_run 对模型可见",
       "dry_run" in schemas.get("fs_edit", {}), str(schemas.get("fs_edit")))
-check("六个工具都在 tools/list 中",
-      len(schemas) == 6, str(sorted(schemas)))
+check("八个工具都在 tools/list 中",
+      len(schemas) == 8 and {"fs_exec", "fs_file"} <= set(schemas), str(sorted(schemas)))
 
 # 长行截断时要提示一次全文读法，且不能每行重复
 minjs_path = os.path.join(root, "min.js")
@@ -922,6 +924,122 @@ data_file = os.path.join(root, "summary_data.json")
 open(data_file, "w", encoding="utf-8").write('{"a": 1}\n')
 text, _ = call("fs_read", path=posix(data_file), summary=True)
 check("summary 拒绝数据文件", text.startswith("E_BAD_ARGS") and "数据文件" in text, text)
+
+# 20. fs_read reads / focus：一次调用完成多文件与按模式取块
+reads_dir = os.path.join(root, "reads_multi")
+os.makedirs(reads_dir)
+for _i in range(3):
+    with open(os.path.join(reads_dir, f"m{_i}.txt"), "w", encoding="utf-8", newline="\n") as _f:
+        _f.write("".join(f"m{_i}-L{j}\n" for j in range(1, 6)))
+text, _ = call("fs_read", reads=[
+    {"path": posix(os.path.join(reads_dir, f"m{_i}.txt")), "start": _i + 1, "end": _i + 2}
+    for _i in range(3)
+])
+check("reads 一次读三文件的不同区间",
+      all(f"{_i + 1}|m{_i}-L{_i + 1}" in text and f"{_i + 2}|m{_i}-L{_i + 2}" in text
+          for _i in range(3)), text)
+check("reads 不含区间外内容", "1|m1-L1" not in text, text)
+text, _ = call("fs_read", reads=[{"path": posix(summary_file)}], paths=[posix(summary_file)])
+check("reads 与 paths 互斥", text.startswith("E_BAD_ARGS") and "reads" in text, text)
+
+focus_file = os.path.join(root, "focus_sample.rs")
+open(focus_file, "w", encoding="utf-8", newline="\n").write(
+    "fn alpha() {\n    let a = 1;\n}\n\n"
+    "fn beta() {\n    let target = 2;\n}\n\n"
+    "fn gamma() {\n    let target = 3;\n}\n"
+)
+text, _ = call("fs_read", path=posix(focus_file), focus="target")
+check("focus 一次取回两个命中代码块",
+      "5|fn beta()" in text and "6|    let target = 2;" in text
+      and "9|fn gamma()" in text and "10|    let target = 3;" in text
+      and "let a = 1" not in text, text)
+text, _ = call("fs_read", path=posix(focus_file), focus="no_such_symbol")
+check("focus 无命中给出 fs_grep 建议",
+      text.startswith("E_NO_MATCH") and "fs_grep" in text, text)
+
+# 21. 读取缓存：只在同一次 MCP 会话内生效；fsops call 每次都是新进程
+cache_file = os.path.join(root, "cache_sample.txt")
+with open(cache_file, "w", encoding="utf-8", newline="\n") as _f:
+    _f.write("".join(f"c{i}\n" for i in range(1, 21)))
+text, _ = call("fs_read", path=posix(cache_file), start=1, end=20)
+check("缓存 单进程调用返回正文", "1|c1" in text and "20|c20" in text, text)
+text, _ = call("fs_read", path=posix(cache_file), start=1, end=20)
+check("缓存 跨进程不复用（新进程仍是正文）",
+      "1|c1" in text and "未变更" not in text, text)
+with open(cache_file, "w", encoding="utf-8", newline="\n") as _f:
+    _f.write("".join(f"n{i}\n" for i in range(1, 21)))
+text, _ = call("fs_read", path=posix(cache_file), start=1, end=20)
+check("缓存 文件改动后返回新内容", "1|n1" in text and "未变更" not in text, text)
+
+
+# 22. fs_glob map=true：一次调用给出 repo map
+map_repo = os.path.join(root, "map_repo")
+os.makedirs(map_repo)
+with open(os.path.join(map_repo, "core.rs"), "w", encoding="utf-8", newline="\n") as _f:
+    _f.write("pub struct Token {}\npub fn verify() {}\n")
+with open(os.path.join(map_repo, "user.rs"), "w", encoding="utf-8", newline="\n") as _f:
+    _f.write("fn use_it() { let t = Token; verify(); }\n")
+with open(os.path.join(map_repo, "main.rs"), "w", encoding="utf-8", newline="\n") as _f:
+    _f.write("fn main() {}\n")
+text, _ = call("fs_glob", path=posix(map_repo), pattern="**/*", map=True)
+check("map 一次调用给出排序后的文件与符号",
+      "符号" in text and "core.rs" in text and "pub fn verify" in text
+      and text.find("core.rs") < text.find("user.rs"), text)
+text, _ = call("fs_glob", path=posix(map_repo), pattern="**/*", map=True, dirs=True)
+check("map 与 dirs 互斥", text.startswith("E_BAD_ARGS"), text)
+
+# 23. fs_exec / fs_file：替代 PowerShell 的执行与文件管理
+text, _ = call("fs_exec", program="cmd", args=["/c", "echo", "e2e-exec"])
+check("fs_exec 返回退出码与 stdout",
+      text.startswith("ok exit=0") and "e2e-exec" in text, text)
+text, _ = call("fs_exec", program="cmd", args=["/c", "exit", "5"])
+check("fs_exec 非零退出不是错误", text.startswith("ok exit=5"), text)
+text, _ = call("fs_exec", program="cmd", args=["/c", "ping", "-n", "10", "127.0.0.1"],
+               timeout_ms=500)
+check("fs_exec 超时结束进程树", text.startswith("E_TIMEOUT"), text)
+
+exec_dir = os.path.join(root, "exec_files")
+text, _ = call("fs_file", op="mkdir", path=posix(exec_dir))
+check("fs_file mkdir 成功", text.startswith("ok mkdir"), text)
+src_file = os.path.join(exec_dir, "a.txt")
+open(src_file, "w", encoding="utf-8", newline="\n").write("hello\n")
+text, _ = call("fs_file", op="copy", src=posix(src_file), dst=posix(os.path.join(exec_dir, "b.txt")))
+check("fs_file copy 成功", text.startswith("ok copy"), text)
+text, _ = call("fs_file", op="move", src=posix(os.path.join(exec_dir, "b.txt")),
+               dst=posix(os.path.join(exec_dir, "c.txt")))
+check("fs_file move 成功", text.startswith("ok move"), text)
+text, _ = call("fs_file", op="remove", path=posix(os.path.join(exec_dir, "c.txt")))
+check("fs_file remove 需要 confirm", text.startswith("E_CONFIRM_REQUIRED"), text)
+text, _ = call("fs_file", op="remove", path=posix(os.path.join(exec_dir, "c.txt")), confirm=True)
+check("fs_file remove 确认后成功", text.startswith("ok remove"), text)
+gbk_file = os.path.join(exec_dir, "gbk.txt")
+open(gbk_file, "wb").write(b"\xd6\xd0\xce\xc4\r\n")
+text, _ = call("fs_file", op="convert", path=posix(gbk_file), encoding="utf-8", eol="lf")
+check("fs_file convert GBK 转 UTF-8",
+      text.startswith("ok convert") and open(gbk_file, "rb").read() == "中文\n".encode("utf-8"), text)
+
+# 24. fs_file archive / extract
+zip_dir = os.path.join(root, "zip_ops")
+os.makedirs(os.path.join(zip_dir, "in"))
+with open(os.path.join(zip_dir, "in", "a.txt"), "w", encoding="utf-8", newline="\n") as _f:
+    _f.write("A\n")
+zip_path = os.path.join(zip_dir, "out.zip")
+text, _ = call("fs_file", op="archive", src=posix(os.path.join(zip_dir, "in")), dst=posix(zip_path))
+check("fs_file archive 成功", text.startswith("ok archive") and os.path.exists(zip_path), text)
+out_dir = os.path.join(zip_dir, "out")
+text, _ = call("fs_file", op="extract", src=posix(zip_path), dst=posix(out_dir))
+check("fs_file extract 成功",
+      text.startswith("ok extract")
+      and open(os.path.join(out_dir, "a.txt"), encoding="utf-8").read() == "A\n", text)
+text, _ = call("fs_file", op="extract", src=posix(zip_path), dst=posix(out_dir))
+check("fs_file extract 默认不覆盖", text.startswith("E_EXISTS"), text)
+
+# 25. fs_exec 后台任务
+text, _ = call("fs_exec", program="cmd", args=["/c", "ping", "-n", "30", "127.0.0.1"],
+               background=True)
+check("fs_exec background 返回 job id", text.startswith("ok job="), text)
+text, _ = call("fs_exec", job=99999)
+check("fs_exec 未知 job 给出可执行错误", text.startswith("E_NO_JOB"), text)
 
 passed = sum(1 for _, c, _ in results if c)
 print(f"\n{passed}/{len(results)} 通过   目录={root}")

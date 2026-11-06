@@ -224,7 +224,10 @@ def build_fixture(root: Path) -> dict:
     glob_dir = root / "glob"
     count_dir = root / "count"
     edit_dir = root / "edit"
-    for d in (src, files, glob_dir, count_dir, edit_dir):
+    reads_dir = root / "reads"
+    repeat_dir = root / "repeat"
+    map_dir = root / "map"
+    for d in (src, files, glob_dir, count_dir, edit_dir, reads_dir, repeat_dir, map_dir):
         d.mkdir(parents=True, exist_ok=True)
 
     # 场景 2：grep 命中函数内部 → block 展开 → 预算截断续读
@@ -255,12 +258,34 @@ def build_fixture(root: Path) -> dict:
     cfg = ["fn cfg() {"] + [f"    let limit_{i} = {100 + i};" for i in range(20)] + ["}", ""]
     (edit_dir / "edit.rs").write_text("\n".join(cfg), encoding="utf-8", newline="\n")
 
+    # 场景 7：重复读同一区间，验证未变更短路
+    (repeat_dir / "loop.txt").write_text(
+        "".join(f"loop-{i:04}-{'x' * 24}\n" for i in range(1, 401)),
+        encoding="utf-8", newline="\n")
+
+    # 场景 8：repo map 排序
+    (map_dir / "core.rs").write_text(
+        "pub struct Token {}\npub fn verify() {}\n", encoding="utf-8", newline="\n")
+    (map_dir / "user.rs").write_text(
+        "fn use_it() { let t = Token; verify(); }\n", encoding="utf-8", newline="\n")
+    (map_dir / "main.rs").write_text("fn main() {}\n", encoding="utf-8", newline="\n")
+    (map_dir / "notes.md").write_text("# notes\n", encoding="utf-8", newline="\n")
+
+    # 场景 6：5 个文件各读不同区间，一次 reads 调用
+    for i in range(5):
+        lines = [f"r{i}-line{j}" for j in range(1, 7)]
+        (reads_dir / f"r{i}.txt").write_text(
+            "\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+
     return {
         "src_file": src / "app.rs",
         "files_dir": files,
         "glob_dir": glob_dir,
         "count_dir": count_dir,
         "edit_file": edit_dir / "edit.rs",
+        "reads_dir": reads_dir,
+        "repeat_dir": repeat_dir,
+        "map_dir": map_dir,
     }
 
 
@@ -436,12 +461,94 @@ def scenario_count_density(c: Ctx, fx: dict) -> None:
     c.check("本页可见" not in text, "count: 未截断时不应标注本页可见", text[:200])
 
 
+def scenario_multi_file_reads(c: Ctx, fx: dict) -> None:
+    """多文件异构区间：5 次单读 vs 1 次 reads，内容必须等价。"""
+    files = [c.p("reads", f"r{i}.txt") for i in range(5)]
+    separate_chars = 0
+    for i, path in enumerate(files):
+        text, err = c.call("fs_read", path=path, start=i + 1, end=i + 2)
+        c.check(not err, f"reads: 单读 r{i} 不应报错", text[:200])
+        separate_chars += len(text)
+
+    before = c.mcp.calls
+    batched, err = c.call(
+        "fs_read",
+        reads=[{"path": path, "start": i + 1, "end": i + 2} for i, path in enumerate(files)],
+        force=True,
+    )
+    used = c.mcp.calls - before
+    c.check(not err, "reads: 批量调用不应报错", batched[:300])
+    c.check(used == 1, "reads: 多文件异构读取应只占 1 次调用", f"实际 {used} 次")
+    for i in range(5):
+        c.check(f"r{i}.txt" in batched, f"reads: 缺少 r{i} 的文件头", batched[:300])
+        c.check(f"{i + 1}|r{i}-line{i + 1}" in batched,
+                f"reads: r{i} 缺起始行", batched[:400])
+        c.check(f"{i + 2}|r{i}-line{i + 2}" in batched,
+                f"reads: r{i} 缺结束行", batched[:400])
+        c.check(f"1|r{i}-line1" not in batched or i == 0,
+                f"reads: r{i} 读到了区间外的第 1 行", batched[:400])
+    c.check(len(batched) <= separate_chars * 1.10 + 50,
+            "reads: 单次批量输出不应明显大于 5 次单读",
+            f"批量 {len(batched)} vs 单读 {separate_chars}")
+
+
+def scenario_repeat_read(c: Ctx, fx: dict) -> None:
+    """重复读同一区间：第二次只回未变更摘要，force 才返回正文。"""
+    path = c.p("repeat", "loop.txt")
+    first, err = c.call("fs_read", path=path, start=1, end=400)
+    c.check(not err, "repeat: 首次读不应报错", first[:200])
+    second, err = c.call("fs_read", path=path, start=1, end=400)
+    c.check(not err, "repeat: 二次读不应报错", second[:200])
+    c.check("未变更" in second, "repeat: 二次读应短路", second[:200])
+    c.check(len(second) * 10 < len(first), "repeat: 摘要应小于正文的 10%",
+            f"{len(second)} vs {len(first)}")
+    c.check("force=true" in second, "repeat: 摘要应给出 force 出口", second[:200])
+    forced, err = c.call("fs_read", path=path, start=1, end=400, force=True)
+    c.check(not err and "1|" in forced and "未变更" not in forced,
+            "repeat: force 应返回正文", forced[:200])
+
+def scenario_repo_map(c: Ctx, fx: dict) -> None:
+    """repo map：一次调用给出「先看哪些文件」。"""
+    before = c.mcp.calls
+    text, err = c.call("fs_glob", path=c.p("map"), pattern="**/*", map=True)
+    used = c.mcp.calls - before
+    c.check(not err, "map: 不应报错", text[:300])
+    c.check(used == 1, "map: 应只占 1 次调用", f"实际 {used} 次")
+    c.check("符号" in text and "core.rs" in text, "map: 缺少文件或符号", text[:400])
+    core = text.find("core.rs")
+    user = text.find("user.rs")
+    c.check(core != -1 and user != -1 and core < user,
+            "map: 被引用的 core.rs 应排在 user.rs 前", text[:500])
+    c.check("notes.md" not in text, "map: 数据文件应跳过", text[:400])
+
+def scenario_background_job(c: Ctx, fx: dict) -> None:
+    """后台任务：启动后轮询到退出，输出按新增返回。"""
+    text, err = c.call("fs_exec", program="cmd", args=["/c", "ping", "-n", "3", "127.0.0.1"],
+                       background=True)
+    c.check(not err and text.startswith("ok job="), "job: 启动应返回 job id", text[:200])
+    m = re.search(r"job=(\d+)", text)
+    job_id = int(m.group(1)) if m else 0
+    poll = ""
+    done = False
+    for _ in range(50):
+        poll, err = c.call("fs_exec", job=job_id)
+        if "exit=" in poll:
+            done = True
+            break
+        time.sleep(0.1)
+    c.check(done and "exit=0" in poll, "job: 轮询到退出", poll[:300])
+    c.check("stdout" in poll, "job: 应返回输出", poll[:300])
+
 SCENARIOS = [
     ("files 高密度分页", scenario_files_paging),
     ("grep→block→续读", scenario_grep_block_continue),
     ("glob 预算分页", scenario_glob_budget),
     ("正则编辑 dry_run+diff", scenario_regex_edit),
     ("count 高密度", scenario_count_density),
+    ("多文件异构 reads", scenario_multi_file_reads),
+    ("重复读短路", scenario_repeat_read),
+    ("repo map 排序", scenario_repo_map),
+    ("后台任务轮询", scenario_background_job),
 ]
 
 

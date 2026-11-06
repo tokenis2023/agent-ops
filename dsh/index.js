@@ -68,6 +68,23 @@ const TOOL_SPECS = [
         type: 'boolean',
         description: '只输出结构摘要：声明行 + 行号，不展开函数体；行号可直接接 block=true 读实现。与 ranges/block/end 互斥',
       },
+      reads: {
+        type: 'array',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            path: { type: 'string' },
+            start: { type: 'integer' },
+            end: { type: 'integer' },
+            block: { type: 'boolean' },
+            max_line: { type: 'integer' },
+          },
+        },
+        description: '一次读多个文件的不同区间，每项 {path,start?,end?,block?,max_line?}；与 path/paths 互斥',
+      },
+      focus: { type: 'string', description: '正则；只返回命中所在的完整代码块，替代 grep+block 两步' },
+      force: { type: 'boolean', description: '绕过未变更短路，强制返回正文' },
     },
   },
   {
@@ -124,6 +141,49 @@ const TOOL_SPECS = [
       time_budget_ms: { type: 'integer', description: '遍历时间预算，默认 5000 毫秒' },
       no_ignore: { type: 'boolean', description: '忽略 .gitignore 与默认跳过目录' },
       budget: { type: 'integer', description: '响应最多字节数，默认 8192' },
+      map: { type: 'boolean', description: '输出 repo map：按引用重要性排序的文件与符号，一次回答先看哪些文件' },
+      focus: { type: 'string', description: 'map=true 时的关注词' },
+      max_files: { type: 'integer', description: 'map=true 时最多扫描的文件数，默认 2000' },
+    },
+  },
+  {
+    name: 'fs_exec',
+    description:
+      '执行程序（argv 数组，不经过 shell）。替代 PowerShell 跑 cargo/git/npm/python：没有引号/插值、2>&1、ErrorRecord、$LASTEXITCODE 问题。非零退出不是错误；超时结束整个进程树。',
+    parameters: {
+      program: { type: 'string', description: '可执行文件，如 cargo、git、python；走 PATH', required: true },
+      args: { type: 'array', items: { type: 'string' }, description: '参数数组，每个参数独立，不拼字符串' },
+      cwd: { type: 'string', description: '工作目录，默认当前目录' },
+      timeout_ms: { type: 'integer', description: '超时毫秒，默认 120000，最大 600000' },
+      stdin: { type: 'string', description: '传给进程的标准输入' },
+      env: { type: 'object', additionalProperties: true, description: '追加/覆盖环境变量' },
+      shell: { type: 'boolean', description: '显式走 cmd /c（需要管道/重定向时才用）' },
+      max_output: { type: 'integer', description: '每条流最多保留字节，默认 32768' },
+      background: { type: 'boolean', description: '后台运行：立即返回 job id，用 job=<id> 轮询' },
+      job: { type: 'integer', description: '轮询/终止后台任务：传启动时返回的 job id' },
+      kill: { type: 'boolean', description: '配合 job 使用：结束该任务的整个进程树' },
+    },
+  },
+  {
+    name: 'fs_file',
+    description:
+      '文件管理：copy/move/remove/mkdir/convert/archive/extract。替代 PowerShell 的 Copy-Item/Move-Item/Remove-Item/New-Item 与压缩解压。remove 必须 confirm=true。',
+    parameters: {
+      op: {
+        type: 'string',
+        enum: ['copy', 'move', 'remove', 'mkdir', 'convert', 'archive', 'extract'],
+        description: '操作类型',
+        required: true,
+      },
+      src: { type: 'string', description: 'copy/move 的源' },
+      dst: { type: 'string', description: 'copy/move 的目标' },
+      path: { type: 'string', description: 'remove/mkdir/convert 的目标' },
+      recursive: { type: 'boolean', description: 'remove 删除目录时必须为 true' },
+      confirm: { type: 'boolean', description: 'remove 必须显式传 true' },
+      overwrite: { type: 'boolean', description: 'copy/move 覆盖已存在目标' },
+      encoding: { type: 'string', description: 'convert 目标编码：utf-8/gbk/utf-16le/gb18030' },
+      eol: { type: 'string', enum: ['lf', 'crlf'], description: 'convert 目标换行' },
+      dry_run: { type: 'boolean', description: '只报告不落盘' },
     },
   },
   {

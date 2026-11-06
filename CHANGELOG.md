@@ -2,6 +2,32 @@
 
 本项目使用语义化版本。日期为发布日。
 
+## [0.2.7] - 2026-11-06
+
+**减少轮次**
+
+- `fs_read reads=[{path,start,end,…}]`：一次读多个文件的**不同区间**，最多 20 项，预算按项均分；单项失败只影响该项。
+- `fs_read focus=<正则>`：只返回命中所在的完整代码块（自动展开并合并区间），替代「fs_grep 拿行号 → block=true」两步；最多 12 块。
+- `fsops mcp --jobs N`：`tools/call` 用固定线程池并发处理（默认 4，0/1 串行），响应按 id 匹配；initialize/ping/tools/list 仍在读线程就地应答。
+- 引导升级：`initialize.instructions` 与 AGENTS 规则写入「同一回复可并行多个只读调用 + 已知多文件用 reads 一次读完 + 按模式取块用 focus」。
+
+**减少体积**
+
+- `fs_read` 未变更短路：同一 MCP 会话内同文件同 hash 同区间再读只回一行摘要（带 hash/区间/总行数/首行锚点），实测重复读输出约为正文的 1.1%；`force=true` 可重读，`FSOPS_MCP_CACHE=0` 可关闭。
+- `fs_read` 自适应预算：单文件、未显式传 `budget`、≤16 KB 时自动放开到全文，12–16 KB 文件不再被 12288 截断逼出第二次续读。
+- `fs_glob map=true`：repo map lite。按「符号被引用程度 + 入口点 + focus」排序输出文件与关键符号，一次调用回答「先改哪些文件」；数据文件与 >256KB 跳过，最多 2000 文件。
+
+**替代 PowerShell**
+
+- `fs_exec`：用 argv 数组直接启动程序，不经过 shell——没有引号/插值、`2>&1`、ErrorRecord、`$LASTEXITCODE` 问题；非零退出不是错误，超时结束整个进程树。
+- `fs_exec` 后台任务：`background=true` 立即返回 job id，`job=<id>` 轮询增量输出，`kill=true` 结束进程树；适合 dev server/watch。只在长驻 MCP 会话内有效。
+- `fs_file`：copy/move/remove/mkdir/convert/archive/extract，替代 PowerShell 的 Copy-Item/Move-Item/Remove-Item/New-Item 与 Compress-Archive/Expand-Archive；`remove` 必须 `confirm=true`，`extract` 拒绝 zip-slip。
+
+**工具面**
+
+- 6 → 8 个工具；`remove` 强制 `confirm=true`，`extract` 拒绝 zip-slip，`fs_exec` 明确不是安全沙箱。
+- 测试：单测 278、e2e 185、task_bench 9 场景。
+
 ## [0.2.6] - 2026-11-06
 
 - 开发：新增 `scripts/check.ps1` 分级检查（`fast`/`commit`/`full`），并按档位更新 `CONTRIBUTING.md` 与 `AGENTS.md`：编辑过程中只跑改动模块单测，提交前跑 `commit`，push 前或改 I/O 内核跑 `full`，不再每次改动都跑全套。

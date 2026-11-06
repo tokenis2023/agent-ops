@@ -147,16 +147,18 @@ node tests/dsh_plugin_smoke.mjs --exe target/debug/fsops.exe
 
 ## 工具面
 
-6 个工具，故意做窄。
+8 个工具，故意做窄。
 
 | 工具 | 用途 | 关键参数 |
 |---|---|---|
-| `fs_read` | 读文件、行区间、多文件、大文件窗口、结构摘要、DOCX/PDF 正文 | `path`/`paths`、`start`、`end`、`ranges`、`scan`、`summary`、`max_line`、`budget` |
+| `fs_read` | 读文件、行区间、多文件、多文件异构区间、按模式取块、大文件窗口、结构摘要、DOCX/PDF 正文 | `path`/`paths`/`reads`、`start`、`end`、`ranges`、`focus`、`scan`、`summary`、`max_line`、`budget` |
 | `fs_edit` | 精确替换、正则替换、diff 自查、多文件批量、并发保护 | `edits`（`old/new` 或 `pattern/replacement`）、`files`、`diff`、`expect_hash`、`normalize_eol` |
 | `fs_write` | 新建或整体覆盖，原子写入，可生成 DOCX | `content`、`expect_hash`、`normalize_eol` |
-| `fs_glob` | 按 glob 找文件，尊重 `.gitignore`，带遍历时间预算 | `pattern`、`path`、`dirs`、`detail`、`limit`、`offset`、`time_budget_ms`、`budget` |
+| `fs_glob` | 按 glob 找文件，尊重 `.gitignore`，带遍历时间预算，可输出 repo map | `pattern`、`path`、`dirs`、`detail`、`limit`、`offset`、`time_budget_ms`、`budget`、`map`、`focus` |
 | `fs_grep` | 正则搜索、四种输出、分页、并行，支持 DOCX/PDF 正文 | `pattern`、`output`、`context`、`max_per_file`、`max_file_size`、`offset`、`parallel` |
 | `fs_stat` | 元信息、编码、换行、hash | `path`/`paths`、`detail=meta/hash/full` |
+| `fs_exec` | 执行程序（argv 数组，不经过 shell），支持后台任务；替代 PowerShell 跑 cargo/git/npm | `program`、`args`、`cwd`、`timeout_ms`、`stdin`、`env`、`shell` |
+| `fs_file` | 文件管理：copy/move/remove/mkdir/convert/archive/extract | `op`、`src`、`dst`、`path`、`confirm`、`overwrite`、`encoding`、`eol` |
 
 完整参数、输出和错误码见 **[工具参考](docs/工具参考.md)**。
 
@@ -299,7 +301,6 @@ python tests/bench.py /path/to/repo    # 额外在真实代码上跑一轮
 
 - [使用指南](docs/使用指南.md)：安装、宿主接入、工作流、错误码、升级卸载
 - [工具参考](docs/工具参考.md)：全部参数、输出和协议
-- [设计说明](docs/设计.md)：工具面、预算、Windows 语义取舍
 - [Agent 规则](AGENTS.md)：给编码 Agent 的路由与安全规则
 - [安全声明](SECURITY.md)：权限模型、写入安全、漏洞报告
 - [变更记录](CHANGELOG.md)：版本历史

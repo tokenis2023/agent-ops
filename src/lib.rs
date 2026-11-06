@@ -5,11 +5,16 @@
 //! 同样的任务，工具输出越短，轮次越少，token 越省。
 
 pub mod adopt;
+pub mod cache;
 pub mod cli;
 pub mod documents;
 pub mod edit;
+pub mod exec;
+pub mod fileops;
 pub mod harden;
 pub mod io;
+pub mod jobs;
+pub mod map;
 pub mod mcp;
 pub mod paths;
 pub mod render;

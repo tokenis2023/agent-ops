@@ -5,9 +5,9 @@
  * 再用一个最小 ctx 复刻 `tools.register` / `subprocess.spawn` / `workingDirectory.ensure`。
  *
  * 校验三件事：
- *   1. 6 个工具的 parameters 符合 DSH value-schema DSL（类型、必填、additionalProperties）；
+ *   1. 8 个工具的 parameters 符合 DSH value-schema DSL（类型、必填、additionalProperties）；
  *   2. 包清单（package.json / cordis.patch.yml / locale / icon）满足 bundle 契约；
- *   3. 用真实 fsops.exe 跑通 fs_write → fs_read → fs_edit → fs_grep → fs_glob → fs_stat，
+ *   3. 用真实 fsops.exe 跑通 fs_write → fs_read → fs_edit → fs_grep → fs_glob → fs_stat → fs_exec → fs_file，
  *      并确认 E_ 错误会变成工具错误。
  *
  * 用法：node tests/dsh_plugin_smoke.mjs [--exe target/debug/fsops.exe]
@@ -209,8 +209,10 @@ plugin.apply(ctx, { binary: EXE })
 
 const names = [...ctx.registered.keys()].sort()
 check(
-  JSON.stringify(names) === JSON.stringify(['fs_edit', 'fs_glob', 'fs_grep', 'fs_read', 'fs_stat', 'fs_write']),
-  '注册 6 个 fs_* 工具',
+  JSON.stringify(names) === JSON.stringify([
+    'fs_edit', 'fs_exec', 'fs_file', 'fs_glob', 'fs_grep', 'fs_read', 'fs_stat', 'fs_write',
+  ]),
+  '注册 8 个 fs_* 工具',
   names.join(','),
 )
 for (const [toolName, definition] of ctx.registered) {
@@ -258,6 +260,19 @@ try {
 
   const stat = await call('fs_stat', { path: file, detail: 'meta' })
   check(/\dB/.test(stat) || stat.includes('file'), 'fs_stat 返回元信息', stat.slice(0, 200))
+
+  const execOut = await call('fs_exec', { program: 'cmd', args: ['/c', 'echo', 'hi-from-exec'] })
+  check(execOut.includes('exit=0') && execOut.includes('hi-from-exec'), 'fs_exec 返回退出码与输出', execOut.slice(0, 200))
+
+  const copied = await call('fs_file', { op: 'copy', src: file, dst: join(work, 'copy.rs') })
+  check(copied.startsWith('ok copy'), 'fs_file copy 成功', copied.slice(0, 200))
+  let noConfirm = ''
+  try {
+    await call('fs_file', { op: 'remove', path: join(work, 'copy.rs') })
+  } catch (error) {
+    noConfirm = String(error.message)
+  }
+  check(noConfirm.startsWith('E_CONFIRM_REQUIRED'), 'fs_file remove 需要 confirm', noConfirm.slice(0, 200))
 
   let missing = ''
   try {

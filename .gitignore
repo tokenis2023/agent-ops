@@ -2,6 +2,7 @@
 /dist
 node_modules/
 /.planning
+/docs/plans/
 __pycache__/
 *.pyc
 *.fsops-tmp-*

@@ -1,4 +1,4 @@
-//! 工具层：6 个工具的定义与执行。
+//! 工具层：8 个工具的定义与执行。
 //!
 //! 设计原则：工具面窄（少而准），返回短（带续读提示），错误直给（带候选行）。
 //! 所有工具名以 `fs_` 开头，避免和宿主自带文件工具撞名。
@@ -22,7 +22,25 @@ pub fn tool_defs() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "文件路径，如 /d/repo/app/src/main.rs"},
-                    "paths": {"type": "array", "items": {"type": "string"}, "maxItems": 20, "description": "一次读多个文件（最多 20 个）"},
+                    "paths": {"type": "array", "items": {"type": "string"}, "maxItems": 20, "description": "一次读多个文件（最多 20 个），所有文件共用 start/end"},
+                    "reads": {
+                        "type": "array",
+                        "maxItems": 20,
+                        "description": "一次读多个文件的不同区间，每项 {path,start?,end?,ranges?,block?,max_line?,scan?}；与 path/paths/ranges/start/end/block/summary/focus 互斥，预算按项均分",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string"},
+                                "start": {"type": "integer"},
+                                "end": {"type": "integer"},
+                                "ranges": {"type": "array", "items": {"type": "array", "items": {"type": "integer", "minimum": 1}, "minItems": 2, "maxItems": 2}},
+                                "block": {"type": "boolean"},
+                                "max_line": {"type": "integer"},
+                                "scan": {"type": "string", "enum": ["window", "full"]}
+                            },
+                            "required": ["path"]
+                        }
+                    },
                     "start": {"type": "integer", "description": "起始行（1 基）"},
                     "end": {"type": "integer", "description": "结束行（含）；用 block=true 时可省略"},
                     "block": {"type": "boolean", "description": "返回包含 start 行的整个代码块（自动向前找块起始、向后配平结束）；配合 fs_grep 的行号用，命中行在函数内部也能展开"},
@@ -43,7 +61,9 @@ pub fn tool_defs() -> Vec<Value> {
                         "enum": ["window", "full"],
                         "description": "仅对 >32MB 文件生效：window（默认）只读到请求区间末尾并探测是否还有内容，毫秒级返回，但不给全文 hash/总行数；full 全文件扫描，给精确 hash 与总行数"
                     },
-                    "summary": {"type": "boolean", "description": "只输出结构摘要：声明行 + 行号，不展开函数体；行号可直接接 block=true 读实现。与 ranges/block/end 互斥，数据文件与超大文件不支持"}
+                    "summary": {"type": "boolean", "description": "只输出结构摘要：声明行 + 行号，不展开函数体；行号可直接接 block=true 读实现。与 ranges/block/end 互斥，数据文件与超大文件不支持"},
+                    "focus": {"type": "string", "description": "只返回匹配该正则的完整代码块（含上下文），替代「先 fs_grep 再 block=true」两步。仅单文件，与 paths/reads/ranges/start/end/block/summary 互斥"},
+                    "force": {"type": "boolean", "description": "绕过未变更短路，强制返回正文。默认情况下，同一 MCP 会话里同文件同 hash 同区间再读只回一行摘要"}
                 },
                 "required": []
             }
@@ -98,7 +118,7 @@ pub fn tool_defs() -> Vec<Value> {
         }),
         json!({
             "name": "fs_glob",
-            "description": "按 glob 找文件。优先替代 find/Glob/Get-ChildItem。尊重 .gitignore，自动跳过 node_modules/target 等。默认只给路径，detail=true 附大小与时间。",
+            "description": "按 glob 找文件。优先替代 find/Glob/Get-ChildItem。尊重 .gitignore，自动跳过 node_modules/target 等。默认只给路径，detail=true 附大小与时间；map=true 输出按引用重要性排序的 repo map（文件+符号），一次回答先看哪些文件。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -110,7 +130,10 @@ pub fn tool_defs() -> Vec<Value> {
                     "offset": {"type": "integer", "description": "跳过前 N 个匹配条目，用于 next_offset 续页"},
                     "time_budget_ms": {"type": "integer", "description": "目录遍历时间预算，默认 5000 毫秒；超时返回已找到结果并标注"},
                     "no_ignore": {"type": "boolean", "description": "忽略 .gitignore 与 node_modules/target 等默认跳过项；只在明确要查依赖源码或构建产物时用"},
-                    "budget": {"type": "integer", "description": "最终响应最多字节数，默认 8192"}
+                    "budget": {"type": "integer", "description": "最终响应最多字节数，默认 8192"},
+                    "map": {"type": "boolean", "description": "输出 repo map：按符号被引用程度、入口点和 focus 排序的文件与符号，一次调用回答先看哪些文件"},
+                    "focus": {"type": "string", "description": "map=true 时的关注词，空格分隔；文件名或符号命中会加权"},
+                    "max_files": {"type": "integer", "description": "map=true 时最多扫描的文件数，默认 2000"}
                 },
                 "required": []
             }
@@ -158,6 +181,47 @@ pub fn tool_defs() -> Vec<Value> {
                     }
                 },
                 "required": []
+            }
+        }),
+        json!({
+            "name": "fs_exec",
+            "description": "执行程序（argv 数组，不经过 shell）。替代 PowerShell 跑 cargo/git/npm/python：没有引号/插值、2>&1、ErrorRecord、$LASTEXITCODE 问题。非零退出不是错误；超时会结束整个进程树。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "program": {"type": "string", "description": "可执行文件，如 cargo、git、python；走 PATH"},
+                    "args": {"type": "array", "items": {"type": "string"}, "description": "参数数组，每个参数独立，不拼字符串"},
+                    "cwd": {"type": "string", "description": "工作目录，默认当前目录"},
+                    "timeout_ms": {"type": "integer", "description": "超时毫秒，默认 120000，最大 600000；超时结束进程树"},
+                    "stdin": {"type": "string", "description": "传给进程的标准输入"},
+                    "env": {"type": "object", "description": "追加/覆盖环境变量，如 {\"RUST_BACKTRACE\":\"1\"}"},
+                    "shell": {"type": "boolean", "description": "显式走 cmd /c（需要管道/重定向时才用，会回到文本解析）"},
+                    "max_output": {"type": "integer", "description": "每条流最多保留字节，默认 32768"},
+                    "background": {"type": "boolean", "description": "后台运行：立即返回 job id，用 job=<id> 轮询输出；适合 dev server/watch 这类长驻命令"},
+                    "job": {"type": "integer", "description": "轮询/终止后台任务：传启动时返回的 job id"},
+                    "kill": {"type": "boolean", "description": "配合 job 使用：结束该任务的整个进程树"}
+                },
+                "required": ["program"]
+            }
+        }),
+        json!({
+            "name": "fs_file",
+            "description": "文件管理：copy/move/remove/mkdir/convert/archive/extract。替代 PowerShell 的 Copy-Item/Move-Item/Remove-Item/New-Item 与压缩解压。remove 必须 confirm=true。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "op": {"type": "string", "enum": ["copy", "move", "remove", "mkdir", "convert", "archive", "extract"], "description": "操作类型"},
+                    "src": {"type": "string", "description": "copy/move 的源"},
+                    "dst": {"type": "string", "description": "copy/move 的目标；可以是目录"},
+                    "path": {"type": "string", "description": "remove/mkdir/convert 的目标"},
+                    "recursive": {"type": "boolean", "description": "remove 删除目录时必须为 true"},
+                    "confirm": {"type": "boolean", "description": "remove 必须显式传 true"},
+                    "overwrite": {"type": "boolean", "description": "copy/move 覆盖已存在目标"},
+                    "encoding": {"type": "string", "description": "convert 目标编码：utf-8/gbk/utf-16le/utf-16be/gb18030"},
+                    "eol": {"type": "string", "enum": ["lf", "crlf"], "description": "convert 目标换行"},
+                    "dry_run": {"type": "boolean", "description": "只报告不落盘"}
+                },
+                "required": ["op"]
             }
         }),
     ];
@@ -377,20 +441,20 @@ fn doc_format_error(format: crate::documents::Format) -> &'static str {
     }
 }
 
-fn arg_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
+pub(crate) fn arg_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key)
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
 }
 
-fn arg_usize(args: &Value, key: &str, default: usize) -> usize {
+pub(crate) fn arg_usize(args: &Value, key: &str, default: usize) -> usize {
     args.get(key)
         .and_then(Value::as_u64)
         .map(|v| v as usize)
         .unwrap_or(default)
 }
 
-fn arg_bool(args: &Value, key: &str, default: bool) -> bool {
+pub(crate) fn arg_bool(args: &Value, key: &str, default: bool) -> bool {
     args.get(key).and_then(Value::as_bool).unwrap_or(default)
 }
 
@@ -500,6 +564,8 @@ pub fn call(name: &str, args: &Value) -> String {
         "fs_glob" => glob_tool(args),
         "fs_grep" => grep_tool(args),
         "fs_stat" => stat(args),
+        "fs_exec" => crate::exec::run(args),
+        "fs_file" => crate::fileops::run(args),
         other => format!("E_UNKNOWN_TOOL 未知工具 {other}"),
     }
 }
@@ -564,7 +630,134 @@ fn render_summary(
     out
 }
 
+/// fs_read reads=[...]：把每项展开成一次独立读取，预算按项均分。
+///
+/// 递归复用单文件路径，编码/EOL/block/ranges 等语义全部自动继承；
+/// 某一项失败只影响该项，其余照常输出（整体由 MCP 层标记 isError）。
+fn read_items(args: &Value) -> String {
+    let Some(items) = args.get("reads").and_then(Value::as_array) else {
+        return "E_BAD_ARGS reads 必须是数组".into();
+    };
+    for key in [
+        "path", "paths", "ranges", "start", "end", "block", "summary", "focus",
+    ] {
+        if args.get(key).is_some() {
+            return format!(
+                "E_BAD_ARGS reads 不能与 {key} 同时使用；每项的区间写在 reads 项内（path/start/end/ranges/block/max_line）"
+            );
+        }
+    }
+    if items.is_empty() {
+        return "E_BAD_ARGS reads 不能为空".into();
+    }
+    if items.len() > 20 {
+        return format!("E_BAD_ARGS reads 最多 20 项，当前 {} 项", items.len());
+    }
+    const ALLOWED: [&str; 7] = [
+        "path", "start", "end", "ranges", "block", "max_line", "scan",
+    ];
+    let budget = arg_usize(args, "budget", render::DEFAULT_BUDGET);
+    let force = arg_bool(args, "force", false);
+    let per_item = (budget / items.len()).max(256);
+    let mut out = String::new();
+    for (index, item) in items.iter().enumerate() {
+        let Some(obj) = item.as_object() else {
+            out.push_str(&format!(
+                "E_BAD_ARGS reads[{index}] 必须是对象 {{path,start,end,...}}\n"
+            ));
+            continue;
+        };
+        if obj.get("path").and_then(Value::as_str).is_none() {
+            out.push_str(&format!(
+                "E_BAD_ARGS reads[{index}] 缺少字符串类型的 path\n"
+            ));
+            continue;
+        }
+        let unknown: Vec<&str> = obj
+            .keys()
+            .filter(|key| !ALLOWED.contains(&key.as_str()))
+            .map(String::as_str)
+            .collect();
+        if !unknown.is_empty() {
+            out.push_str(&format!(
+                "E_BAD_ARGS reads[{index}] 未知字段 {}；可用 path/start/end/ranges/block/max_line/scan\n",
+                unknown.join(",")
+            ));
+            continue;
+        }
+        let mut single = obj.clone();
+        single.insert("budget".to_string(), json!(per_item));
+        if force {
+            single.insert("force".to_string(), json!(true));
+        }
+        let text = read(&Value::Object(single));
+        if index > 0 && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&text);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    out.trim_end().to_string()
+}
+
+/// focus 最多返回的代码块数；再多应该用 fs_grep 缩小范围。
+const MAX_FOCUS_BLOCKS: usize = 12;
+
+/// focus 的计算结果：保留的块、命中总数、是否被上限截断。
+struct FocusBlocks {
+    blocks: Vec<(usize, usize)>,
+    total: usize,
+    truncated: bool,
+}
+
+/// 把命中行扩成完整代码块并合并重叠/相邻区间。
+fn focus_blocks(index: &render::LineIndex<'_>, pattern: &str) -> Result<FocusBlocks, String> {
+    let regex = regex::Regex::new(pattern)
+        .map_err(|e| format!("E_BAD_REGEX 正则非法: {e}；检查转义，或先用 fs_grep 确认形状"))?;
+    let mut blocks: Vec<(usize, usize)> = Vec::new();
+    for (offset, line) in index.lines().iter().enumerate() {
+        if regex.is_match(line) {
+            let line_no = offset + 1;
+            blocks.push(enclosing_block(index.lines(), line_no).unwrap_or((line_no, line_no)));
+        }
+    }
+    if blocks.is_empty() {
+        return Ok(FocusBlocks {
+            blocks: Vec::new(),
+            total: 0,
+            truncated: false,
+        });
+    }
+    let merged = merge_ranges(blocks);
+    let total = merged.len();
+    let truncated = total > MAX_FOCUS_BLOCKS;
+    let mut kept = merged;
+    kept.truncate(MAX_FOCUS_BLOCKS);
+    Ok(FocusBlocks {
+        blocks: kept,
+        total,
+        truncated,
+    })
+}
+
 fn read(args: &Value) -> String {
+    if args.get("reads").is_some() {
+        return read_items(args);
+    }
+    // focus 只对单文件生效：多文件时它无法确定含义。
+    if args.get("focus").is_some()
+        && (args.get("paths").is_some()
+            || args.get("ranges").is_some()
+            || args.get("start").is_some()
+            || args.get("end").is_some()
+            || arg_bool(args, "block", false)
+            || arg_bool(args, "summary", false))
+    {
+        return "E_BAD_ARGS focus 只能用于单文件 path，且不能与 paths/ranges/start/end/block/summary 同时使用"
+            .into();
+    }
     let budget_explicit = args.get("budget").is_some();
     let mut budget = arg_usize(args, "budget", render::DEFAULT_BUDGET);
     let mut targets: Vec<String> = Vec::new();
@@ -952,10 +1145,40 @@ fn read(args: &Value) -> String {
             }
         };
         let doc = &snapshot.doc;
+        // 自适应预算：小文件一次读完，省掉一次「12KB 截断 → 续读」的往返。
+        // 多送几 KB 换掉一整轮上下文重发，划算；显式 budget 永远优先。
+        if !budget_explicit
+            && targets.len() == 1
+            && budget == render::DEFAULT_BUDGET
+            && doc.size <= 16 * 1024
+        {
+            budget = doc.size as usize + 4096;
+        }
         // 行索引只建一次：总行数、block 探测和 converge 多轮渲染共用，
         // 避免每次缩预算都把整个文件重新 split 一遍。
         let index = render::LineIndex::new(&doc.text);
         let total_lines = index.total_lines();
+        // focus：命中行扩成完整代码块；与 block 类似，但范围由正则决定。
+        let focus_info = match arg_str(args, "focus") {
+            Some(pattern) => match focus_blocks(&index, pattern) {
+                Ok(info) => {
+                    if info.blocks.is_empty() {
+                        out.push_str(&format!(
+                            "E_NO_MATCH {} 没有匹配 {} 的代码块；用 fs_grep 确认模式，或去掉 focus 直接读文件\n",
+                            fp.display(),
+                            pattern
+                        ));
+                        continue;
+                    }
+                    Some((info, pattern.to_string()))
+                }
+                Err(e) => {
+                    out.push_str(&format!("{e}\n"));
+                    continue;
+                }
+            },
+            None => None,
+        };
         // summary=true：只给结构、不给正文；行号可直接接 block=true 读实现。
         if arg_bool(args, "summary", false) {
             if args.get("ranges").is_some()
@@ -1008,7 +1231,9 @@ fn read(args: &Value) -> String {
         // block=true：返回包含 start 行的整个代码块。
         // grep 给出的行号通常在函数内部，直接按 start 展开只能拿到那一行；
         // 这里先向外找到块起始行，再按括号配平确定结束行。
-        let per_file_ranges = if arg_bool(args, "block", false) && args.get("ranges").is_none() {
+        let per_file_ranges = if let Some((focus, _)) = &focus_info {
+            focus.blocks.clone()
+        } else if arg_bool(args, "block", false) && args.get("ranges").is_none() {
             match enclosing_block(index.lines(), start) {
                 Some((from, to)) => vec![(from, to)],
                 None => ranges.clone(),
@@ -1029,6 +1254,23 @@ fn read(args: &Value) -> String {
                 (from, to)
             })
             .collect();
+        // 未变更短路：同一进程内、同 hash、同 max_line、区间已完整读过时只回摘要。
+        // 上下文被压缩后模型可能已经不记得内容，所以摘要里带 hash/区间/总行数/首行锚点。
+        let cache_key = fp.display().to_string();
+        if !arg_bool(args, "force", false) && args.get("focus").is_none() {
+            if let Some(covered) =
+                crate::cache::lookup(&cache_key, &snapshot.hash, max_line, &per_file_ranges)
+            {
+                out.push_str(&crate::cache::stub(
+                    &cache_key,
+                    &snapshot.hash,
+                    &covered,
+                    total_lines,
+                    index.lines().first().copied().unwrap_or(""),
+                ));
+                continue;
+            }
+        }
         // 多文件时把公共目录前缀只写一次：深目录下 5 个文件能把 2KB 的路径开销
         // 压到几百字节，而这些字节对模型判断毫无信息量。
         let mut header = if targets.len() > 1 {
@@ -1051,12 +1293,26 @@ fn read(args: &Value) -> String {
             total_lines,
             snapshot.hash
         ));
+        if let Some((focus, pattern)) = &focus_info {
+            if focus.truncated {
+                header.push_str(&format!(
+                    "… focus={pattern} 命中 {} 个代码块，仅显示前 {MAX_FOCUS_BLOCKS} 块；用 fs_grep 缩小范围\n",
+                    focus.total
+                ));
+            } else {
+                header.push_str(&format!(
+                    "… focus={pattern} 命中 {} 个代码块\n",
+                    focus.total
+                ));
+            }
+        }
 
         let want = if targets.len() > 1 {
             (budget / targets.len().max(1)).saturating_sub(usize::from(i > 0))
         } else {
             budget
         };
+        let mut fully_rendered = false;
         let target = render::converge_budget(want, |body_budget| {
             let mut target = header.clone();
             let r = index.render_ranges(
@@ -1082,6 +1338,8 @@ fn read(args: &Value) -> String {
                     r.total_lines
                 );
             }
+            // 只有整段请求都完整返回且没有长行截断，才敢记进缓存。
+            fully_rendered = r.continuation.is_empty() && !r.line_cut;
             target.push_str(&r.body);
             // 部分区间完全越界时明确提示，否则模型会以为那些行本来就不存在。
             if let Some(raw) = args.get("ranges").and_then(Value::as_array) {
@@ -1142,6 +1400,9 @@ fn read(args: &Value) -> String {
             target
         });
         out.push_str(&target);
+        if fully_rendered && args.get("focus").is_none() {
+            crate::cache::record(&cache_key, &snapshot.hash, max_line, &per_file_ranges);
+        }
     }
     if budget_enforced {
         // 超大文件路径自己已控制长度，不再二次硬切。
@@ -2088,7 +2349,12 @@ mod tests {
     fn 每个声明参数都有对应实现分支() {
         // 防止再出现「schema 声明了 dry_run 但代码没实现」或「实现了但模型看不到」。
         // 这里只校验最容易漏的布尔/可选开关，必须同时出现在 schema 与参数读取里。
-        let src = include_str!("tools.rs");
+        let src = concat!(
+            include_str!("tools.rs"),
+            include_str!("exec.rs"),
+            include_str!("fileops.rs"),
+            include_str!("jobs.rs")
+        );
         let defs = tool_defs();
         let mut problems = Vec::new();
         for def in &defs {
@@ -2104,7 +2370,9 @@ mod tests {
                     format!("arg_str(args, \"{key}\""),
                     format!("arg_bool(args, \"{key}\""),
                     format!("arg_usize(args, \"{key}\""),
+                    format!("path_arg(args, \"{key}\""),
                     format!("args.get(\"{key}\")"),
+                    format!(".get(\"{key}\")"),
                     format!("\"{key}\" =>"),
                 ]
                 .iter()
@@ -2179,11 +2447,13 @@ fn next_fn() {
         let path = 临时文本文件(content);
         let posix_path = path.to_string_lossy().replace('\\', "/");
         // 从第 1 行开始应定位到第 7 行（outer 的闭合括号）
+        // 读取缓存会短路同区间重复读；本测试校验 block 逻辑本身，统一 force 绕过。
         let out = read(&json!({
             "path": posix_path,
             "start": 1,
             "block": true,
-            "budget": 100000
+            "budget": 100000,
+            "force": true
         }));
         // grep 典型输出：命中行在函数内部（第 2 行是 let，没有 {），
         // 应向外扩展到整个 outer，而不是只给这一行。
@@ -2191,14 +2461,16 @@ fn next_fn() {
             "path": posix_path,
             "start": 2,
             "block": true,
-            "budget": 100000
+            "budget": 100000,
+            "force": true
         }));
         // 命中行在嵌套块内部（第 4 行在 if 里）→ 扩展为最近的 if 块
         let nested = read(&json!({
             "path": posix_path,
             "start": 4,
             "block": true,
-            "budget": 100000
+            "budget": 100000,
+            "force": true
         }));
         let _ = fs::remove_file(path);
 
@@ -3131,7 +3403,7 @@ fn next_fn() {
     #[test]
     fn grep_schema暴露输出分页与预算参数() {
         let defs = tool_defs();
-        assert_eq!(defs.len(), 6);
+        assert_eq!(defs.len(), 8);
         let grep = defs
             .iter()
             .find(|def| def["name"] == "fs_grep")
@@ -4069,6 +4341,10 @@ fn edit_tool(args: &Value) -> String {
             );
         }
     }
+    // 写入成功后清掉读取缓存：即使 hash 校验已能挡住旧内容，这里再兜一层。
+    for item in &prepared {
+        crate::cache::invalidate(&item.fp.display().to_string());
+    }
 
     if file_count == 1 {
         let item = &prepared[0];
@@ -4274,6 +4550,7 @@ fn write(args: &Value) -> String {
     if let Err(e) = io::atomic_write(&fp, &bytes) {
         return e;
     }
+    crate::cache::invalidate(&fp.display().to_string());
     format!(
         "ok 写入 {} {} {}行 hash={}",
         fp.display(),
@@ -4291,6 +4568,21 @@ fn glob_tool(args: &Value) -> String {
         Err(e) => return format!("E_BAD_PATH {e}"),
     };
     let pattern = arg_str(args, "pattern").unwrap_or("");
+    // repo map：一次给「哪些文件值得先看」，而不是路径列表。
+    if arg_bool(args, "map", false) {
+        if arg_bool(args, "dirs", false) || arg_bool(args, "detail", false) {
+            return "E_BAD_ARGS map=true 不能与 dirs/detail 同时使用；repo map 自带符号与排序"
+                .into();
+        }
+        return crate::map::build(
+            &root,
+            pattern,
+            arg_str(args, "focus").unwrap_or(""),
+            budget,
+            arg_usize(args, "max_files", 2000),
+            arg_usize(args, "time_budget_ms", 5000) as u128,
+        );
+    }
     let limit = arg_usize(args, "limit", 200);
     let offset = arg_usize(args, "offset", 0);
     if limit == 0 {
@@ -4758,5 +5050,302 @@ mod summary_tests {
         let _ = fs::remove_dir_all(&dir);
         assert!(out.starts_with("E_BAD_ARGS"), "{out}");
         assert!(out.contains("数据文件"), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod roundtrip_tests {
+    use super::*;
+    use std::fs;
+
+    fn 目录(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "fsops-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn reads一次读多文件的不同区间() {
+        let dir = 目录("reads-basic");
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        fs::write(&a, "a1\na2\na3\na4\n").unwrap();
+        fs::write(&b, "b1\nb2\nb3\n").unwrap();
+        let out = call(
+            "fs_read",
+            &json!({"reads": [
+                {"path": a.to_string_lossy().replace('\\', "/"), "start": 2, "end": 3},
+                {"path": b.to_string_lossy().replace('\\', "/"), "start": 1, "end": 1}
+            ]}),
+        );
+        let _ = fs::remove_dir_all(&dir);
+        assert!(out.contains("2|a2"), "{out}");
+        assert!(out.contains("3|a3"), "{out}");
+        assert!(!out.contains("1|a1"), "{out}");
+        assert!(out.contains("1|b1"), "{out}");
+    }
+
+    #[test]
+    fn reads预算按项均分且两项都有输出() {
+        let dir = 目录("reads-budget");
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        let body = |prefix: &str| {
+            (1..=50)
+                .map(|i| format!("{prefix}{i}\n"))
+                .collect::<String>()
+        };
+        fs::write(&a, body("a")).unwrap();
+        fs::write(&b, body("b")).unwrap();
+        let out = call(
+            "fs_read",
+            &json!({"reads": [
+                {"path": a.to_string_lossy().replace('\\', "/")},
+                {"path": b.to_string_lossy().replace('\\', "/")}
+            ], "budget": 800}),
+        );
+        let _ = fs::remove_dir_all(&dir);
+        assert!(out.contains("a.txt") && out.contains("b.txt"), "{out}");
+        assert!(out.contains("1|a1"), "{out}");
+        assert!(out.contains("1|b1"), "{out}");
+    }
+
+    #[test]
+    fn reads某文件不存在只影响该项() {
+        let dir = 目录("reads-missing");
+        let missing = dir.join("nope.txt");
+        let ok = dir.join("ok.txt");
+        fs::write(&ok, "ok1\nok2\n").unwrap();
+        let out = call(
+            "fs_read",
+            &json!({"reads": [
+                {"path": missing.to_string_lossy().replace('\\', "/")},
+                {"path": ok.to_string_lossy().replace('\\', "/")}
+            ]}),
+        );
+        let _ = fs::remove_dir_all(&dir);
+        assert!(out.contains("E_"), "缺失文件应报错: {out}");
+        assert!(out.contains("1|ok1"), "另一项仍应输出: {out}");
+    }
+
+    #[test]
+    fn focus返回命中所在的完整代码块() {
+        let dir = 目录("focus-basic");
+        let path = dir.join("a.rs");
+        fs::write(
+            &path,
+            "fn alpha() {\n    let a = 1;\n}\n\nfn beta() {\n    let target = 2;\n    let b = 3;\n}\n",
+        )
+        .unwrap();
+        let out = call(
+            "fs_read",
+            &json!({"path": path.to_string_lossy().replace('\\', "/"), "focus": "target"}),
+        );
+        let _ = fs::remove_dir_all(&dir);
+        assert!(out.contains("5|fn beta()"), "应包含函数签名: {out}");
+        assert!(out.contains("6|    let target = 2;"), "{out}");
+        assert!(out.contains("8|}"), "应包含函数结束括号: {out}");
+        assert!(!out.contains("let a = 1"), "不应包含未命中的函数体: {out}");
+    }
+
+    #[test]
+    fn focus无命中给出建议() {
+        let dir = 目录("focus-none");
+        let path = dir.join("a.rs");
+        fs::write(&path, "fn alpha() {}\n").unwrap();
+        let out = call(
+            "fs_read",
+            &json!({"path": path.to_string_lossy().replace('\\', "/"), "focus": "不存在的东西"}),
+        );
+        let _ = fs::remove_dir_all(&dir);
+        assert!(out.starts_with("E_NO_MATCH"), "{out}");
+        assert!(out.contains("fs_grep"), "{out}");
+    }
+
+    #[test]
+    fn focus与summary互斥() {
+        let dir = 目录("focus-conflict");
+        let path = dir.join("a.rs");
+        fs::write(&path, "fn alpha() {}\n").unwrap();
+        let posix = path.to_string_lossy().replace('\\', "/");
+        let out = call(
+            "fs_read",
+            &json!({"path": posix, "focus": "a", "summary": true}),
+        );
+        let _ = fs::remove_dir_all(&dir);
+        assert!(out.starts_with("E_BAD_ARGS"), "{out}");
+    }
+
+    #[test]
+    fn focus最多返回12个块并标注截断() {
+        let dir = 目录("focus-truncate");
+        let path = dir.join("many.rs");
+        let mut body = String::new();
+        for i in 0..20 {
+            body.push_str(&format!("fn f{i}() {{\n    let hit = {i};\n}}\n\n"));
+        }
+        fs::write(&path, body).unwrap();
+        let out = call(
+            "fs_read",
+            &json!({"path": path.to_string_lossy().replace('\\', "/"), "focus": "hit", "budget": 60000}),
+        );
+        let _ = fs::remove_dir_all(&dir);
+        assert!(out.contains("仅显示前 12 块"), "{out}");
+        assert!(out.contains("命中 20 个代码块"), "{out}");
+    }
+    #[test]
+    fn 第二次同区间读返回未变更摘要() {
+        let dir = 目录("cache-hit");
+        let path = dir.join("a.txt");
+        fs::write(
+            &path,
+            (1..=30).map(|i| format!("line{i}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let posix = path.to_string_lossy().replace('\\', "/");
+        let first = call("fs_read", &json!({"path": posix, "start": 1, "end": 30}));
+        assert!(first.contains("1|line1"), "{first}");
+        let second = call("fs_read", &json!({"path": posix, "start": 1, "end": 30}));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(second.contains("未变更"), "{second}");
+        assert!(!second.contains("1|line1"), "{second}");
+        assert!(second.contains("force=true"), "{second}");
+    }
+
+    #[test]
+    fn 不同区间不命中缓存() {
+        let dir = 目录("cache-range");
+        let path = dir.join("a.txt");
+        fs::write(
+            &path,
+            (1..=30).map(|i| format!("line{i}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let posix = path.to_string_lossy().replace('\\', "/");
+        let _ = call("fs_read", &json!({"path": posix, "start": 1, "end": 10}));
+        let out = call("fs_read", &json!({"path": posix, "start": 20, "end": 25}));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(out.contains("20|line20"), "未读过的区间必须返回正文: {out}");
+        assert!(!out.contains("未变更"), "{out}");
+    }
+
+    #[test]
+    fn 文件改动后不命中缓存() {
+        let dir = 目录("cache-change");
+        let path = dir.join("a.txt");
+        fs::write(&path, "old1\nold2\n").unwrap();
+        let posix = path.to_string_lossy().replace('\\', "/");
+        let _ = call("fs_read", &json!({"path": posix, "start": 1, "end": 2}));
+        fs::write(&path, "new1\nnew2\n").unwrap();
+        let out = call("fs_read", &json!({"path": posix, "start": 1, "end": 2}));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(out.contains("1|new1"), "文件改动后必须返回新内容: {out}");
+        assert!(!out.contains("未变更"), "{out}");
+    }
+
+    #[test]
+    fn glob_map输出排序后的文件与符号() {
+        let dir = 目录("glob-map");
+        fs::write(
+            dir.join("core.rs"),
+            "pub struct Token {}\npub fn verify() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("user.rs"),
+            "fn use_it() { let t = Token; verify(); }\n",
+        )
+        .unwrap();
+        fs::write(dir.join("main.rs"), "fn main() {}\n").unwrap();
+        let posix = dir.to_string_lossy().replace('\\', "/");
+        let out = call(
+            "fs_glob",
+            &json!({"path": posix, "pattern": "**/*", "map": true}),
+        );
+        let _ = fs::remove_dir_all(&dir);
+        assert!(out.contains("core.rs"), "{out}");
+        assert!(out.contains("符号"), "{out}");
+        assert!(out.contains("pub fn verify"), "{out}");
+        let core = out.find("core.rs").expect("core.rs");
+        let user = out.find("user.rs").expect("user.rs");
+        assert!(core < user, "被引用的 core.rs 应排在 user.rs 前: {out}");
+    }
+
+    #[test]
+    fn glob_map与dirs互斥() {
+        let out = call(
+            "fs_glob",
+            &json!({"path": ".", "pattern": "**/*", "map": true, "dirs": true}),
+        );
+        assert!(out.starts_with("E_BAD_ARGS"), "{out}");
+    }
+
+    #[test]
+    fn 小文件自适应预算一次读完() {
+        let dir = 目录("adaptive-budget");
+        let path = dir.join("big.txt");
+        let body: String = (1..=400)
+            .map(|i| format!("{i:04}-{}\n", "x".repeat(30)))
+            .collect();
+        fs::write(&path, body).unwrap();
+        let posix = path.to_string_lossy().replace('\\', "/");
+        let out = call("fs_read", &json!({"path": posix}));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            out.contains("400|"),
+            "14KB 文件应一次读完: {}",
+            &out[out.len().saturating_sub(300)..]
+        );
+        assert!(!out.contains("续读"), "不应要求续读: {out}");
+    }
+    #[test]
+    fn 编辑后同区间再读返回新内容() {
+        let dir = 目录("cache-edit");
+        let path = dir.join("a.txt");
+        fs::write(&path, "aaa\nbbb\n").unwrap();
+        let posix = path.to_string_lossy().replace('\\', "/");
+        let _ = call("fs_read", &json!({"path": posix, "start": 1, "end": 2}));
+        let edited = call(
+            "fs_edit",
+            &json!({"path": posix, "edits": [{"old": "aaa", "new": "zzz"}]}),
+        );
+        assert!(edited.starts_with("ok"), "{edited}");
+        let out = call("fs_read", &json!({"path": posix, "start": 1, "end": 2}));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(out.contains("1|zzz"), "编辑后必须返回新内容: {out}");
+        assert!(!out.contains("未变更"), "{out}");
+    }
+
+    #[test]
+    fn force绕过缓存() {
+        let dir = 目录("cache-force");
+        let path = dir.join("a.txt");
+        fs::write(&path, "x1\nx2\n").unwrap();
+        let posix = path.to_string_lossy().replace('\\', "/");
+        let _ = call("fs_read", &json!({"path": posix, "start": 1, "end": 2}));
+        let out = call(
+            "fs_read",
+            &json!({"path": posix, "start": 1, "end": 2, "force": true}),
+        );
+        let _ = fs::remove_dir_all(&dir);
+        assert!(out.contains("1|x1"), "force=true 必须返回正文: {out}");
+    }
+    #[test]
+    fn reads与paths互斥() {
+        let dir = 目录("reads-conflict");
+        let a = dir.join("a.txt");
+        fs::write(&a, "x\n").unwrap();
+        let posix = a.to_string_lossy().replace('\\', "/");
+        let out = call(
+            "fs_read",
+            &json!({"reads": [{"path": posix.clone()}], "paths": [posix]}),
+        );
+        let _ = fs::remove_dir_all(&dir);
+        assert!(out.starts_with("E_BAD_ARGS"), "{out}");
     }
 }
