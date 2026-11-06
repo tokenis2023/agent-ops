@@ -15,6 +15,7 @@ const MAX_JOBS: usize = 16;
 const MAX_BUFFER: usize = 64 * 1024;
 const MAX_KEPT_JOBS: usize = 64;
 const MAX_TIMEOUT_MS: usize = 3_600_000;
+const MAX_WAIT_MS: usize = 60_000;
 
 struct Job {
     child: Child,
@@ -196,6 +197,27 @@ pub fn poll_or_kill(job_id: u32, args: &Value) -> String {
         return e;
     }
     let kill = crate::tools::arg_bool(args, "kill", false);
+    // 等待退出：短命令一次调用拿结果，不必反复轮询；锁只在检查时短暂持有。
+    let wait_ms = crate::tools::arg_usize(args, "wait_ms", 0).min(MAX_WAIT_MS);
+    let mut waited = 0u128;
+    if !kill && wait_ms > 0 {
+        let began = Instant::now();
+        loop {
+            let Ok(mut map) = jobs().lock() else {
+                break; // 锁不可用：立即走正常路径报错
+            };
+            let done = match map.get_mut(&job_id) {
+                Some(job) => matches!(job.child.try_wait(), Ok(Some(_))),
+                // 任务不存在：结束等待，正常路径会报 E_NO_JOB。
+                None => break,
+            };
+            if done || began.elapsed() >= Duration::from_millis(wait_ms as u64) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        waited = began.elapsed().as_millis();
+    }
     let Ok(mut map) = jobs().lock() else {
         return "E_JOB 任务表不可用".into();
     };
@@ -219,7 +241,13 @@ pub fn poll_or_kill(job_id: u32, args: &Value) -> String {
         Some(code) => {
             format!("ok job={job_id} exit={code} {elapsed}ms stdout={out_kept}B stderr={err_kept}B")
         }
-        None => format!("ok job={job_id} running {elapsed}ms pid={}", job.pid),
+        None => {
+            let mut text = format!("ok job={job_id} running {elapsed}ms pid={}", job.pid);
+            if waited > 0 {
+                text.push_str(&format!("（等待 {waited}ms 后仍在运行）"));
+            }
+            text
+        }
     };
     if job.killed {
         text.push_str("（已终止）");
@@ -371,6 +399,38 @@ mod tests {
         let (second, _) = take_delta(&buffer, &mut cursor);
         assert_eq!(second, "中");
         assert_eq!(cursor, 3);
+    }
+
+    #[test]
+    fn wait_ms等待任务退出后再返回() {
+        let started = start(&json!({
+            "program": "cmd",
+            "args": ["/c", "ping", "-n", "2", "127.0.0.1"],
+            "timeout_ms": 10000
+        }));
+        let id = job_id(&started);
+        let began = std::time::Instant::now();
+        let text = poll_or_kill(id, &json!({"wait_ms": 15000}));
+        assert!(text.contains("exit="), "等待后应带退出码: {text}");
+        assert!(
+            began.elapsed().as_secs() >= 1,
+            "应等待任务结束而不是立即返回: {text}"
+        );
+    }
+
+    #[test]
+    fn wait_ms超时后返回运行状态() {
+        let started = start(&json!({
+            "program": "cmd",
+            "args": ["/c", "ping", "-n", "30", "127.0.0.1"],
+            "timeout_ms": 30000
+        }));
+        let id = job_id(&started);
+        let text = poll_or_kill(id, &json!({"wait_ms": 300}));
+        assert!(text.contains("running"), "仍在运行: {text}");
+        assert!(!text.contains("exit="), "不应有退出码: {text}");
+        assert!(text.contains("仍在运行"), "应说明等待已超时: {text}");
+        let _ = poll_or_kill(id, &json!({"kill": true}));
     }
 
     #[test]

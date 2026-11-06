@@ -64,7 +64,7 @@ pub fn tool_defs() -> Vec<Value> {
                         "description": "仅对 >32MB 文件生效：window（默认）只读到请求区间末尾并探测是否还有内容，毫秒级返回，但不给全文 hash/总行数；full 全文件扫描，给精确 hash 与总行数"
                     },
                     "summary": {"type": "boolean", "description": "只输出结构摘要：声明行 + 行号，不展开函数体；行号可直接接 block=true 读实现。与 ranges/block/end 互斥，数据文件与超大文件不支持"},
-                    "focus": {"type": "string", "description": "只返回匹配该正则的完整代码块（含上下文），替代「先 fs_grep 再 block=true」两步。仅单文件，与 paths/reads/ranges/start/end/block/summary 互斥"},
+                    "focus": {"type": "string", "description": "只返回匹配该正则的完整代码块（含上下文），替代「先 fs_grep 再 block=true」两步。仅单文件，与 paths/reads/ranges/start/end/block/summary 互斥。JSON 字符串里反斜杠需双写"},
                     "force": {"type": "boolean", "description": "绕过未变更短路，强制返回正文。默认情况下，同一 MCP 会话里同文件同 hash 同区间再读只回一行摘要"}
                 },
                 "required": []
@@ -147,7 +147,7 @@ pub fn tool_defs() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "pattern": {"type": "string", "description": "Rust/PCRE 风格正则"},
+                    "pattern": {"type": "string", "description": "Rust/PCRE 风格正则；JSON 字符串里反斜杠需双写"},
                     "path": {"type": "string", "description": "搜索根目录，默认当前目录"},
                     "glob": {"type": "string", "description": "只看匹配的文件，如 **/*.ts"},
                     "ignore_case": {"type": "boolean"},
@@ -204,6 +204,7 @@ pub fn tool_defs() -> Vec<Value> {
                     "background": {"type": "boolean", "description": "会话内后台任务：立即返回 job id，用 job=<id> 轮询输出，list=true 列出全部；进程随 MCP 会话结束"},
                     "job": {"type": "integer", "description": "轮询/终止后台任务：传启动时返回的 job id"},
                     "list": {"type": "boolean", "description": "列出当前会话的全部后台任务（id/pid/状态/时长）"},
+                    "wait_ms": {"type": "integer", "description": "配合 job：最多等待 N 毫秒直到任务退出再返回（上限 60000）；超时仍运行则返回增量输出"},
                     "kill": {"type": "boolean", "description": "配合 job 使用：结束该任务的整个进程树"}
                 },
                 "required": []
@@ -1101,7 +1102,7 @@ fn read(args: &Value) -> String {
                         let line_no = window.first_line + r.continuation[0].0.saturating_sub(1);
                         let need = line_need_bytes(&window.text, r.continuation[0].0);
                         return format!(
-                            "E_LINE_TOO_LONG 第 {} 行约 {} 字节，当前 budget={} 放不下；请设 max_line=0 并把 budget 提到至少 {}",
+                            "E_LINE_TOO_LONG 第 {} 行约 {} 字节，渲染剩余预算 {}B 放不下；请设 max_line=0 并把 budget 提到至少 {}",
                             line_no, need, bb, need + 200 + header_len
                         );
                     }
@@ -1373,7 +1374,7 @@ fn read(args: &Value) -> String {
                 let line_no = r.continuation[0].0;
                 let need = line_need_bytes(&doc.text, line_no);
                 return format!(
-                    "E_LINE_TOO_LONG 第 {} 行约 {} 字节，当前 budget={} 放不下；请设 max_line=0 并把 budget 提到至少 {}",
+                    "E_LINE_TOO_LONG 第 {} 行约 {} 字节，渲染剩余预算 {}B 放不下；请设 max_line=0 并把 budget 提到至少 {}",
                     line_no, need, body_budget, need + 200
                 );
             }

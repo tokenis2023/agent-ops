@@ -91,7 +91,7 @@ const TOOL_SPECS = [
         },
         description: '一次读多个文件的不同区间，每项 {path,start?,end?,ranges?,block?,max_line?,scan?,budget?,focus?}；与 path/paths 互斥',
       },
-      focus: { type: 'string', description: '正则；只返回命中所在的完整代码块，替代 grep+block 两步' },
+      focus: { type: 'string', description: '正则；只返回命中所在的完整代码块，替代 grep+block 两步；JSON 字符串里反斜杠需双写' },
       force: { type: 'boolean', description: '绕过未变更短路，强制返回正文' },
     },
   },
@@ -171,6 +171,7 @@ const TOOL_SPECS = [
       background: { type: 'boolean', description: '会话内后台任务：立即返回 job id，用 job=<id> 轮询输出，list=true 列出全部；进程随 MCP 会话结束' },
       job: { type: 'integer', description: '轮询/终止后台任务：传启动时返回的 job id' },
       list: { type: 'boolean', description: '列出当前会话的全部后台任务（id/pid/状态/时长）' },
+      wait_ms: { type: 'integer', description: '配合 job：最多等待 N 毫秒直到任务退出再返回（上限 60000）；超时仍运行则返回增量输出' },
       kill: { type: 'boolean', description: '配合 job 使用：结束该任务的整个进程树' },
     },
   },
@@ -202,7 +203,7 @@ const TOOL_SPECS = [
     description:
       '正则流式搜索。优先替代 grep/rg/Select-String。按文件稳定分组，支持文本和 DOCX/PDF 正文，output 可选 files/count/matches/snippets；截断时返回 next_offset。',
     parameters: {
-      pattern: { type: 'string', description: 'Rust/PCRE 风格正则', required: true },
+      pattern: { type: 'string', description: 'Rust/PCRE 风格正则；JSON 字符串里反斜杠需双写', required: true },
       path: { type: 'string', description: '搜索根目录，默认当前目录' },
       glob: { type: 'string', description: '只看匹配的文件，如 **/*.ts' },
       ignore_case: { type: 'boolean', description: '忽略大小写' },
