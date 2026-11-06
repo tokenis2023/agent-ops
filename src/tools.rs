@@ -201,8 +201,9 @@ pub fn tool_defs() -> Vec<Value> {
                     "shell": {"type": "boolean", "description": "显式走 cmd /c（需要管道/重定向时才用，会回到文本解析）"},
                     "max_output": {"type": "integer", "description": "每条流最多保留字节，默认 32768"},
                     "check": {"type": "boolean", "description": "非零退出按 E_EXIT 错误返回；默认 false，非零仍是 ok"},
-                    "background": {"type": "boolean", "description": "后台运行：立即返回 job id，用 job=<id> 轮询输出；适合 dev server/watch 这类长驻命令"},
+                    "background": {"type": "boolean", "description": "会话内后台任务：立即返回 job id，用 job=<id> 轮询输出，list=true 列出全部；进程随 MCP 会话结束"},
                     "job": {"type": "integer", "description": "轮询/终止后台任务：传启动时返回的 job id"},
+                    "list": {"type": "boolean", "description": "列出当前会话的全部后台任务（id/pid/状态/时长）"},
                     "kill": {"type": "boolean", "description": "配合 job 使用：结束该任务的整个进程树"}
                 },
                 "required": []
@@ -688,6 +689,7 @@ fn read_items(args: &Value) -> String {
         );
     }
     let mut out = String::new();
+    let mut failed = 0usize;
     for (index, item) in items.iter().enumerate() {
         let Some(obj) = item.as_object() else {
             out.push_str(&format!(
@@ -722,6 +724,11 @@ fn read_items(args: &Value) -> String {
             single.insert("force".to_string(), json!(true));
         }
         let text = read(&Value::Object(single));
+        // 项级成败：单项输出的首行是 E_ 即失败；MCP 的 isError 对整体保守，
+        // 头部这行让调用方能一眼看出还有多少内容可用。
+        if text.starts_with("E_") {
+            failed += 1;
+        }
         if index > 0 && !out.ends_with('\n') {
             out.push('\n');
         }
@@ -730,7 +737,15 @@ fn read_items(args: &Value) -> String {
             out.push('\n');
         }
     }
-    out.trim_end().to_string()
+    let total = items.len();
+    let ok = total - failed;
+    let mut summary = format!("ok reads {total} 项：{ok} 成功");
+    if failed > 0 {
+        summary.push_str(&format!("，{failed} 失败"));
+    }
+    summary.push('\n');
+    summary.push_str(out.trim_end());
+    summary
 }
 
 /// focus 最多返回的代码块数；再多应该用 fs_grep 缩小范围。
@@ -2921,6 +2936,51 @@ fn next_fn() {
         let def = defs.iter().find(|d| d["name"] == "fs_exec").unwrap();
         let required = def["inputSchema"]["required"].as_array().unwrap();
         assert!(required.is_empty(), "fs_exec.required 应为空: {required:?}");
+    }
+
+    #[test]
+    fn 工具参考覆盖全部工具与错误码() {
+        // 三处契约（MCP schema / 源码错误码 / 文档）手工维护必然漂移；
+        // 把文档钉住：源码里出现的错误码必须能在工具参考里找到。
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let doc = fs::read_to_string(root.join("docs/工具参考.md")).unwrap();
+        for def in tool_defs() {
+            let name = def["name"].as_str().unwrap();
+            assert!(
+                doc.contains(&format!("## {name}")),
+                "工具参考缺少 {name} 章节"
+            );
+        }
+        let pattern = regex::Regex::new(r"E_[A-Z][A-Z0-9_]{2,}").unwrap();
+        let mut codes: Vec<String> = Vec::new();
+        for entry in fs::read_dir(root.join("src")).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = fs::read_to_string(&path).unwrap();
+            for m in pattern.find_iter(&text) {
+                // 排除 RULE_BODY / MAX_ARCHIVE_ENTRIES 这类标识符里嵌的 "E_XXX"：
+                // 匹配前一个字符仍是标识符字符，说明是更长名字的一部分。
+                let before = text[..m.start()].chars().next_back();
+                if before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    continue;
+                }
+                let code = m.as_str().to_string();
+                // 注释与文案里的占位示例，不是真实错误码。
+                if code == "E_XXX" {
+                    continue;
+                }
+                if !codes.contains(&code) {
+                    codes.push(code);
+                }
+            }
+        }
+        let missing: Vec<String> = codes
+            .into_iter()
+            .filter(|code| !doc.contains(code.as_str()))
+            .collect();
+        assert!(missing.is_empty(), "源码错误码未入工具参考: {missing:?}");
     }
 
     #[test]
@@ -5221,6 +5281,9 @@ mod roundtrip_tests {
         let _ = fs::remove_dir_all(&dir);
         assert!(out.contains("E_"), "缺失文件应报错: {out}");
         assert!(out.contains("1|ok1"), "另一项仍应输出: {out}");
+        assert!(out.starts_with("ok reads"), "应带部分成功头: {out}");
+        assert!(out.contains("1 成功"), "应报成功项数: {out}");
+        assert!(out.contains("1 失败"), "应报失败项数: {out}");
     }
 
     #[test]

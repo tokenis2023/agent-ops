@@ -10,6 +10,10 @@
 - `fs_read reads[]` 每项支持 `budget` 与 `focus`：大文件可单项多要预算，多文件按模式取块一次完成。
 - `fs_read` 的 description 增加模式互斥表（path/paths/reads/focus 四选一），模型在发出调用前就能拼出合法参数。
 - `fs_stat detail=server` 返回 `fsops 0.3.0 tools=8`：宿主重载后一条调用即可自检连接的服务端版本与工具数。
+- `fs_exec list=true`：列出当前会话的后台任务（id/pid/状态/时长），丢了 job id 也能自救；启动文案明确标注「会话内」任务，进程随 MCP 会话结束。
+- `fs_read reads` 输出首行改为 `ok reads N 项：X 成功，Y 失败`——单项失败不再淹没在正文里；MCP 的 `isError` 保守置 true 时，调用方可从首行判断还有多少内容可用。
+- 新增 `fsops schema` 子命令：输出 8 个工具的 MCP schema JSON；DSH 冒烟测试用它逐工具比对插件参数集合，三处手写 schema 的漂移从此变红灯。
+- 文档防漂移测试：扫描源码全部 `E_*` 错误码，断言工具参考覆盖每个码与每个工具章节。
 
 ## [0.3.0] - 2026-11-06
 

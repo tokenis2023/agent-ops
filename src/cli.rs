@@ -28,6 +28,8 @@ pub fn run(args: &[String]) -> i32 {
         "glob" => cmd_glob(rest),
         "stat" => cmd_stat(rest),
         "call" => cmd_call(rest),
+        "schema" => serde_json::to_string_pretty(&tools::tool_defs())
+            .unwrap_or_else(|_| "E_INTERNAL schema 序列化失败".into()),
         "install" => return install(rest),
         "integrate" => return crate::adopt::integrate(rest),
         "doctor" => return crate::adopt::doctor(rest),
@@ -56,6 +58,7 @@ fn usage() -> String {
   fsops glob [pattern] [--path DIR] [--dirs] [--limit N]
   fsops stat <path...>
   fsops call <tool> '<json 参数>'
+  fsops schema                              输出 8 个工具的 MCP schema（JSON）
   fsops install <claude|hermes|codex|json>  生成或写入 MCP 配置
   fsops integrate --rules [--target ...]     向项目写入 fsops 软规则
   fsops doctor [--json]                      检查规则与宿主接入状态

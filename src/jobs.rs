@@ -138,7 +138,57 @@ pub fn start(args: &Value) -> String {
             }
         });
     }
-    format!("ok job={id} pid={pid} 已启动（用 fs_exec job={id} 轮询，kill=true 结束）")
+    format!("ok job={id} pid={pid} 会话内后台任务已启动（fs_exec job={id} 轮询，list=true 列出全部，kill=true 结束）")
+}
+
+/// `fs_exec list=true`：列出当前会话的后台任务（id、pid、状态、时长）。
+/// job id 一旦丢失就再也轮询不到，这里给一条自救路径。
+pub fn list() -> String {
+    if let Some(e) = disabled() {
+        return e;
+    }
+    let Ok(mut map) = jobs().lock() else {
+        return "E_JOB 任务表不可用".into();
+    };
+    let keys: Vec<u32> = map.keys().copied().collect();
+    if keys.is_empty() {
+        return "ok jobs 0 个任务".into();
+    }
+    let mut lines = Vec::new();
+    let mut running = 0usize;
+    for key in keys {
+        let Some(job) = map.get_mut(&key) else {
+            continue;
+        };
+        let elapsed = job.started.elapsed().as_millis();
+        match job.child.try_wait() {
+            Ok(Some(status)) => lines.push(format!(
+                "job={key} pid={} exit={}（已结束）{elapsed}ms",
+                job.pid,
+                status.code().unwrap_or(-1)
+            )),
+            _ => {
+                running += 1;
+                let flag = if job.killed {
+                    "（终止中）"
+                } else if job.timed_out {
+                    "（超时）"
+                } else {
+                    ""
+                };
+                lines.push(format!(
+                    "job={key} pid={} running{flag} {elapsed}ms",
+                    job.pid
+                ));
+            }
+        }
+    }
+    let mut text = format!("ok jobs {} 个任务（{} 运行中）", lines.len(), running);
+    for line in lines {
+        text.push('\n');
+        text.push_str(&line);
+    }
+    text
 }
 
 pub fn poll_or_kill(job_id: u32, args: &Value) -> String {
@@ -321,6 +371,23 @@ mod tests {
         let (second, _) = take_delta(&buffer, &mut cursor);
         assert_eq!(second, "中");
         assert_eq!(cursor, 3);
+    }
+
+    #[test]
+    fn 列出后台任务() {
+        let started = start(&json!({
+            "program": "cmd",
+            "args": ["/c", "ping", "-n", "2", "127.0.0.1"]
+        }));
+        let id = job_id(&started);
+        let text = list();
+        assert!(text.starts_with("ok jobs"), "{text}");
+        assert!(
+            text.contains(&id.to_string()),
+            "列表应含刚启动的任务: {text}"
+        );
+        let text = poll_or_kill(id, &json!({"kill": true}));
+        assert!(text.contains("已终止"), "{text}");
     }
 
     #[test]

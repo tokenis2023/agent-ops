@@ -226,6 +226,41 @@ for (const [toolName, definition] of ctx.registered) {
   }
 }
 
+// ---- 4.5 fsops schema 与 DSH 参数集合一致 -----------------------------------
+// MCP schema（fsops schema 子命令输出）与 DSH 插件的 parameters 必须同名同参数集合。
+// 三处手写 schema 已漂移过 11 处（描述、缺字段），这里把漂移变成红灯。
+{
+  const text = await new Promise((resolve, reject) => {
+    const child = spawn(EXE, ['schema'], { stdio: ['ignore', 'pipe', 'inherit'] })
+    let out = ''
+    child.stdout.on('data', (chunk) => (out += chunk))
+    child.on('error', reject)
+    child.on('close', (code) => (code === 0 ? resolve(out) : reject(new Error('exit=' + code))))
+  })
+  const defs = JSON.parse(text)
+  check(
+    Array.isArray(defs) && defs.length === ctx.registered.size,
+    'fsops schema 与插件工具数一致',
+    'schema=' + defs.length + ' 插件=' + ctx.registered.size,
+  )
+  for (const [toolName, definition] of ctx.registered) {
+    const def = defs.find((d) => d.name === toolName)
+    if (!def) {
+      check(false, 'schema 一致：' + toolName, 'fsops schema 缺少该工具')
+      continue
+    }
+    const mcpKeys = Object.keys(def.inputSchema?.properties ?? {}).sort()
+    const dshKeys = Object.keys(definition.parameters ?? {}).sort()
+    const same =
+      mcpKeys.length === dshKeys.length && mcpKeys.every((k, i) => k === dshKeys[i])
+    check(
+      same,
+      'schema 一致：' + toolName + ' 参数集合相同',
+      'MCP: ' + mcpKeys.join(',') + ' / DSH: ' + dshKeys.join(','),
+    )
+  }
+}
+
 // ---- 5. 真实调用 -----------------------------------------------------------
 
 async function call(name, args) {

@@ -68,7 +68,10 @@ pub fn build_command(args: &Value) -> Result<(Command, String), String> {
 }
 
 pub fn run(args: &Value) -> String {
-    // 后台任务：{job:N} 轮询/终止；{background:true} 启动。
+    // 后台任务：{job:N} 轮询/终止；{list:true} 列出全部任务。
+    if crate::tools::arg_bool(args, "list", false) {
+        return crate::jobs::list();
+    }
     if let Some(job_id) = args.get("job").and_then(Value::as_u64) {
         return crate::jobs::poll_or_kill(job_id as u32, args);
     }
