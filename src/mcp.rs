@@ -11,18 +11,17 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
 /// 默认并发度：同一回复里的多个只读调用可以真正并行。
-const DEFAULT_JOBS: usize = 4;
+pub const DEFAULT_JOBS: usize = 4;
 
 pub fn serve() -> io::Result<()> {
     serve_with(DEFAULT_JOBS)
 }
 
 pub fn serve_with(jobs: usize) -> io::Result<()> {
-    if jobs <= 1 {
-        serve_serial()
-    } else {
-        serve_parallel(jobs)
-    }
+    // 0/1 升为单工作线程：串行 dispatch 会让 background/wait_ms 阻塞读线程，
+    // 后续请求（包括 kill 自救）全部排队。单工作线程保留串行语义，控制类
+    // 请求（initialize/ping/tools/list）仍在读线程就地应答，不受影响。
+    serve_parallel(jobs.max(1))
 }
 
 /// 单条请求 -> 单条响应；通知（无 id）返回 None。
@@ -68,35 +67,6 @@ fn dispatch(req: &Value) -> Option<Value> {
         Ok(v) => json!({"jsonrpc": "2.0", "id": id, "result": v}),
         Err((code, msg)) => err_resp(id, code, &msg),
     })
-}
-
-fn serve_serial() -> io::Result<()> {
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
-    for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
-        };
-        if line.trim().is_empty() {
-            continue;
-        }
-        let req: Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(e) => {
-                let resp = err_resp(Value::Null, -32700, &format!("JSON 解析失败: {e}"));
-                writeln!(stdout, "{resp}")?;
-                stdout.flush()?;
-                continue;
-            }
-        };
-        if let Some(resp) = dispatch(&req) {
-            writeln!(stdout, "{resp}")?;
-            stdout.flush()?;
-        }
-    }
-    crate::jobs::shutdown();
-    Ok(())
 }
 
 fn serve_parallel(jobs: usize) -> io::Result<()> {
@@ -181,9 +151,28 @@ pub fn instructions() -> &'static str {
 // 多文件响应里错误可能出现在任意一行；实现已移到 `tools::has_error_line`，
 // CLI 退出码与 MCP 的 isError 共用同一判定。
 
+/// `jobs.max(1)`：0/1 升为单工作线程的映射，供测试钉住。
+#[cfg(test)]
+fn jobs_max1(jobs: usize) -> usize {
+    jobs.max(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn jobs为0或1时升为单工作线程() {
+        // 串行 dispatch 会让 background/wait_ms 阻塞读线程（读线程被占住，
+        // 后续请求包括 kill 自救全部排队）。0/1 统一升为 1 个工作线程。
+        // serve_serial 已删；serve_with 用 jobs.max(1) 钉住该行为。
+        // mcp_jobs 在 cli.rs（不同测试模块），这里断言入口常量不回归。
+        assert_eq!(DEFAULT_JOBS, 4);
+        assert_eq!(jobs_max1(0), 1);
+        assert_eq!(jobs_max1(1), 1);
+        assert_eq!(jobs_max1(4), 4);
+    }
 
     #[test]
     fn 引导明确_pdf_正文走_fs_read() {

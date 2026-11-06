@@ -6,6 +6,7 @@
 //!   fsops call fs_edit '{"path":"/d/a.txt","edits":[{"old":"a","new":"b"}]}'
 //!   fsops install claude
 
+use crate::mcp::DEFAULT_JOBS;
 use crate::tools;
 use serde_json::{json, Value};
 use std::io::Read;
@@ -84,7 +85,7 @@ fn has(args: &[String], name: &str) -> bool {
 /// fsops mcp --jobs N：默认 4；0/1 表示串行。
 fn mcp_jobs(args: &[String]) -> Result<usize, String> {
     let Some(raw) = flag(args, "--jobs") else {
-        return Ok(4);
+        return Ok(DEFAULT_JOBS);
     };
     match raw.parse::<usize>() {
         Ok(n) if n <= 64 => Ok(n),
