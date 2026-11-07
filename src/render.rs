@@ -2,7 +2,7 @@
 //!
 //! 三条规则（直接决定 token 开销）：
 //! 1. 每行前缀 `行号|`，比 JSON 逐行对象省一半以上字符；
-//! 2. 连续空行折叠成一个 `⋯`，长行截断并标注剩余字符数；
+//! 2. 正文逐行原样输出（不折叠空行，才能直接当 fs_edit 的 old）；长行截断并标注剩余字符数；
 //! 3. 每次返回都有硬预算，超出就少给行、并在末尾告诉模型怎么继续取。
 
 /// 默认响应预算。32KB ≈ 8K token：多数源码文件一次读完，
@@ -16,7 +16,6 @@ pub struct RenderOpts {
     pub end: usize,
     pub budget: usize,
     pub max_line: usize,
-    pub squeeze_blank: bool,
     pub numbers: bool,
     /// 输出行号偏移；大文件只加载局部片段时用于还原真实行号。
     pub line_offset: usize,
@@ -29,7 +28,6 @@ impl Default for RenderOpts {
             end: usize::MAX,
             budget: DEFAULT_BUDGET,
             max_line: MAX_LINE_CHARS,
-            squeeze_blank: true,
             numbers: true,
             line_offset: 0,
         }
@@ -167,22 +165,9 @@ fn render_indexed(
     'ranges: for (range_index, &(raw_start, raw_end)) in ranges.iter().enumerate() {
         let start = raw_start.max(1);
         let end = raw_end.min(total);
-        let mut blank_run = 0usize;
         for idx in start..=end {
             let raw = lines[idx - 1];
             let line = raw.strip_suffix('\r').unwrap_or(raw);
-
-            if opts.squeeze_blank && line.trim().is_empty() {
-                blank_run += 1;
-                if blank_run > 1 {
-                    // 第二个及以后的连续空行直接跳过
-                    last = idx;
-                    continue;
-                }
-            } else {
-                blank_run = 0;
-            }
-
             let (shown, extra) = truncate_line(line, opts.max_line);
             let piece = if opts.numbers {
                 format!("{}|{shown}", idx + opts.line_offset)
@@ -357,11 +342,12 @@ mod tests {
     }
 
     #[test]
-    fn 连续空行被折叠() {
+    fn 连续空行按原文保留() {
+        // fs_read 的正文要能直接当 fs_edit 的 old：折叠空行会让模型
+        // 拿到的片段缺行，构造 old 时必 E_NO_MATCH，白多一轮。
         let text = "a\n\n\n\nb\n";
         let r = render_window(text, RenderOpts::default());
-        // 末尾换行不是一行，末尾不再输出幽灵的 `6|`。
-        assert_eq!(r.body, "1|a\n2|\n5|b\n");
+        assert_eq!(r.body, "1|a\n2|\n3|\n4|\n5|b\n");
         assert_eq!(r.total_lines, 5);
     }
 

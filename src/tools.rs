@@ -26,7 +26,7 @@ pub fn tool_defs() -> Vec<Value> {
                     "reads": {
                         "type": "array",
                         "maxItems": 20,
-                        "description": "一次读多个文件的不同区间，每项 {path,start?,end?,ranges?,block?,max_line?,scan?}；与 path/paths/ranges/start/end/block/summary/focus 互斥，预算按项均分",
+                        "description": "一次读多个文件的不同区间，每项 {path,start?,end?,ranges?,block?,max_line?,scan?,budget?,focus?}；与 path/paths/ranges/start/end/block/summary/focus 互斥，预算按项均分",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -66,14 +66,14 @@ pub fn tool_defs() -> Vec<Value> {
                     "summary": {"type": "boolean", "description": "只输出结构摘要：声明行 + 行号，不展开函数体；行号可直接接 block=true 读实现。与 ranges/block/end 互斥，数据文件与超大文件不支持"},
                     "tail": {"type": "integer", "minimum": 1, "description": "只读最后 N 行（日志场景）：与 start/end/ranges/block/summary/focus/paths 互斥，文件不足 N 行时读全部；免去先 fs_stat 拿总行数那一步"},
                     "focus": {"type": "string", "description": "只返回匹配该正则的完整代码块（含上下文），替代「先 fs_grep 再 block=true」两步。数据文件（JSON/YAML/Markdown 等）没有代码块，只给命中行 ±2 行。仅单文件，与 paths/reads/ranges/start/end/block/summary 互斥。JSON 字符串里反斜杠需双写"},
-                    "force": {"type": "boolean", "description": "绕过未变更短路，强制返回正文。默认情况下，同一 MCP 会话里同文件同 hash 同区间再读只回一行摘要"}
+                    "force": {"type": "boolean", "description": "读取缓存默认关闭；仅当 FSOPS_MCP_CACHE=1 开启后，用本参数绕过未变更摘要、强制返回正文。默认部署重复读直接返回全文，无需传"}
                 },
                 "required": []
             }
         }),
         json!({
             "name": "fs_edit",
-            "description": "精确替换文本（old→new）。优先替代 patch/Edit/apply_patch。同文件多处用 edits，多文件用 files；全部预检通过才写入。自动处理 CRLF/LF 差异并保留原编码；DOCX 不支持精确替换，请用 fs_write 整体重建。",
+            "description": "精确替换文本（old→new）或正则替换（pattern→replacement）：不知道确切原文时用 pattern，省掉为抄原文而做的一次 fs_read。优先替代 patch/Edit/apply_patch。同文件多处用 edits，多文件用 files；全部预检通过才写入。自动处理 CRLF/LF 差异并保留原编码；DOCX 不支持精确替换，请用 fs_write 整体重建。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -3349,6 +3349,62 @@ fn next_fn() {
             .filter(|code| !doc.contains(code.as_str()))
             .collect();
         assert!(missing.is_empty(), "源码错误码未入工具参考: {missing:?}");
+    }
+
+    #[test]
+    fn 工具描述与实际能力一致() {
+        let defs = tool_defs();
+        let get = |name: &str| defs.iter().find(|d| d["name"] == name).unwrap();
+        // 正则替换就是为省掉「抄原文」那一轮，description 里必须看得到。
+        let edit_desc = get("fs_edit")["description"].as_str().unwrap();
+        assert!(
+            edit_desc.contains("正则替换"),
+            "模型看不到正则替换会白多一轮 fs_read: {edit_desc}"
+        );
+        // 读取缓存默认关闭，别让模型以为重复读会被短路。
+        let force = get("fs_read")["inputSchema"]["properties"]["force"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(
+            !force.contains("默认情况下"),
+            "force 描述停留在旧的默认行为: {force}"
+        );
+        assert!(force.contains("默认关闭"), "{force}");
+        // reads 项支持 budget/focus，描述里列全才能少一轮试错。
+        let reads_desc = get("fs_read")["inputSchema"]["properties"]["reads"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(
+            reads_desc.contains("budget") && reads_desc.contains("focus"),
+            "reads 项描述漏了可选字段: {reads_desc}"
+        );
+    }
+
+    #[test]
+    fn 连续空行的正文可直接当old编辑() {
+        // 回归：默认折叠空行时，模型按 fs_read 输出拼 old 会缺行 → E_NO_MATCH。
+        let dir = 临时目录("read-edit-blank");
+        let path = dir.join("a.rs");
+        let content = "fn a() {\n    one();\n}\n\n\npub fn b() {\n    two();\n}\n";
+        fs::write(&path, content).unwrap();
+        let posix = path.to_string_lossy().replace('\\', "/");
+        let out = read(&json!({"path": posix}));
+        assert!(
+            out.contains("4|\n") && out.contains("5|\n") && out.contains("6|pub fn b"),
+            "连续空行必须逐行带行号，否则模型拼出的 old 会缺行: {out}"
+        );
+        let edited = call(
+            "fs_edit",
+            &json!({
+                "path": posix,
+                "edits": [{"old": "}\n\n\npub fn b()", "new": "}\n\npub fn b()"}]
+            }),
+        );
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            !edited.starts_with("E_"),
+            "按原文构造 old 应能直接命中: {edited}"
+        );
     }
 
     #[test]

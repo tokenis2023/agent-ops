@@ -161,7 +161,7 @@ try {
     try {
         Move-Item $staged $destination -Force
     } catch {
-        Write-Warning "目标正在运行，停止 fsops 子进程后重试。MCP 宿主会在下次调用时重启。"
+        Write-Warning "目标正在运行，已停止 fsops 子进程后重试。升级后请新开会话或执行 /reload-mcp，否则宿主仍持旧 schema。"
         Get-Process fsops -ErrorAction SilentlyContinue | Stop-Process -Force
         Start-Sleep -Milliseconds 400
         Move-Item $staged $destination -Force
@@ -203,3 +203,6 @@ Write-Host "安装完成。新终端执行：fsops version" -ForegroundColor Gre
 Write-Host "项目内建议执行：fsops integrate --rules" -ForegroundColor Green
 Write-Host "接入诊断：fsops doctor" -ForegroundColor Green
 Write-Host "使用指南：https://github.com/$Repo/blob/master/docs/使用指南.md"
+Write-Host "升级后必须新开会话或执行 /reload-mcp 才会加载新 schema；" -ForegroundColor Yellow
+Write-Host "  Hermes 若仍显示旧工具数，删除 cache/mcp_schema_cache.json 后重连。" -ForegroundColor Yellow
+Write-Host "  用 fs_stat detail=server 可一条调用确认连的是哪一版。" -ForegroundColor Yellow

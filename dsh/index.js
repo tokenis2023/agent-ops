@@ -93,10 +93,10 @@ const TOOL_SPECS = [
             focus: { type: 'string', description: '该项只返回命中所在的完整代码块' },
           },
         },
-        description: '一次读多个文件的不同区间，每项 {path,start?,end?,ranges?,block?,max_line?,scan?,budget?,focus?}；与 path/paths 互斥',
+        description: '一次读多个文件的不同区间，每项 {path,start?,end?,ranges?,block?,max_line?,scan?,budget?,focus?}；与 path/paths/ranges/start/end/block/summary/focus 互斥，预算按项均分',
       },
-      focus: { type: 'string', description: '正则；只返回命中所在的完整代码块，替代 grep+block 两步；JSON 字符串里反斜杠需双写' },
-      force: { type: 'boolean', description: '绕过未变更短路，强制返回正文' },
+      focus: { type: 'string', description: '正则；只返回命中所在的完整代码块，替代 grep+block 两步；数据文件只给命中行 ±2 行；仅单文件，与 paths/reads/ranges/start/end/block/summary 互斥；JSON 字符串里反斜杠需双写' },
+      force: { type: 'boolean', description: '读取缓存默认关闭；仅当 FSOPS_MCP_CACHE=1 开启后，用本参数绕过未变更摘要强制返回正文' },
     },
   },
   {
@@ -161,7 +161,7 @@ const TOOL_SPECS = [
   {
     name: 'fs_exec',
     description:
-      '执行程序（argv 数组，不经过 shell）。替代 PowerShell 跑 cargo/git/npm/python：没有引号/插值、2>&1、ErrorRecord、$LASTEXITCODE 问题。非零退出不是错误；超时结束整个进程树。后台任务 background/job/kill 只在长驻 MCP 服务内有效；DSH 插件每次调用是新进程，会返回 E_NO_JOB。',
+      '执行程序（argv 数组，不经过 shell）。替代 PowerShell 跑 cargo/git/npm/python：没有引号/插值、2>&1、ErrorRecord、$LASTEXITCODE 问题。非零退出不是错误；超时结束整个进程树。注意：background/job/list/wait_ms/kill 这 5 个参数只在长驻 MCP 服务内有效；DSH 插件每次调用是新进程，传了只会得到 E_NO_JOB，不要使用。',
     parameters: {
       program: { type: 'string', description: '可执行文件，如 cargo、git、python；走 PATH。启动新任务时必填，只轮询/终止 job 时可省略' },
       args: { type: 'array', items: { type: 'string' }, description: '参数数组，每个参数独立，不拼字符串' },

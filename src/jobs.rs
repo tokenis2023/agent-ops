@@ -359,6 +359,10 @@ mod tests {
         let started =
             start(&json!({"program": "cmd", "args": ["/c", "ping", "-n", "2", "127.0.0.1"]}));
         assert!(started.starts_with("ok job="), "{started}");
+        assert!(
+            started.contains("wait_ms=60000"),
+            "启动文案必须引导一次等到退出，别让模型反复轮询: {started}"
+        );
         let id = job_id(&started);
         let mut text = String::new();
         for _ in 0..50 {
@@ -441,6 +445,10 @@ mod tests {
         assert!(text.contains("running"), "仍在运行: {text}");
         assert!(!text.contains("exit="), "不应有退出码: {text}");
         assert!(text.contains("仍在运行"), "应说明等待已超时: {text}");
+        assert!(
+            text.contains("wait_ms=60000"),
+            "运行态尾注必须给出下一轮可直接照做的命令: {text}"
+        );
         let _ = poll_or_kill(id, &json!({"kill": true}));
     }
 
