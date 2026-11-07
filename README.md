@@ -25,7 +25,7 @@ fsops 同时提供 **MCP 服务**和 **CLI**，把 Windows 上最容易让 Agent
 ### 一行安装（推荐）
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://github.com/tokenis2023/agent-ops/releases/latest/download/install.ps1 | iex"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create([Text.Encoding]::UTF8.GetString((New-Object Net.WebClient).DownloadData('https://github.com/tokenis2023/agent-ops/releases/latest/download/install.ps1')).TrimStart([char]0xFEFF)))"
 ```
 
 安装脚本会：
@@ -41,7 +41,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://github.com/t
 跳过宿主注册或 PATH 修改：
 
 ```powershell
-& ([scriptblock]::Create((irm https://github.com/tokenis2023/agent-ops/releases/latest/download/install.ps1))) -Client none -NoPath
+& ([scriptblock]::Create([Text.Encoding]::UTF8.GetString((New-Object Net.WebClient).DownloadData('https://github.com/tokenis2023/agent-ops/releases/latest/download/install.ps1')).TrimStart([char]0xFEFF))) -Client none -NoPath
 ```
 
 ### 手动安装

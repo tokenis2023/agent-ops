@@ -7,7 +7,7 @@
 默认自动注册检测到的 Claude Code、Hermes 和 Codex。
 
 .EXAMPLE
-irm https://github.com/tokenis2023/agent-ops/releases/latest/download/install.ps1 | iex
+& ([scriptblock]::Create([Text.Encoding]::UTF8.GetString((New-Object Net.WebClient).DownloadData('https://github.com/tokenis2023/agent-ops/releases/latest/download/install.ps1')).TrimStart([char]0xFEFF)))
 
 .EXAMPLE
 .\install.ps1 -Version v0.2.2 -Client none -InstallDir "$env:LOCALAPPDATA\fsops"

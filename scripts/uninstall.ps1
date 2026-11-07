@@ -7,7 +7,7 @@
 脚本会打印需要执行的移除命令。
 
 .EXAMPLE
-irm https://github.com/tokenis2023/agent-ops/releases/latest/download/uninstall.ps1 | iex
+& ([scriptblock]::Create([Text.Encoding]::UTF8.GetString((New-Object Net.WebClient).DownloadData('https://github.com/tokenis2023/agent-ops/releases/latest/download/uninstall.ps1')).TrimStart([char]0xFEFF)))
 
 .EXAMPLE
 .\uninstall.ps1 -DryRun
