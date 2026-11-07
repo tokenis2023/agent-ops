@@ -993,7 +993,10 @@ text, _ = call("fs_exec", program="cmd", args=["/c", "echo", "e2e-exec"])
 check("fs_exec 返回退出码与 stdout",
       text.startswith("ok exit=0") and "e2e-exec" in text, text)
 text, _ = call("fs_exec", program="cmd", args=["/c", "exit", "5"])
-check("fs_exec 非零退出不是错误", text.startswith("ok exit=5"), text)
+# 非零退出在 check=false 时不算失败，但不能用 ok 开头：
+# 模型扫到 ok 会把编译/测试失败当成功。
+check("fs_exec 非零退出不是错误",
+      text.startswith("exit=5") and "ok exit=" not in text, text)
 text, _ = call("fs_exec", program="cmd", args=["/c", "ping", "-n", "10", "127.0.0.1"],
                timeout_ms=500)
 check("fs_exec 超时结束进程树", text.startswith("E_TIMEOUT"), text)

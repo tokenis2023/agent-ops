@@ -94,6 +94,15 @@ registerHooks({
 
 const plugin = await import(pathToFileURL(join(ROOT, 'dsh', 'index.js')).href)
 check(plugin.name === 'fsops', '插件导出 name=fsops')
+
+// 版本裁定：解析与「显式来源不探测」两条边界。
+{
+  const binary = await import(pathToFileURL(join(ROOT, 'dsh', 'binary.js')).href)
+  check(binary.extractVersion('fsops 0.6.0 tools=8') === '0.6.0', '版本解析：正常输出')
+  check(binary.extractVersion('fsops v0.6.0') === '0.6.0', '版本解析：允许 v 前缀')
+  check(binary.extractVersion('随便什么') === undefined, '版本解析：无版本返回 undefined')
+  check(binary.extractVersion('') === undefined, '版本解析：空输出返回 undefined')
+}
 check(
   Array.isArray(plugin.inject) && ['tools', 'subprocess', 'workingDirectory'].every((s) => plugin.inject.includes(s)),
   '插件声明 tools/subprocess/workingDirectory 依赖',
@@ -153,8 +162,12 @@ function validateNode(node, path, inPropertyMap) {
 
 function makeContext(cwd) {
   const registered = new Map()
+  const spawns = []
+  const disposers = []
   return {
     registered,
+    spawns,
+    disposers,
     tools: {
       register(definition) {
         registered.set(definition.name, definition)
@@ -165,6 +178,9 @@ function makeContext(cwd) {
         return cwd
       },
     },
+    on(event, handler) {
+      if (event === 'dispose') disposers.push(handler)
+    },
     subprocess: {
       async resolveExecutable(path) {
         if (path === 'fsops') throw new Error('not on PATH')
@@ -172,11 +188,27 @@ function makeContext(cwd) {
         return path
       },
       spawn(spec) {
+        spawns.push(spec.argv)
+        const stdio = spec.stdio ?? {}
         const child = spawn(spec.argv[0], spec.argv.slice(1), {
           cwd: spec.cwd,
           windowsHide: true,
           stdio: ['pipe', 'pipe', 'pipe'],
         })
+        const done = new Promise((settle) => {
+          child.on('close', (exitCode, signal) => settle({ exitCode, signal }))
+        })
+        // 管道模式：长驻会话由调用方持有流，不能替它关 stdin。
+        if (stdio.stdin === 'pipe' || stdio.stdout === 'pipe') {
+          return {
+            done,
+            stdin: child.stdin,
+            stdout: child.stdout,
+            stderr: child.stderr,
+            collected: {},
+            terminate: () => child.kill(),
+          }
+        }
         let out = ''
         let err = ''
         child.stdout.on('data', (chunk) => {
@@ -188,9 +220,6 @@ function makeContext(cwd) {
         const input = spec.stdio?.stdin?.data
         if (input !== undefined) child.stdin.end(input)
         else child.stdin.end()
-        const done = new Promise((settle) => {
-          child.on('close', (exitCode, signal) => settle({ exitCode, signal }))
-        })
         return {
           done,
           collected: {
@@ -251,7 +280,8 @@ for (const [toolName, definition] of ctx.registered) {
     }
     const mcpKeys = Object.keys(def.inputSchema?.properties ?? {}).sort()
     const dshKeys = Object.keys(definition.parameters ?? {}).sort()
-    // DSH 每次调用都是新进程，长驻后台任务不可用，这 5 个参数刻意不暴露；
+    // 插件刻意不暴露这段后台任务参数：任务生命周期绑在长驻会话里，
+    // 跨会话无法清理，需要长任务的用户走 MCP 形态。
     // 除此之外两侧参数集合必须完全一致，任何多出/缺失都是契约漂移。
     const dshAbsent = new Set(['background', 'job', 'list', 'wait_ms', 'kill'])
     const extra = dshKeys.filter((k) => !mcpKeys.includes(k))
@@ -340,7 +370,38 @@ try {
     missing = String(error.message)
   }
   check(missing.startsWith('E_'), 'fsops E_ 错误转成工具错误', missing.slice(0, 200))
+
+  // 并发正确性：4 个工作线程会乱序应答，响应靠 id 匹配，不能串号。
+  const parallelFiles = []
+  for (let index = 0; index < 4; index += 1) {
+    const target = join(work, 'par' + index + '.txt')
+    await call('fs_write', { path: target, content: 'marker-' + index + '\n' })
+    parallelFiles.push(target)
+  }
+  const parallelTexts = await Promise.all(parallelFiles.map((target) => call('fs_read', { path: target })))
+  const parallelOk = parallelTexts.every((text, index) => {
+    if (!text.includes('marker-' + index)) return false
+    return [0, 1, 2, 3].every((other) => other === index || !text.includes('marker-' + other))
+  })
+  check(parallelOk, '并发调用的响应按 id 匹配且不串号', parallelTexts.map((t) => t.slice(0, 40)).join(' | '))
+
+  // 长驻会话复用：一次 spawn 服务上面全部调用，才是这次延迟优化的核心。
+  const mcpSpawns = ctx.spawns.filter((argv) => argv[1] === 'mcp').length
+  check(mcpSpawns === 1, '工具调用复用同一个长驻 MCP 会话', 'mcp spawn 次数=' + mcpSpawns)
+  const oneShotSpawns = ctx.spawns.filter((argv) => argv[1] === 'call').length
+  check(oneShotSpawns === 0, '正常路径不退回一次性 spawn', 'call spawn 次数=' + oneShotSpawns)
+  // 显式 binary 就是用户的选择，不应该再花一次进程去核版本。
+  const versionProbes = ctx.spawns.filter((argv) => argv[1] === 'version').length
+  check(versionProbes === 0, '显式 binary 不做版本探测', 'version spawn 次数=' + versionProbes)
+
+  // 会话释放后重建：插件重载 / 会话崩溃都要能自愈。
+  for (const dispose of ctx.disposers) dispose()
+  const revived = await call('fs_read', { path: parallelFiles[0] })
+  check(revived.includes('marker-0'), '会话释放后自动重建', revived.slice(0, 120))
+  const respawns = ctx.spawns.filter((argv) => argv[1] === 'mcp').length
+  check(respawns === 2, '重建会话只再 spawn 一次', 'mcp spawn 次数=' + respawns)
 } finally {
+  for (const dispose of ctx.disposers) dispose()
   await rm(work, { recursive: true, force: true })
   await rm(stubDir, { recursive: true, force: true })
 }

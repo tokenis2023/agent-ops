@@ -101,13 +101,18 @@ patch 插入 `dsh/index.js` 这个 Host 插件。在 Harness 的 **插件 → �
 https://github.com/tokenis2023/agent-ops
 ```
 
-安装后默认启用，提供 8 个 `fs_*` 工具，与 MCP 形态同名、同错误码；参数集合基本一致，唯一差异是插件形态每次调用都是新进程，不暴露 `fs_exec` 的 `background`/`job`/`list`/`wait_ms`/`kill` 五个后台任务参数（需要后台任务请用 MCP 形态）。
+安装后默认启用，提供 8 个 `fs_*` 工具，与 MCP 形态同名、同错误码。插件**复用一条长驻 `fsops mcp` 会话**（换行分隔 JSON-RPC、按 id 匹配响应），不是每次调用新起进程：实测单次工具调用 **~33ms → 0.3–0.6ms**。会话不可用（spawn 失败、进程退出、初始化失败）时自动退回一次性 `fsops call`，功能不降级；想强制走一次性调用可配 `mcp: false`。参数集合与 MCP 形态基本一致，唯一差异是插件形态不暴露 `fs_exec` 的 `background`/`job`/`list`/`wait_ms`/`kill` 五个后台任务参数（需要后台任务请用 MCP 形态）。
 
 - **二进制来源**：优先用 `%LOCALAPPDATA%\fsops` 或 PATH 上已有的 `fsops.exe`；都没有时按本仓库版本
   从 GitHub Release 下载并校验 SHA-256（该版本还没发 Release 时回退到 latest），缓存在
   `%LOCALAPPDATA%\fsops-dsh\<版本>\`。
+  **会核对版本**：`%LOCALAPPDATA%\fsops` 与 PATH 上的二进制是任意旧版本，解析时跑一次
+  `fsops version` 与插件版本比对；不一致则优先用版本匹配的缓存/下载，都不行时直接报
+  `E_VERSION`（点名实际找到的版本），不再静默用旧内核。包内 `bin/` 与按版本命名的缓存不探测。
 - **离线或自定义**：在 profile 的 `cordis.patch.yml` 里按 `fsops-tools` 覆盖配置
-  `binary: D:\tools\fsops.exe`，或设环境变量 `FSOPS_BIN`，或用 `autoDownload: false` 关闭下载。
+  `binary: D:\tools\fsops.exe`（显式指定即直接采用，不做事后版本裁决），或设环境变量 `FSOPS_BIN`，
+  或用 `autoDownload: false` 关闭下载。确认就要用旧版本时设 `allowVersionMismatch: true`
+  或环境变量 `FSOPS_ALLOW_VERSION_MISMATCH=1`。
 - **平台**：`dsh.bundle.platforms` 声明为 `win32`，非 Windows 宿主不会展示也不允许启用。
 - **安全边界**：与 MCP 接入一致——fsops 没有路径沙箱，权限等于 Harness 进程用户；需要隔离时
   依赖 Harness 自己的沙箱策略或限定工作区。
@@ -125,6 +130,7 @@ node tests/dsh_plugin_smoke.mjs --exe target/debug/fsops.exe
 |---|---|
 | 双形态 | MCP stdio 服务 + Unix 风格 CLI |
 | DSH 插件 | 仓库根即标准 DSH bundle；插件管理里粘贴仓库地址即可安装 |
+| 插件延迟 | 复用长驻 `fsops mcp` 会话，单次工具调用 0.3–0.6ms；一次性 spawn 约 33ms（含隐藏 console 分配 ~17ms） |
 | 单文件分发 | Rust 编译的独立 Windows 可执行文件，无 Node/Python 运行时依赖 |
 | 文本编码 | UTF-8 / BOM / GBK / GB18030 / UTF-16 自动识别并原编码写回 |
 | 换行保持 | 匹配层归一 LF，写入层还原原文件 CRLF/LF/CR |
@@ -266,11 +272,23 @@ fsops 可以替代 Agent 对 `Get-Content`、`Set-Content`、`Select-String`、`
 
 结论：**读得少、改得省**是主要收益。纯定位单行时 fsops 可能持平甚至略亏（工具输出带路径头），这类查询直接给 `pattern` 已经足够，不必期待零成本。
 
+**插件调用延迟**（DSH 插件形态，Node 侧观测的墙钟时间）：
+
+| 场景 | 每个调用新起进程 | 复用长驻会话 |
+|---|---:|---:|
+| `fs_read`（5 行） | 33.5 ms | **0.54 ms** |
+| `fs_stat`（meta） | 32.9 ms | **0.34 ms** |
+| `fs_grep`（count） | — | 1.8 ms |
+| 4 路并发（4 次总耗时） | — | **0.59 ms** |
+
+一次性 spawn 的 33ms 拆开看：Windows 进程创建 ~9ms、给隐藏 console 子进程新建 conhost ~17ms、镜像加载与 Rust 初始化 ~6ms，**工具本身 <0.5ms**（`fsops version` 与 `fsops call fs_stat` 几乎同耗时）。所以优化只能靠复用进程，压 Rust 代码没有收益；长驻会话把这块固定成本摊销到一次。
+
 复跑：
 
 ```bash
 python tests/bench.py                  # 自带 fixture，无需外部仓库、无需 tiktoken
 python tests/bench.py /path/to/repo    # 额外在真实代码上跑一轮
+node tests/bench_dsh_latency.mjs       # 插件调用延迟：一次性 spawn vs 长驻会话
 ```
 
 ## 安全模型

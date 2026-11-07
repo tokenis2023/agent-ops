@@ -1,9 +1,14 @@
 /**
  * fsops 的 DSH Host 插件：把 8 个 fs_* 工具注册到当前 profile。
  *
- * 不重复实现文件语义——每次调用都通过 `fsops call <tool> -`（JSON 走 stdin）
- * 交给同一份 Rust 内核，因此错误码、预算、续读提示和输出格式与 fsops 的
+ * 不重复实现文件语义——通过一条长驻的 `fsops mcp` 子进程（换行分隔 JSON-RPC）
+ * 把调用交给同一份 Rust 内核，因此错误码、预算、续读提示和输出格式与 fsops 的
  * MCP / CLI 完全一致。
+ *
+ * 为什么是长驻而不是每次 `fsops call`：实测单次调用约 33ms，其中工具本身 <0.5ms，
+ * 其余是 Windows 进程创建（~9ms）、隐藏 console 分配（~17ms）和镜像加载（~6ms）。
+ * 复用同一个进程后单次调用降到亚毫秒；`fsops mcp` 自带 4 个工作线程，
+ * 并发只读调用也是真并行。会话不可用时仍退回一次性调用，功能不降级。
  */
 import { readFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
@@ -22,6 +27,8 @@ const PLUGIN_VERSION = JSON.parse(readFileSync(resolve(PKG_ROOT, 'package.json')
 const MAX_STDOUT_BYTES = 8 * 1024 * 1024
 const MAX_STDERR_BYTES = 256 * 1024
 const GRACE_MS = 5000
+/** 与 fsops mcp 的 initialize 应答对齐（它原样回显请求的版本）。 */
+const MCP_PROTOCOL_VERSION = '2025-06-18'
 
 /** fs_edit 的单条修改：字面量 {old,new} 或正则 {pattern,replacement}。 */
 function editItemSchema() {
@@ -253,17 +260,8 @@ async function agentCwd(ctx, exec) {
   return process.cwd()
 }
 
-/** 执行一次 fsops CLI 调用并把结果转成工具返回值。 */
-async function invoke(ctx, config, toolName, args, exec) {
-  const version =
-    typeof config.version === 'string' && config.version.length > 0 ? config.version : PLUGIN_VERSION
-  const executable = await resolveFsops({
-    pkgRoot: PKG_ROOT,
-    version,
-    config,
-    subprocess: ctx.subprocess,
-  })
-  const cwd = await agentCwd(ctx, exec)
+/** 执行一次性的 `fsops call` 调用（长驻会话不可用时的退路）。 */
+async function invokeOneShot(ctx, executable, cwd, toolName, args, exec) {
   const handle = ctx.subprocess.spawn({
     argv: [executable, 'call', toolName, '-'],
     cwd,
@@ -286,6 +284,245 @@ async function invoke(ctx, config, toolName, args, exec) {
   throw new Error('fsops ' + toolName + ' 失败（exit=' + String(outcome.exitCode) + signal + '）：' + detail)
 }
 
+/** 会话级失败：上层据此退回一次性调用；工具自身的 E_ 错误不能走这条路。 */
+function sessionError(message) {
+  const error = new Error(message)
+  error.fsopsSession = true
+  return error
+}
+
+function messageOf(value) {
+  if (value instanceof Error) return value.message
+  if (value !== null && typeof value === 'object' && typeof value.message === 'string') return value.message
+  return String(value)
+}
+
+function abortReason(signal) {
+  const reason = signal === undefined ? undefined : signal.reason
+  return reason instanceof Error ? reason : new Error('已取消')
+}
+
+/**
+ * 开一条长驻 `fsops mcp` 会话，并把 stdout 的行流按 id 分发到各自的 Promise。
+ *
+ * 行帧格式由 src/mcp.rs 固定：一行一个 JSON-RPC 响应，工具调用可由
+ * 4 个工作线程乱序应答，所以必须按 id 匹配而不是按顺序取。
+ */
+function startSession(ctx, executable, cwd) {
+  const handle = ctx.subprocess.spawn({
+    argv: [executable, 'mcp'],
+    cwd,
+    stdio: { stdin: 'pipe', stdout: 'pipe', stderr: 'pipe' },
+    graceMs: GRACE_MS,
+  })
+  const stdin = handle.stdin
+  const stdout = handle.stdout
+  if (stdin === undefined || stdout === undefined) {
+    handle.terminate?.()
+    throw sessionError('subprocess 未提供 stdin/stdout 管道，无法复用长驻会话')
+  }
+  let buffer = ''
+  let stderrTail = ''
+  let exited = false
+  let nextId = 0
+  const pending = new Map()
+
+  const failPending = (error) => {
+    for (const waiter of pending.values()) waiter.reject(error)
+    pending.clear()
+  }
+
+  stdout.setEncoding?.('utf8')
+  stdout.on('data', (chunk) => {
+    buffer += chunk
+    let index = buffer.indexOf('\n')
+    while (index >= 0) {
+      const line = buffer.slice(0, index)
+      buffer = buffer.slice(index + 1)
+      index = buffer.indexOf('\n')
+      if (line.trim().length === 0) continue
+      let message
+      try {
+        message = JSON.parse(line)
+      } catch {
+        continue
+      }
+      const waiter = pending.get(message.id)
+      if (waiter === undefined) continue
+      pending.delete(message.id)
+      waiter.resolve(message)
+    }
+  })
+  if (handle.stderr !== undefined) {
+    handle.stderr.setEncoding?.('utf8')
+    // stderr 必须持续排空：管道写满会把子进程卡死。
+    handle.stderr.on('data', (chunk) => {
+      stderrTail = (stderrTail + chunk).slice(-4096)
+    })
+  }
+  handle.done.then(
+    (outcome) => {
+      exited = true
+      const tail = stderrTail.trim()
+      failPending(
+        sessionError(
+          'fsops mcp 已退出（exit=' + String(outcome.exitCode) + '）' + (tail.length > 0 ? '：' + tail : ''),
+        ),
+      )
+    },
+    (error) => {
+      exited = true
+      failPending(sessionError('fsops mcp 启动失败：' + messageOf(error)))
+    },
+  )
+
+  const request = (method, params, signal) =>
+    new Promise((resolve, reject) => {
+      if (exited) {
+        reject(sessionError('fsops mcp 会话已退出'))
+        return
+      }
+      if (signal !== undefined && signal.aborted) {
+        reject(abortReason(signal))
+        return
+      }
+      const id = ++nextId
+      const onAbort = () => {
+        pending.delete(id)
+        reject(abortReason(signal))
+      }
+      pending.set(id, {
+        resolve: (message) => {
+          signal?.removeEventListener?.('abort', onAbort)
+          resolve(message)
+        },
+        reject: (error) => {
+          signal?.removeEventListener?.('abort', onAbort)
+          reject(error)
+        },
+      })
+      signal?.addEventListener?.('abort', onAbort, { once: true })
+      try {
+        stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n')
+      } catch (error) {
+        pending.delete(id)
+        reject(sessionError('向 fsops mcp 写入失败：' + messageOf(error)))
+      }
+    })
+
+  const ready = request('initialize', {
+    protocolVersion: MCP_PROTOCOL_VERSION,
+    capabilities: {},
+    clientInfo: { name: 'dsh-fsops-plugin', version: PLUGIN_VERSION },
+  }).then((message) => {
+    if (message.error !== undefined) {
+      throw sessionError('fsops mcp 初始化失败：' + messageOf(message.error))
+    }
+  })
+
+  return {
+    ready,
+    request,
+    isExited: () => exited,
+    dispose() {
+      exited = true
+      failPending(sessionError('fsops mcp 会话已关闭'))
+      handle.terminate?.()
+    },
+  }
+}
+
+/** 一次插件实例的传输层：缓存可执行文件、复用长驻会话、提供一次性退路。 */
+function createTransport(ctx, options) {
+  const sessions = new Map()
+  let executablePromise
+
+  // 解析一次就够：每次调用重走候选路径探测纯属白花时间。
+  const executableOnce = () => {
+    if (executablePromise === undefined) {
+      const version =
+        typeof options.version === 'string' && options.version.length > 0
+          ? options.version
+          : PLUGIN_VERSION
+      executablePromise = resolveFsops({
+        pkgRoot: PKG_ROOT,
+        version,
+        config: options,
+        subprocess: ctx.subprocess,
+      }).catch((error) => {
+        executablePromise = undefined
+        throw error
+      })
+    }
+    return executablePromise
+  }
+
+  const sessionFor = async (executable, cwd) => {
+    const existing = sessions.get(cwd)
+    if (existing !== undefined && !existing.isExited()) {
+      await existing.ready
+      return existing
+    }
+    sessions.delete(cwd)
+    const fresh = startSession(ctx, executable, cwd)
+    sessions.set(cwd, fresh)
+    try {
+      await fresh.ready
+    } catch (error) {
+      sessions.delete(cwd)
+      fresh.dispose()
+      throw error
+    }
+    return fresh
+  }
+
+  const callOnce = async (toolName, args, exec) => {
+    const executable = await executableOnce()
+    const cwd = await agentCwd(ctx, exec)
+    return invokeOneShot(ctx, executable, cwd, toolName, args, exec)
+  }
+
+  const callRpc = async (toolName, args, exec) => {
+    const executable = await executableOnce()
+    const cwd = await agentCwd(ctx, exec)
+    const session = await sessionFor(executable, cwd)
+    const response = await session.request(
+      'tools/call',
+      { name: toolName, arguments: args ?? {} },
+      exec.signal,
+    )
+    if (response.error !== undefined) {
+      // 协议层错误（未知方法/参数）不是会话故障，直接抛给模型。
+      throw new Error('fsops ' + toolName + ' 失败：' + messageOf(response.error))
+    }
+    const content = response.result === undefined ? undefined : response.result.content
+    const first = Array.isArray(content) && content.length > 0 ? content[0] : undefined
+    const text = first !== undefined && typeof first.text === 'string' ? first.text : ''
+    // isError 与 CLI 退出码 2 同源（首行 E_ 或正文里夹着 E_ 行），行为保持一致。
+    if (response.result !== undefined && response.result.isError === true) {
+      throw new Error(text.trimEnd().length > 0 ? text.trimEnd() : 'fsops ' + toolName + ' 失败')
+    }
+    return text.trimEnd()
+  }
+
+  return {
+    /** 优先长驻会话；会话级故障退回一次性 spawn，保证工具始终可用。 */
+    async call(toolName, args, exec) {
+      if (options.mcp === false) return callOnce(toolName, args, exec)
+      try {
+        return await callRpc(toolName, args, exec)
+      } catch (error) {
+        if (error === null || typeof error !== 'object' || error.fsopsSession !== true) throw error
+        return callOnce(toolName, args, exec)
+      }
+    },
+    dispose() {
+      for (const session of sessions.values()) session.dispose()
+      sessions.clear()
+    },
+  }
+}
+
 /**
  * 注册全部 fs_* 工具。
  * @param ctx Cordis 上下文。
@@ -293,6 +530,9 @@ async function invoke(ctx, config, toolName, args, exec) {
  */
 export function apply(ctx, config) {
   const options = config ?? {}
+  const transport = createTransport(ctx, options)
+  // 服务释放会杀子进程；这里显式关会话，让 pending 请求立即失败而不是干等。
+  if (typeof ctx.on === 'function') ctx.on('dispose', () => transport.dispose())
   for (const spec of TOOL_SPECS) {
     const definition = {
       name: spec.name,
@@ -303,7 +543,7 @@ export function apply(ctx, config) {
         render: (_args, value) => [{ type: 'text', text: value }],
       },
       async execute(args, exec) {
-        return invoke(ctx, options, spec.name, args, exec)
+        return transport.call(spec.name, args, exec)
       },
     }
     if (spec.readOnly === true) definition.isConcurrencySafe = () => true

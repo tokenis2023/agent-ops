@@ -59,6 +59,17 @@ const MAX_LOCI: usize = 64;
 /// diff 展示的改动块上限，避免大文件批量替换把响应撑爆。
 const MAX_HUNKS: usize = 32;
 
+/// 多编辑中途失败时，错误里展示的文件片段是「前几处已在内存应用」的中间态，
+/// 磁盘一个字都没写。不声明这一点，模型会以为已经部分写入，进而重试已生效的修改。
+fn with_partial_note(err: String, applied_before: usize) -> String {
+    if applied_before == 0 {
+        return err;
+    }
+    format!(
+        "{err}\n（注：前 {applied_before} 处只在内存里应用过，本次未写入任何文件；上面的文件片段是中间态，磁盘内容未变）"
+    )
+}
+
 /// 在已解码文本上按原换行风格匹配、修改，返回新文本与摘要。
 pub fn apply(original: &str, eol: Eol, edits: &[EditSpec]) -> Result<(String, EditResult), String> {
     let mut work = text::to_lf(original);
@@ -73,6 +84,26 @@ pub fn apply(original: &str, eol: Eol, edits: &[EditSpec]) -> Result<(String, Ed
     };
 
     for (i, e) in edits.iter().enumerate() {
+        // 字面量与正则两套参数不能混用。旧实现只要给了 pattern 就 continue，
+        // old/new 被完全静默忽略：模型以为字面量生效，写盘后内容错且零信号。
+        if e.pattern.is_some() && e.old.is_some() {
+            return Err(format!(
+                "E_BAD_EDIT 第{}处 old 与 pattern 只能二选一；用 pattern 时不要传 old/new，替换文本写在 replacement",
+                i + 1
+            ));
+        }
+        if e.pattern.is_some() && e.new.is_some() {
+            return Err(format!(
+                "E_BAD_EDIT 第{}处 new 与 pattern 只能二选一；用 pattern 时替换文本写在 replacement",
+                i + 1
+            ));
+        }
+        if e.pattern.is_none() && e.replacement.is_some() {
+            return Err(format!(
+                "E_BAD_EDIT 第{}处 replacement 只能配合 pattern 使用；字面量替换请用 new",
+                i + 1
+            ));
+        }
         // 正则模式：不知道确切原文也能改，省掉为抄原文而做的一次读取。
         if let Some(pat) = &e.pattern {
             apply_regex(&mut work, e, pat, i + 1, &mut res, &mut touched_lines)?;
@@ -114,17 +145,20 @@ pub fn apply(original: &str, eol: Eol, edits: &[EditSpec]) -> Result<(String, Ed
                     .map(|p| line_of(&work, *p).to_string())
                     .collect::<Vec<_>>()
                     .join(",");
-                return Err(format!(
-                    "E_NO_MATCH 第{}处：在 {}..={} 行内未找到目标文本（文件其他位置有 {} 处匹配：行 {other_lines}）；调整 start/end 或去掉范围",
-                    i + 1,
-                    from,
-                    e.end.map(|v| v.to_string()).unwrap_or("末".into()),
-                    other.len()
+                return Err(with_partial_note(
+                    format!(
+                        "E_NO_MATCH 第{}处：在 {}..={} 行内未找到目标文本（文件其他位置有 {} 处匹配：行 {other_lines}）；调整 start/end 或去掉范围",
+                        i + 1,
+                        from,
+                        e.end.map(|v| v.to_string()).unwrap_or("末".into()),
+                        other.len()
+                    ),
+                    i,
                 ));
             }
         }
         if positions.is_empty() {
-            return Err(no_match_error(&work, &needle, i + 1));
+            return Err(with_partial_note(no_match_error(&work, &needle, i + 1), i));
         }
         if positions.len() > 1 && !e.all {
             let line_list: Vec<String> = positions
@@ -157,13 +191,16 @@ pub fn apply(original: &str, eol: Eol, edits: &[EditSpec]) -> Result<(String, Ed
                 }
                 snippets.push('\n');
             }
-            return Err(format!(
-                "E_AMBIGUOUS 第{}处匹配到 {} 个位置（行 {} 列 {}）；加更多上下文，或设 all=true 全部替换，或用 start/end 限定行范围{}",
-                i + 1,
-                positions.len(),
-                line_list.join(","),
-                col_list.join(","),
-                snippets
+            return Err(with_partial_note(
+                format!(
+                    "E_AMBIGUOUS 第{}处匹配到 {} 个位置（行 {} 列 {}）；加更多上下文，或在该条 edits 项里设 \"all\": true 全部替换，或用该条 edits 项里的 \"start\"/\"end\" 限定行范围（这三个字段属于 edits[] 内的单条修改项，传到顶层会被 schema 拒绝）{}",
+                    i + 1,
+                    positions.len(),
+                    line_list.join(","),
+                    col_list.join(","),
+                    snippets
+                ),
+                i,
             ));
         }
 
@@ -768,6 +805,65 @@ mod tests {
         // 附上下文片段：模型不必再 fs_read 就能构造出唯一的 old。
         assert!(err.contains("1|x();"), "应含命中行片段: {err}");
         assert!(err.contains("2|x();"), "应含命中行片段: {err}");
+        // 建议必须能直接照做：all/start/end 属于 edits[] 内的单条修改项，
+        // 写到顶层会被 schema 当未知字段拒绝（旧文案正是在这里把模型带进二次报错）。
+        assert!(
+            err.contains("edits"),
+            "歧义建议要指明写在 edits 项里: {err}"
+        );
+    }
+
+    #[test]
+    fn old与pattern同时给出必须报错而不是静默取pattern() {
+        // 旧实现只要给了 pattern 就 continue，old/new 被完全忽略：模型以为字面量
+        // 生效，写盘后内容错且没有任何信号。互斥必须在写入前显式拒绝。
+        let mut e = spec("gamma", "GAMMA");
+        e.pattern = Some("delta".into());
+        e.replacement = Some("DELTA".into());
+        let err = apply("gamma\ndelta\n", Eol::Lf, &[e]).unwrap_err();
+        assert!(err.starts_with("E_BAD_EDIT"), "{err}");
+        assert!(err.contains("二选一"), "应说明互斥: {err}");
+    }
+
+    #[test]
+    fn new与pattern同时给出必须报错() {
+        let mut e = spec("gamma", "GAMMA");
+        e.old = None;
+        e.pattern = Some("delta".into());
+        e.replacement = Some("DELTA".into());
+        let err = apply("delta\n", Eol::Lf, &[e]).unwrap_err();
+        assert!(err.starts_with("E_BAD_EDIT"), "{err}");
+        assert!(
+            err.contains("replacement"),
+            "应指引替换文本写在 replacement: {err}"
+        );
+    }
+
+    #[test]
+    fn replacement脱离pattern时必须报错() {
+        let mut e = spec("a", "b");
+        e.replacement = Some("c".into());
+        let err = apply("a\n", Eol::Lf, &[e]).unwrap_err();
+        assert!(err.starts_with("E_BAD_EDIT"), "{err}");
+        assert!(err.contains("new"), "应指引字面量替换用 new: {err}");
+    }
+
+    #[test]
+    fn 多编辑中途失败时说明片段是内存中间态() {
+        // 错误里的文件片段来自「前一处已在内存应用」的 work，磁盘一个字未写。
+        // 不声明这点，模型会以为已部分写入，重试已经生效的修改。
+        let err = apply(
+            "aaa\nbbb\n",
+            Eol::Lf,
+            &[spec("aaa", "AAA"), spec("zzz", "ZZZ")],
+        )
+        .unwrap_err();
+        assert!(err.starts_with("E_NO_MATCH"), "{err}");
+        assert!(err.contains("未写入任何文件"), "必须声明磁盘未变: {err}");
+        assert!(err.contains("中间态"), "{err}");
+        // 第一处生效时不应平白多这条注释。
+        let first = apply("aaa\n", Eol::Lf, &[spec("zzz", "ZZZ")]).unwrap_err();
+        assert!(!first.contains("中间态"), "{first}");
     }
 
     #[test]

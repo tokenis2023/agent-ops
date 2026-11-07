@@ -2,6 +2,54 @@
 
 本项目使用语义化版本。日期为发布日。
 
+## [未发布]
+
+### 修复（Agent 友好度评审的 P0）
+
+- `fs_edit` 同时给 `old` 与 `pattern`（或 `new` 与 `pattern`、`replacement` 不带 `pattern`）现在直接报 `E_BAD_EDIT`。
+  旧实现只要给了 `pattern` 就 `continue`，`old`/`new` 被静默忽略：模型以为字面量生效，
+  写盘后内容错且没有任何信号——这是评审里唯一的「静默写错」。
+- `E_AMBIGUOUS` 的建议改成可照做的说法：`all`/`start`/`end` 属于 `edits[]` 内的单条修改项，
+  并显式说明传到顶层会被 schema 拒绝。原文案直接写「设 all=true」，模型照做会撞
+  `E_BAD_ARGS ... 是未知字段`，把一个错误变成两个。
+- `E_BAD_ARGS` 对 `fs_edit` 的字段级关键字（`old`/`new`/`pattern`/`replacement`/`all`/`start`/`end`）
+  提到顶层时给定向指引，不再机械地猜「最接近的合法字段是 path」（而 `all` 根本不是拼错）。
+- `fs_exec` 非零退出不再用 `ok` 前缀：`ok exit=3` → `exit=3 非零`。`check` 默认 false 时它确实是
+  成功返回，但 `ok` 会让模型把编译/测试失败当成功。
+- 多编辑中途失败时，错误里的文件片段标注为「内存中间态，本次未写入任何文件」。
+  原来预览显示的是「已应用前几处」的内存态，与磁盘不符，模型会误判已部分写入。
+
+### 性能
+
+- DSH 插件改为复用**一条长驻 `fsops mcp` 会话**（换行分隔 JSON-RPC、按 id 匹配响应、
+  `fsops mcp` 自带 4 个工作线程所以并发只读调用是真并行），不再每次调用新起进程：
+  实测 `fs_read` **33.5ms → 0.54ms**、`fs_stat` **32.9ms → 0.34ms**、`fs_grep` 1.8ms、
+  4 路并发一轮 0.59ms（首次调用付一次 spawn，约 35ms）。
+  一次性 spawn 的 33ms 里工具本身 <0.5ms，其余是 Windows 进程创建（~9ms）、
+  隐藏 console 分配（~17ms）和镜像加载（~6ms）——这部分只能靠复用进程摊销。
+- 会话级故障（spawn 失败、进程退出、初始化失败）自动退回一次性 `fsops call`，功能不降级；
+  可用 `mcp: false` 强制一次性调用。插件释放时关闭会话，并让挂起请求立即失败而不是干等。
+- 可执行文件解析结果缓存，不再每次调用重走候选路径探测。
+- 新增 `node tests/bench_dsh_latency.mjs`：对比一次性 spawn 与长驻会话，输出 min/med/p95/max。
+- 冒烟测试新增两条回归守卫：全部工具调用只 spawn 一次 `fsops mcp`、正常路径不退回一次性 spawn。
+
+### 插件接入
+
+- **修掉版本静默降级**：`resolveFsops` 以前只要找到 `%LOCALAPPDATA%\fsops\fsops.exe` 就直接用，
+  不核对版本——插件升到 0.6.0 而那里躺着 0.5.0 时，schema 是新的、跑的是旧内核，
+  参数差异直接变成 `E_BAD_ARGS` 循环，而且没有任何提示。现在对 `%LOCALAPPDATA%\fsops` 与
+  PATH 上的候选跑一次 `fsops version` 比对：不一致就用版本匹配的缓存/下载，都不行则报
+  `E_VERSION` 并点名实际版本与三种修法；包内 `bin/` 与按版本命名的缓存仍不探测（零额外开销）。
+- 显式来源（配置 `binary` / `FSOPS_BIN`）保持权威，不做事后推翻；确需旧版本可用
+  `allowVersionMismatch: true` 或 `FSOPS_ALLOW_VERSION_MISMATCH=1`。
+- 冒烟测试新增 5 项：版本解析 4 项（含 `v` 前缀、空输出、乱文本）与「显式 binary 不做版本探测」（65 项全绿）。
+
+### 测试
+
+- 新增 5 个 Rust 单测：`old`/`pattern` 互斥 3 个、多编辑中间态提示 1 个、
+  `fs_edit` 顶层字段指引 1 个；并给 `fs_exec` 非零退出的前缀加了反向断言。
+- `cargo test --lib` 348 → 353 项全绿；`cargo clippy -D warnings` 干净；DSH 冒烟 57 → 65 项全绿。
+
 ## [0.6.0] - 2026-11-07
 
 - 新增 `fsops upgrade [--check|--force]` 自更新：跟随 `releases/latest` 取最新 tag，下载二进制与 `.sha256` 并校验，SHA-256 不匹配时中止且不改动任何文件；替换采用「先改名再落新版」，失败自动回滚，旧文件保留为 `fsops.exe.old-*` 并在下次升级自动清理。网络瞬时失败重试 3 次。

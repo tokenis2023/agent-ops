@@ -496,6 +496,17 @@ fn edit_distance(a: &str, b: &str) -> usize {
     previous[b_chars.len()]
 }
 
+/// fs_edit 单条修改项自己的字段：容易被模型误提到顶层的关键字。
+const EDIT_ITEM_FIELDS: [&str; 7] = [
+    "old",
+    "new",
+    "pattern",
+    "replacement",
+    "all",
+    "start",
+    "end",
+];
+
 /// 按 schema 校验参数类型。
 ///
 /// 为什么必须有：类型写错时旧代码会用 `unwrap_or(default)` 静默退回默认值，
@@ -516,6 +527,13 @@ fn validate_args(name: &str, args: &Value) -> Option<String> {
     }
     for (key, value) in obj {
         let Some(spec) = props.get(key) else {
+            // fs_edit 的字段级参数常被模型提到顶层。机械地报「最接近的合法字段」
+            // 会把它猜成 path，反而把模型引向更错的方向，所以这里给定向指引。
+            if name == "fs_edit" && EDIT_ITEM_FIELDS.contains(&key.as_str()) {
+                return Some(format!(
+                    "E_BAD_ARGS fs_edit.{key} 是单条修改自己的字段，请放进 edits[] 或 files[].edits[] 的每一项里，例如 edits: [{{\"old\": \"...\", \"{key}\": ...}}]"
+                ));
+            }
             let nearest = props
                 .keys()
                 .min_by_key(|candidate| edit_distance(key, candidate))
@@ -2316,6 +2334,33 @@ mod tests {
                 json!(false),
                 "{} schema 未禁止未知字段",
                 def["name"]
+            );
+        }
+    }
+
+    #[test]
+    fn edit字段级参数提到顶层时指引放进edits() {
+        // 通用「最接近合法字段」会把它猜成 path，反而把模型引到更错的方向。
+        for key in [
+            "all",
+            "start",
+            "end",
+            "old",
+            "new",
+            "pattern",
+            "replacement",
+        ] {
+            let mut args = json!({ "path": "a.txt" });
+            args[key] = json!(true);
+            let output = call("fs_edit", &args);
+            assert!(output.starts_with("E_BAD_ARGS"), "{key}: {output}");
+            assert!(
+                output.contains("edits"),
+                "{key} 应指引放进 edits[]: {output}"
+            );
+            assert!(
+                !output.contains("最接近的合法字段"),
+                "{key} 不该猜最接近字段: {output}"
             );
         }
     }

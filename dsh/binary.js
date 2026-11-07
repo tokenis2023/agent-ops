@@ -128,11 +128,44 @@ export async function downloadFsops(version) {
   return { path: dest, version: target, verified: asset.expected !== '' }
 }
 
+/** 从 `<exe> version` 的输出里取版本号；格式不符时返回 undefined。 */
+export function extractVersion(text) {
+  const match = /fsops\s+v?(\d+\.\d+\.\d+)/.exec(String(text))
+  return match === null ? undefined : match[1]
+}
+
+/** 探测一个已解析二进制的版本；探测不到（无 subprocess、启动失败）返回 undefined。 */
+async function probeVersion(subprocess, executable) {
+  if (typeof subprocess?.spawn !== 'function') return undefined
+  try {
+    const handle = subprocess.spawn({
+      argv: [executable, 'version'],
+      cwd: process.cwd(),
+      stdio: { stdin: 'ignore', stdout: { maxBytes: 4096 }, stderr: { maxBytes: 4096 } },
+      graceMs: 5000,
+    })
+    const outcome = await handle.done
+    if (outcome.exitCode !== 0) return undefined
+    const stdout = handle.collected === undefined ? undefined : handle.collected.stdout
+    return extractVersion(stdout === undefined ? '' : stdout.readFrom(0).text)
+  } catch {
+    return undefined
+  }
+}
+
 /**
  * 确保拿到一个可执行的 fsops，返回绝对路径。
  * `subprocess` 是 Harness 的 ctx.subprocess，用来校验可执行文件；缺失时只做存在性判断。
+ *
+ * 版本裁定：
+ *   - 显式来源（配置 binary / FSOPS_BIN）就是用户的选择，直接用，不事后推翻；
+ *   - 包内 bin/ 与 %LOCALAPPDATA%\fsops-dsh\<version>\ 由版本号决定，不探测；
+ *   - %LOCALAPPDATA%\fsops\ 与 PATH 上的可能是任意旧版本，必须核对——
+ *     否则会出现「插件 0.6.0 配 0.5.0 内核」这种静默降级：schema 是新插件的，
+ *     执行的却是旧二进制，参数差异直接变成 E_BAD_ARGS 循环。
  */
 export async function resolveFsops({ pkgRoot, version, config, subprocess }) {
+  const exe = process.platform === 'win32' ? 'fsops.exe' : 'fsops'
   const verify = async (path) => {
     if (subprocess?.resolveExecutable) {
       try {
@@ -144,14 +177,62 @@ export async function resolveFsops({ pkgRoot, version, config, subprocess }) {
     return existsSync(path) ? path : undefined
   }
 
-  for (const candidate of candidatePaths({ pkgRoot, version, config })) {
+  const explicit = [config?.binary, process.env.FSOPS_BIN].filter(
+    (value) => typeof value === 'string' && value.length > 0,
+  )
+  for (const candidate of explicit) {
     const resolved = await verify(candidate)
     if (resolved !== undefined) return resolved
   }
 
+  const pinned = new Set([join(pkgRoot, 'bin', exe), cachePath(version)])
+  const drifted = []
+  for (const candidate of candidatePaths({ pkgRoot, version, config })) {
+    if (explicit.includes(candidate)) continue
+    const resolved = await verify(candidate)
+    if (resolved === undefined) continue
+    if (pinned.has(candidate)) return resolved
+    const found = await probeVersion(subprocess, resolved)
+    // 探测不到版本（异常/裁剪过的构建）不据此拒绝，宁可信任也不误伤。
+    if (found === undefined || found === version) return resolved
+    drifted.push({ path: resolved, found })
+  }
+
   // 裸名称交给平台在 PATH 里查。
   const fromPath = await verify('fsops')
-  if (fromPath !== undefined) return fromPath
+  if (fromPath !== undefined) {
+    const found = await probeVersion(subprocess, fromPath)
+    if (found === undefined || found === version) return fromPath
+    drifted.push({ path: fromPath, found })
+  }
+
+  let downloadError
+  if (config?.autoDownload !== false) {
+    try {
+      const downloaded = await downloadFsops(version)
+      const resolved = await verify(downloaded.path)
+      if (resolved !== undefined) return resolved
+    } catch (error) {
+      downloadError = error
+    }
+  }
+
+  const allowMismatch =
+    config?.allowVersionMismatch === true || process.env.FSOPS_ALLOW_VERSION_MISMATCH === '1'
+  if (drifted.length > 0) {
+    if (allowMismatch) return drifted[0].path
+    const found = drifted.map((item) => item.path + '（v' + item.found + '）').join('、')
+    throw new Error(
+      'E_VERSION 找到的 fsops 与插件版本不符：' +
+        found +
+        '；本插件需要 v' +
+        version +
+        '。请安装对应版本、用 FSOPS_BIN 指向 v' +
+        version +
+        '，或保持 autoDownload 开启；确要用旧版本时设 FSOPS_ALLOW_VERSION_MISMATCH=1。' +
+        (downloadError === undefined ? '' : '（自动下载也失败：' + downloadError.message + '）'),
+    )
+  }
 
   if (config?.autoDownload === false) {
     throw new Error(
@@ -159,10 +240,6 @@ export async function resolveFsops({ pkgRoot, version, config, subprocess }) {
         '或在插件配置里用 binary 指定绝对路径。',
     )
   }
-  const downloaded = await downloadFsops(version)
-  const resolved = await verify(downloaded.path)
-  if (resolved === undefined) {
-    throw new Error('E_NOT_FOUND 已下载 fsops 到 ' + downloaded.path + '，但无法作为可执行文件解析')
-  }
-  return resolved
+  if (downloadError !== undefined) throw downloadError
+  throw new Error('E_NOT_FOUND 找不到可用的 fsops.exe')
 }

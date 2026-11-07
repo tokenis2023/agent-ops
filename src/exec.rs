@@ -166,8 +166,12 @@ pub fn run(args: &Value) -> String {
     let exit = exit_code.unwrap_or(-1);
     let mut text = if check && exit != 0 {
         format!("E_EXIT code={exit} {elapsed}ms stdout={out_total}B stderr={err_total}B\n")
+    } else if exit != 0 {
+        // check=false 时非零退出不算失败，但前缀绝不能是 ok：
+        // 模型扫到 ok 会把编译/测试失败当成功。
+        format!("exit={exit} 非零 {elapsed}ms stdout={out_total}B stderr={err_total}B\n")
     } else {
-        format!("ok exit={exit} {elapsed}ms stdout={out_total}B stderr={err_total}B\n")
+        format!("ok exit=0 {elapsed}ms stdout={out_total}B stderr={err_total}B\n")
     };
     push_stream(&mut text, "stdout", &out_text, out_bytes.len(), out_total);
     push_stream(&mut text, "stderr", &err_text, err_bytes.len(), err_total);
@@ -259,7 +263,10 @@ mod tests {
     #[test]
     fn 非零退出不是错误() {
         let out = run(&json!({"program": "cmd", "args": ["/c", "exit 3"]}));
-        assert!(out.starts_with("ok exit=3"), "{out}");
+        // 非零退出在 check=false 时不算失败，但前缀不能是 ok：
+        // 模型扫到 ok 会把编译失败当成功。
+        assert!(out.starts_with("exit=3"), "{out}");
+        assert!(!out.contains("ok exit=3"), "{out}");
     }
 
     #[test]
@@ -267,9 +274,10 @@ mod tests {
         let out = run(&json!({"program": "cmd", "args": ["/c", "exit 3"], "check": true}));
         assert!(out.starts_with("E_EXIT"), "{out}");
         assert!(out.contains("code=3"), "{out}");
-        // 默认行为不变：非零退出仍是 ok
+        // 默认行为不变：非零退出仍不算失败，但不再冠以 ok。
         let off = run(&json!({"program": "cmd", "args": ["/c", "exit 3"]}));
-        assert!(off.starts_with("ok exit=3"), "{off}");
+        assert!(off.starts_with("exit=3"), "{off}");
+        assert!(!off.contains("ok exit=3"), "{off}");
     }
 
     #[test]
