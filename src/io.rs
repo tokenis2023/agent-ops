@@ -195,20 +195,90 @@ pub fn with_path(err: String, fp: &FsPath) -> String {
 /// 路径不存在时检查是否写错了格式（双重盘符、多余斜杠），
 /// 或文件名拼错——同目录里最相似的几个条目直接列出来，省掉一次 fs_glob。
 fn with_hint(reason: &str, fp: &FsPath) -> String {
+    // 环境变量不会被展开：模型常写 $env:TEMP 或 %TEMP%，结果被当成相对路径拼到
+    // cwd 下，报一个和真实原因无关的 OS 错误（os error 123）。这里点破它。
+    // 必须排在双重盘符判断之前：`/d/x/$env:TEMP` 会被误判成多了一层盘符。
+    if let Some(name) = env_placeholder(&fp.display()) {
+        return format!(
+            "{reason}；路径里的 {name} 不会被展开（原样当字符），请先 fs_exec 取到绝对路径再传，或直接用绝对路径"
+        );
+    }
     if let Some(fixed) = crate::paths::double_prefix_hint(&fp.display()) {
         return format!("{reason}；路径疑似多了一层盘符，应为 {fixed}");
     }
-    let missing = reason.contains("找不到指定的文件")
-        || reason.contains("找不到指定路径")
-        || reason.contains("not found")
-        || reason.contains("NotFound");
+    let missing = is_missing_reason(reason);
     if !missing {
         return reason.to_string();
     }
     match similar_siblings(fp) {
         Some(names) => format!("{reason}；同目录下有：{}", names.join(", ")),
-        None => reason.to_string(),
+        // 没有相近候选时也要给下一步，否则模型只能盲猜或干等。
+        // 用文件名片段拼一条可直接跑的 fs_glob，比「请确认路径」有用。
+        None => {
+            let name = fp
+                .native()
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let pattern = if name.is_empty() {
+                "*".to_string()
+            } else {
+                format!("*{}*", name)
+            };
+            format!("{reason}；用 fs_glob pattern=\"{pattern}\" 定位，或 fs_stat 确认路径")
+        }
     }
+}
+
+/// 判断一个 OS 错误是不是「路径不存在」。
+///
+/// 旧实现只比「找不到指定的文件 / 找不到指定路径」：而 Windows 实际报的是
+/// 「找不到指定**的**路径」，少一个「的」就让整个提示分支从未生效（os error 3 的目录不存在）。
+fn is_missing_reason(reason: &str) -> bool {
+    const MARKERS: [&str; 8] = [
+        "os error 2",
+        "os error 3",
+        "找不到指定",
+        "cannot find",
+        "could not find",
+        "not find the",
+        "not found",
+        "NotFound",
+    ];
+    MARKERS.iter().any(|marker| reason.contains(marker))
+}
+
+/// 路径里出现未展开的环境变量占位符（`$env:NAME` 或 `%NAME%`）时返回该片段。
+fn env_placeholder(display: &str) -> Option<String> {
+    if let Some(index) = display.find("$env:") {
+        let name: String = display[index + 5..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if !name.is_empty() {
+            return Some(format!("$env:{name}"));
+        }
+    }
+    for (start, c) in display.char_indices() {
+        if c != '%' {
+            continue;
+        }
+        let rest = &display[start + 1..];
+        let Some(end) = rest.find('%') else {
+            continue;
+        };
+        let name = &rest[..end];
+        let looks_like_var = !name.is_empty()
+            && name
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if looks_like_var {
+            return Some(format!("%{name}%"));
+        }
+    }
+    None
 }
 
 /// 同目录里名字最相似的 3 个条目；没有相近候选时返回 None。
@@ -707,6 +777,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(msg.contains("config.yaml"), "应给出候选文件名: {msg}");
         assert!(!msg.contains("other.txt"), "不相似的文件不应出现: {msg}");
+    }
+
+    #[test]
+    fn 目录不存在时也给定位提示() {
+        // 回归：旧判定比的是「找不到指定路径」，而 Windows 报「找不到指定**的**路径」，
+        // 少一个「的」就导致 os error 3 这个分支从未生效。
+        let fp = FsPath::parse("/d/no-such-dir-xyz/a.txt").unwrap();
+        let msg = with_path(
+            "E_READ 读取失败: 系统找不到指定的路径。 (os error 3)".to_string(),
+            &fp,
+        );
+        assert!(
+            msg.contains("fs_glob pattern="),
+            "目录不存在也要给下一步: {msg}"
+        );
+    }
+
+    #[test]
+    fn 缺文件且无相近候选时仍给出下一步() {
+        let dir = std::env::temp_dir().join(format!("fsops-hint-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("aaa.txt"), "a").unwrap();
+        std::fs::write(dir.join("bbb.txt"), "b").unwrap();
+        let fp = FsPath::parse(&dir.join("完全不同名字.md").to_string_lossy()).unwrap();
+        let msg = with_hint("系统找不到指定的文件。 (os error 2)", &fp);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            msg.contains("fs_glob pattern="),
+            "缺文件要给定位手段: {msg}"
+        );
+        assert!(
+            msg.contains("完全不同名字.md"),
+            "pattern 应带上文件名片段: {msg}"
+        );
+    }
+
+    #[test]
+    fn 路径含未展开环境变量时点破而不是报无关错误() {
+        for (input, want) in [
+            ("/d/x/$env:TEMP/a.txt", "$env:TEMP"),
+            ("/d/x/%TEMP%/a.txt", "%TEMP%"),
+        ] {
+            let fp = FsPath::parse(input).unwrap();
+            let msg = with_hint("文件名、目录名或卷标语法不正确。 (os error 123)", &fp);
+            assert!(msg.contains(want), "应点名占位符 {want}: {msg}");
+            assert!(msg.contains("不会被展开"), "应说明不会展开: {msg}");
+        }
+    }
+
+    #[test]
+    fn 普通文件名里的百分号不误判为环境变量() {
+        let fp = FsPath::parse("/d/x/100%.txt").unwrap();
+        assert!(env_placeholder(&fp.display()).is_none());
     }
 
     #[test]
