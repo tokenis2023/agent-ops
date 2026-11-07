@@ -80,6 +80,11 @@ function syncCounts(text, count) {
   return text
     .replace(/(暴露)\s+\d+(\s+个工具)/g, (_, a, b) => a + ' ' + count + b)
     .replace(/(提供)\s+\d+(\s+个\s*`fs_\*`\s*工具)/g, (_, a, b) => a + ' ' + count + b)
+    // 文档里的自检示例也带工具数。release.py 的 prepare 只同步版本号，
+    // 不同步这里——曾出现 `tools=8` 与实际 9 个不符。
+    // 三种写法都覆盖：具体版本、x.y.z 占位、<版本> 占位。
+    .replace(/(`fsops )(\d+\.\d+\.\d+|x\.y\.z|<版本>)( tools=)\d+(`)/g,
+      (_, a, version, b, c) => a + version + b + count + c)
 }
 
 /** package.json 的 description 里那句工具清单。 */

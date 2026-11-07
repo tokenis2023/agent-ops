@@ -98,11 +98,11 @@ patch 插入 `dsh/index.js` 这个 Host 插件。在 Harness 的 **插件 → �
 粘贴仓库地址即可；**生产环境建议用 tag/commit 固定版本**，不要跟随默认分支：
 
 ```text
-github:tokenis2023/agent-ops#v0.9.0
+github:tokenis2023/agent-ops#v0.9.1
 ```
 
 安装后在会话里调用 `fs_stat`（`detail=server` 可免路径）自检：应返回与插件同版本的
-`fsops x.y.z tools=8`；二进制版本不符时插件会报 `E_VERSION` 并点名实际版本。
+`fsops <版本> tools=9`；二进制版本不符时插件会报 `E_VERSION` 并点名实际版本。
 
 安装后默认启用，提供 9 个 `fs_*` 工具，与 MCP 形态同名、同错误码。插件**复用一条长驻 `fsops mcp` 会话**（换行分隔 JSON-RPC、按 id 匹配响应），不是每次调用新起进程：release 构建实测单次工具调用 **~34ms → 0.12–0.31ms**（`fs_stat` 0.12 / `fs_read` 0.31 / `fs_grep` 1.6，4 路并发一轮 0.23ms）。会话不可用（spawn 失败、进程退出、初始化失败）时自动退回一次性 `fsops call`，功能不降级；想强制走一次性调用可配 `mcp: false`。取消（abort）单个进行中的写/执行请求会结束长驻会话以阻止后台继续执行，下一次调用自动重建。参数集合与 MCP 形态基本一致；唯一差异是插件形态**不提供** `fs_exec` 的后台任务参数（`background`/`job`/`list`/`wait_ms`/`kill`）：schema 不声明，运行时也会显式拒绝并提示改用 MCP 形态——后台任务的 job id 绑在长驻会话上，插件重载/宿主重启后就会失效。
 
