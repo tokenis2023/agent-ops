@@ -25,8 +25,8 @@ struct Job {
     stderr: Arc<Mutex<Vec<u8>>>,
     cursor_out: usize,
     cursor_err: usize,
-    dropped_out: usize,
-    dropped_err: usize,
+    dropped_out: Arc<AtomicUsize>,
+    dropped_err: Arc<AtomicUsize>,
     killed: bool,
     timed_out: bool,
 }
@@ -118,8 +118,8 @@ pub fn start(args: &Value) -> String {
                 stderr: err_buf,
                 cursor_out: 0,
                 cursor_err: 0,
-                dropped_out: 0,
-                dropped_err: 0,
+                dropped_out: Arc::clone(&out_dropped),
+                dropped_err: Arc::clone(&err_dropped),
                 killed: false,
                 timed_out: false,
             },
@@ -139,7 +139,7 @@ pub fn start(args: &Value) -> String {
             }
         });
     }
-    format!("ok job={id} pid={pid} 会话内后台任务已启动（fs_exec job={id} 轮询，list=true 列出全部，kill=true 结束）")
+    format!("ok job={id} pid={pid} 会话内后台任务已启动；首次轮询直接 fs_exec job={id} wait_ms=60000（一次等到退出，别反复轮询），list=true 列出全部，kill=true 结束")
 }
 
 /// `fs_exec list=true`：列出当前会话的后台任务（id、pid、状态、时长）。
@@ -246,6 +246,7 @@ pub fn poll_or_kill(job_id: u32, args: &Value) -> String {
             if waited > 0 {
                 text.push_str(&format!("（等待 {waited}ms 后仍在运行）"));
             }
+            text.push_str(&format!(" | 续: fs_exec job={job_id} wait_ms=60000"));
             text
         }
     };
@@ -256,8 +257,18 @@ pub fn poll_or_kill(job_id: u32, args: &Value) -> String {
         text.push_str("（超时）");
     }
     text.push('\n');
-    push_delta(&mut text, "stdout", &out_delta, job.dropped_out);
-    push_delta(&mut text, "stderr", &err_delta, job.dropped_err);
+    push_delta(
+        &mut text,
+        "stdout",
+        &out_delta,
+        job.dropped_out.load(Ordering::Relaxed),
+    );
+    push_delta(
+        &mut text,
+        "stderr",
+        &err_delta,
+        job.dropped_err.load(Ordering::Relaxed),
+    );
     text
 }
 
@@ -299,7 +310,7 @@ fn push_delta(text: &mut String, name: &str, delta: &str, dropped: usize) {
     }
     if dropped > 0 {
         text.push_str(&format!(
-            "… {name} 已丢弃 {dropped}B（超过 {MAX_BUFFER}B 缓冲上限）\n"
+            "… {name} 已丢弃 {dropped}B（超过 {MAX_BUFFER}B 缓冲上限）；以上输出不完整，勿据此判断成败，缩小输出或分批重跑\n"
         ));
     }
 }
@@ -455,5 +466,32 @@ mod tests {
         let text = poll_or_kill(99999, &json!({}));
         assert!(text.starts_with("E_NO_JOB"), "{text}");
         assert!(text.contains("MCP"), "{text}");
+    }
+
+    #[test]
+    fn 丢弃的后台输出会在轮询里显式报告() {
+        // 输出超过 64KB 时 pump 会丢弃后续字节；若 Job 里的计数不是
+        // pump 共用的那个 Arc，poll 永远读到 0，失败信息会被静默吞掉。
+        let started = start(&json!({"program": "cmd", "args": ["/c", "echo", "ok"]}));
+        assert!(started.starts_with("ok job="), "{started}");
+        let id = job_id(&started);
+        {
+            let map = jobs().lock().unwrap();
+            let job = map.get(&id).unwrap();
+            job.dropped_out.store(4096, Ordering::Relaxed);
+        }
+        let mut text = String::new();
+        for _ in 0..50 {
+            text = poll_or_kill(id, &json!({}));
+            if text.contains("exit=") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            text.contains("已丢弃 4096B"),
+            "丢弃量必须出现在轮询输出，否则模型会把截断的成功当完整成功: {text}"
+        );
+        let _ = poll_or_kill(id, &json!({"kill": true}));
     }
 }

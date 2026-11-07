@@ -750,6 +750,18 @@ fn read_items(args: &Value) -> String {
             single.insert("force".to_string(), json!(true));
         }
         let text = read(&Value::Object(single));
+        // reads 顶层没有 path，单项递归读时尾注会写成「同 path」；
+        // 多个文件同时截断时多条「同 path」无法对应，补上本项路径。
+        let text = if text.contains("续读: fs_read 同 path") {
+            let item_path = obj.get("path").and_then(Value::as_str).unwrap_or("");
+            text.replacen(
+                "续读: fs_read 同 path",
+                &format!("续读: fs_read path={item_path}"),
+                1,
+            )
+        } else {
+            text
+        };
         // 项级成败：单项输出的首行是 E_ 即失败；MCP 的 isError 对整体保守，
         // 头部这行让调用方能一眼看出还有多少内容可用。
         if text.starts_with("E_") {
@@ -1241,9 +1253,14 @@ fn read(args: &Value) -> String {
                     }
                     if line_cut {
                         let need = r.max_cut_line_bytes;
+                        let (first_cut, last_cut) = r
+                            .cut_lines
+                            .first()
+                            .copied()
+                            .map(|f| (f, r.cut_lines.last().copied().unwrap_or(f)))
+                            .unwrap_or((window.first_line, rendered_last));
                         text.push_str(&format!(
-                            "… 有长行被截断；最长截断行约 {} 字节，重读该行需 max_line=0 且 budget≈{}\n",
-                            need,
+                            "… 有长行被截断（行 {first_cut}-{last_cut}）；重读该行需 max_line=0 且 budget≈{}\n",
                             need + 200 + header_len
                         ));
                     }
@@ -1557,12 +1574,18 @@ fn read(args: &Value) -> String {
             }
             if r.line_cut {
                 // 每行都提示会白白吃掉预算，这里只说明一次。
-                // 同时给出真实成本：单行文件常达上百 KB，只说"用 max_line=0"
-                // 会让模型撞上 E_LINE_TOO_LONG。
+                // 给可重放的完整命令：模型不必再自己定位是哪一行、也不必猜参数。
                 let need = r.max_cut_line_bytes;
+                let (first_cut, last_cut) = r
+                    .cut_lines
+                    .first()
+                    .copied()
+                    .map(|f| (f, r.cut_lines.last().copied().unwrap_or(f)))
+                    .unwrap_or((r.first_line.max(1), r.last_line));
                 target.push_str(&format!(
-                    "… 有长行被截断；最长截断行约 {} 字节，重读该行需 max_line=0 且 budget≈{}\n",
+                    "… 有长行被截断（行 {first_cut}-{last_cut}）；最长截断行约 {} 字节（单行成本）；重读该行: fs_read path={} start={first_cut} end={last_cut} max_line=0 budget≈{}\n",
                     need,
+                    fp.display(),
                     need + 200
                 ));
             }
@@ -1675,6 +1698,80 @@ mod tests {
             grab("start=").unwrap_or_else(|| panic!("续读缺少 start: {out}")),
             grab("end=").unwrap_or_else(|| panic!("续读缺少 end: {out}")),
         )
+    }
+
+    #[test]
+    fn reads续读尾注带各自路径() {
+        // reads 模式顶层没有 path，每项递归读时若沿用「同 path」，
+        // 多条一模一样的尾注会让模型无法把 start 对应回文件。
+        let dir = 临时目录("hint-reads");
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        let body: String = (1..=100).map(|n| format!("line{n}\n")).collect();
+        fs::write(&a, &body).unwrap();
+        fs::write(&b, &body).unwrap();
+        let pa = a.to_string_lossy().replace('\\', "/");
+        let pb = b.to_string_lossy().replace('\\', "/");
+        let out = call(
+            "fs_read",
+            &json!({
+                "reads": [
+                    {"path": pa, "start": 1, "end": 100},
+                    {"path": pb, "start": 1, "end": 100}
+                ],
+                "budget": 900,
+                "force": true
+            }),
+        );
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            !out.contains("续读: fs_read 同 path"),
+            "reads 模式不该出现无法对应的「同 path」: {out}"
+        );
+        assert!(
+            out.matches("续读: fs_read path=").count() >= 2,
+            "每项续读都应带自己的路径: {out}"
+        );
+        assert!(out.contains(&pa), "应含 a 的路径: {out}");
+        assert!(out.contains(&pb), "应含 b 的路径: {out}");
+    }
+
+    #[test]
+    fn 长行截断尾注给可重放的重读命令() {
+        // 只说「用 max_line=0」仍要模型自己找被截的是哪一行，等于多一轮。
+        // 尾注应直接给可复制的完整命令。
+        let content = format!("head\n{}\ntail\n", "y".repeat(600));
+        let path = 临时文本文件(&content);
+        let posix = path.to_string_lossy().replace('\\', "/");
+        let out = read(&json!({"path": posix, "max_line": 80}));
+        let _ = fs::remove_file(path);
+        assert!(
+            out.contains("重读该行: fs_read path="),
+            "应给可重放命令: {out}"
+        );
+        assert!(out.contains("start=2"), "应指出被截行号: {out}");
+        assert!(out.contains("max_line=0"), "应给出关闭截断的参数: {out}");
+    }
+
+    #[test]
+    fn stale错误给出可直接复制的重试指令() {
+        // 并发冲突时若只报「文件已变化」，模型会整轮 fs_read 重来；
+        // 其实 old 仍匹配时带新 hash 原样重试即可，错误应把这条路写清楚。
+        let dir = 临时目录("stale-hint");
+        let path = dir.join("a.txt");
+        fs::write(&path, "alpha\n").unwrap();
+        let posix = path.to_string_lossy().replace('\\', "/");
+        let out = call(
+            "fs_write",
+            &json!({"path": posix, "content": "beta\n", "expect_hash": "0000000000000000"}),
+        );
+        let _ = fs::remove_dir_all(&dir);
+        assert!(out.starts_with("E_STALE"), "{out}");
+        assert!(
+            out.contains("expect_hash="),
+            "应给可直接复制的重试参数: {out}"
+        );
+        assert!(out.contains("fs_read"), "应给出重读分支: {out}");
     }
 
     #[test]
@@ -4478,6 +4575,18 @@ fn next_fn() {
     }
 }
 
+/// 并发冲突把「下一步」写成可直接复制的指令，省掉整轮 fs_read。
+fn stale_changed(hash: &str) -> String {
+    format!(
+        "E_STALE 文件已变化（当前 hash={hash}）；若改动仍适用，原样重试并改传 expect_hash={hash}；否则 fs_read 重新取正文"
+    )
+}
+
+/// 目标不存在时告诉模型怎么放行，而不是只陈述问题。
+fn stale_missing() -> &'static str {
+    "E_STALE 目标文件不存在，无法校验 hash；确认要新建则去掉 expect_hash 重试，或先 fs_read 确认路径"
+}
+
 struct PreparedEdit {
     fp: FsPath,
     bytes: Vec<u8>,
@@ -4557,9 +4666,7 @@ fn prepare_edit(
     };
     if let Some(expect) = expect_hash {
         if hash != expect {
-            return Err(format!(
-                "E_STALE 文件已变化（当前 hash={hash}），请重新 fs_read 后再改"
-            ));
+            return Err(stale_changed(&hash));
         }
     }
     let (new_text, result) = edit::apply(&doc.text, eol, edits)?;
@@ -4832,14 +4939,14 @@ fn write(args: &Value) -> String {
         }
         if let Some(expect) = arg_str(args, "expect_hash") {
             if !fp.exists() {
-                return "E_STALE 目标文件不存在，无法校验 hash".into();
+                return stale_missing().into();
             }
             let bytes = match io::read_bytes(&fp.wide()) {
                 Ok(bytes) => bytes,
                 Err(e) => return e,
             };
             if io::hash_hex(&bytes) != expect {
-                return format!("E_STALE 文件已变化（当前 hash={}）", io::hash_hex(&bytes));
+                return stale_changed(&io::hash_hex(&bytes));
             }
         }
         if arg_bool(args, "dry_run", false) {
@@ -4891,10 +4998,10 @@ fn write(args: &Value) -> String {
         match &existing {
             Some(snapshot) => {
                 if snapshot.hash != expect {
-                    return format!("E_STALE 文件已变化（当前 hash={}）", snapshot.hash);
+                    return stale_changed(&snapshot.hash);
                 }
             }
-            None => return "E_STALE 目标文件不存在，无法校验 hash".into(),
+            None => return stale_missing().into(),
         }
     }
 

@@ -49,6 +49,8 @@ pub struct Rendered {
     pub line_cut: bool,
     /// 本响应所有截断行的最大原始字节数。
     pub max_cut_line_bytes: usize,
+    /// 被 max_line 截断的行号（1 基，含 line_offset）；尾注据此给可重放命令。
+    pub cut_lines: Vec<usize>,
     /// 预算截断后仍未输出的区间，可直接作为下一次 ranges 参数。
     pub continuation: Vec<(usize, usize)>,
 }
@@ -148,6 +150,7 @@ fn render_indexed(
             total_lines: 0,
             line_cut: false,
             max_cut_line_bytes: 0,
+            cut_lines: Vec::new(),
             continuation: Vec::new(),
         };
     }
@@ -158,6 +161,7 @@ fn render_indexed(
     let mut truncated = false;
     let mut line_cut = false;
     let mut max_cut_line_bytes = 0usize;
+    let mut cut_lines: Vec<usize> = Vec::new();
     let mut continuation = Vec::new();
 
     'ranges: for (range_index, &(raw_start, raw_end)) in ranges.iter().enumerate() {
@@ -188,6 +192,7 @@ fn render_indexed(
             let suffix = if extra > 0 {
                 line_cut = true;
                 max_cut_line_bytes = max_cut_line_bytes.max(line.len());
+                cut_lines.push(idx + opts.line_offset);
                 format!("…(+{extra}字符)")
             } else {
                 String::new()
@@ -217,6 +222,7 @@ fn render_indexed(
         total_lines: total,
         line_cut,
         max_cut_line_bytes,
+        cut_lines,
         continuation,
     }
 }

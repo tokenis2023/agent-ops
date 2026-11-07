@@ -107,12 +107,19 @@ pub fn apply(original: &str, eol: Eol, edits: &[EditSpec]) -> Result<(String, Ed
                 line >= from && line <= to
             });
             if positions.is_empty() {
+                let other = find_all(&work, &needle);
+                let other_lines = other
+                    .iter()
+                    .take(8)
+                    .map(|p| line_of(&work, *p).to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
                 return Err(format!(
-                    "E_NO_MATCH 第{}处：在 {}..={} 行内未找到目标文本（文件其他位置有 {} 处匹配）",
+                    "E_NO_MATCH 第{}处：在 {}..={} 行内未找到目标文本（文件其他位置有 {} 处匹配：行 {other_lines}）；调整 start/end 或去掉范围",
                     i + 1,
                     from,
                     e.end.map(|v| v.to_string()).unwrap_or("末".into()),
-                    find_all(&work, &needle).len()
+                    other.len()
                 ));
             }
         }
@@ -563,7 +570,21 @@ fn no_match_error(work: &str, needle: &str, idx: usize) -> String {
     }
     let mut msg = format!("E_NO_MATCH 第{}处未找到目标文本", idx);
     if candidates.is_empty() {
-        msg.push_str("；请先 fs_read 确认当前内容");
+        // 完全无关时也不能只让模型盲重读：工具手里就有全文，
+        // 给行数+开头锚点，让它立刻判断是否拿错文件或文件已被重写。
+        let total = work.lines().count();
+        msg.push_str(&format!("；当前文件共 {total} 行，开头："));
+        for (n, l) in work.lines().take(3).enumerate() {
+            let t = if l.chars().count() > 80 {
+                format!("{}…", l.chars().take(80).collect::<String>())
+            } else {
+                l.to_string()
+            };
+            msg.push_str(&format!("\n{}|{t}", n + 1));
+        }
+        msg.push_str(
+            "\n以上不是目标文本；确认没拿错文件后，用 fs_grep 定位关键词或 fs_read 取回正文",
+        );
     } else {
         msg.push_str("；最接近的行：");
         for (n, l) in candidates {
@@ -614,6 +635,17 @@ fn closest_lines<'a>(work: &'a str, needle: &str, limit: usize) -> Vec<(usize, &
 mod tests {
     use super::*;
     use crate::text::Eol;
+
+    #[test]
+    fn 完全无关的old也给文件结构锚点() {
+        // old 与全文毫无相似处时，不能只丢一句「请先 fs_read」让模型盲重读；
+        // 工具手里就有全文，给行数与开头锚点能让它立刻判断是否拿错文件。
+        let err = no_match_error("line1\nline2\nline3\n", "___完全不存在的片段___", 1);
+        assert!(err.starts_with("E_NO_MATCH"), "{err}");
+        assert!(err.contains("共 3 行"), "应给总行数: {err}");
+        assert!(err.contains("1|line1"), "应给开头锚点: {err}");
+        assert!(err.contains("fs_grep"), "应给定位手段: {err}");
+    }
 
     fn spec(old: &str, new: &str) -> EditSpec {
         EditSpec {
