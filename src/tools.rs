@@ -973,6 +973,26 @@ fn read(args: &Value) -> String {
             .to_string();
         }
     }
+    // 多文件按大小分配预算：小文件优先读满（再跑一轮更贵），
+    // 剩余按大小给大文件。固定均分会让 5 行的小文件浪费一半额度，
+    // 200 行的大文件只拿到 40 行。
+    let (per_file_need, small_total, big_total) = if targets.len() > 1 {
+        let need: Vec<usize> = targets
+            .iter()
+            .map(|t| {
+                FsPath::parse(t)
+                    .ok()
+                    .and_then(|fp| io::meta(&fp).ok())
+                    .map(|m| m.size as usize + 256)
+                    .unwrap_or(256)
+            })
+            .collect();
+        let small: usize = need.iter().filter(|n| **n <= 1024).sum();
+        let big: usize = need.iter().filter(|n| **n > 1024).sum();
+        (need, small, big)
+    } else {
+        (Vec::new(), 0, 0)
+    };
 
     // 多文件且路径有公共目录时，只写一次前缀，各文件只显示剩余部分。
     // 只在确实能省下可观字节时启用，避免给普通场景增加噪声。
@@ -1099,7 +1119,13 @@ fn read(args: &Value) -> String {
                 // 已写入 out 的全部内容（含公共前缀声明、路径头、元信息）都要扣掉。
                 let header_len = out.len();
                 let want = if targets.len() > 1 {
-                    (budget / targets.len().max(1)).saturating_sub(usize::from(i > 0))
+                    let need = per_file_need.get(i).copied().unwrap_or(256);
+                    let share = if need <= 1024 {
+                        need
+                    } else {
+                        budget.saturating_sub(small_total).saturating_mul(need) / big_total.max(1)
+                    };
+                    share.max(256).saturating_sub(usize::from(i > 0))
                 } else {
                     budget
                 };
@@ -1408,7 +1434,13 @@ fn read(args: &Value) -> String {
         }
 
         let want = if targets.len() > 1 {
-            (budget / targets.len().max(1)).saturating_sub(usize::from(i > 0))
+            let need = per_file_need.get(i).copied().unwrap_or(256);
+            let share = if need <= 1024 {
+                need
+            } else {
+                budget.saturating_sub(small_total).saturating_mul(need) / big_total.max(1)
+            };
+            share.max(256).saturating_sub(usize::from(i > 0))
         } else {
             budget
         };
@@ -5577,6 +5609,40 @@ mod roundtrip_tests {
         let _ = fs::remove_dir_all(&dir);
         assert!(out.len() > 24_000, "应一次读完 27KB: {} 字节", out.len());
         assert!(!out.contains("续读"), "不应需要续读: {out}");
+    }
+
+    #[test]
+    fn 多文件按大小分配预算() {
+        let dir = 目录("paths-share");
+        let mut paths = Vec::new();
+        for i in 0..10 {
+            let small = dir.join(format!("s{i}.txt"));
+            fs::write(&small, "a\nb\nc\nd\ne\n").unwrap();
+            paths.push(small.to_string_lossy().replace('\\', "/"));
+        }
+        for i in 0..10 {
+            let big = dir.join(format!("b{i}.txt"));
+            let body: String = (1..=200)
+                .map(|n| format!("line{n} padding padding\n"))
+                .collect();
+            fs::write(&big, body).unwrap();
+            paths.push(big.to_string_lossy().replace('\\', "/"));
+        }
+        let out = call("fs_read", &json!({"paths": paths}));
+        let _ = fs::remove_dir_all(&dir);
+        // 小文件必须读满（再跑一轮更贵）
+        assert!(out.contains("5|e"), "小文件应读满: {out}");
+        // 大文件拿到的行数应明显多于均分（32KB/20 ≈ 40 行）
+        let big_block = out.split("b0.txt").nth(1).expect("应包含 b0.txt");
+        let lines = big_block
+            .lines()
+            .filter(|l| {
+                l.split_once('|')
+                    .map(|(n, _)| n.parse::<usize>().is_ok())
+                    .unwrap_or(false)
+            })
+            .count();
+        assert!(lines > 50, "大文件应拿到更多行，实际 {lines}");
     }
 
     #[test]
