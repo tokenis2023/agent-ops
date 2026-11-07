@@ -52,7 +52,7 @@ const TOOL_SPECS = [
     name: 'fs_read',
     readOnly: true,
     description:
-      '读取文件。优先用本工具替代宿主 read_file/cat/head/tail/Get-Content。默认最多返回 32KB 并给出续读方式；支持行范围、多文件、reads 异构区间、focus 按模式取块、summary 结构摘要、block 代码块展开、DOCX/PDF 正文、自动识别 GBK/UTF-16/BOM 与 CRLF。模式四选一：单文件 path、多文件 paths、异构区间 reads、按正则取块 focus；summary 仅单文件且不能与 ranges/block/end 同用；reads 每项可带 focus 与 budget。',
+      '读取文件。优先用本工具替代宿主 read_file/cat/head/tail/Get-Content。默认最多返回 32KB 并给出续读方式；支持行范围、多文件、reads 异构区间、focus 按模式取块、summary 结构摘要、block 代码块展开、DOCX/PDF 正文、自动识别 GBK/UTF-16/BOM 与 CRLF。模式表：path 与 paths 可同时给（并集）；reads 是异构区间数组（与 path/paths 互斥）；focus 按正则取整块（可与 path 同用，与 reads/paths/ranges/start/end/block/summary 互斥）；tail=N 读末尾（与 start/end/ranges/block/summary/focus/paths 互斥）；summary 只给声明行号（仅单文件，不能与 ranges/block/end 同用）。',
     parameters: {
       path: { type: 'string', description: '文件路径，如 /d/repo/app/src/main.rs' },
       paths: { type: 'array', items: { type: 'string' }, description: '一次读多个文件（最多 20 个）' },
@@ -109,7 +109,7 @@ const TOOL_SPECS = [
   {
     name: 'fs_edit',
     description:
-      '精确替换文本（old→new）或正则替换（pattern→replacement）。优先替代 patch/Edit/apply_patch。同文件多处用 edits，多文件用 files；全部预检通过才写入。自动处理 CRLF/LF 差异并保留原编码；DOCX 不支持精确替换。',
+      '精确替换文本（old→new）或正则替换（pattern→replacement）。两套参数必须二选一：old+new 或 pattern+replacement，同时给会报 E_BAD_EDIT。优先替代 patch/Edit/apply_patch。同文件多处用 edits，多文件用 files；全部预检通过才写入。自动处理 CRLF/LF 差异并保留原编码；DOCX 不支持精确替换。',
     parameters: {
       path: { type: 'string', description: '单文件路径；批量时改用 files' },
       edits: { type: 'array', items: editItemSchema(), description: '单文件的修改列表' },
@@ -168,7 +168,7 @@ const TOOL_SPECS = [
   {
     name: 'fs_exec',
     description:
-      '执行程序（argv 数组，不经过 shell）。替代 PowerShell 跑 cargo/git/npm/python：没有引号/插值、2>&1、ErrorRecord、$LASTEXITCODE 问题。非零退出不是错误；超时结束整个进程树。注意：本插件每次调用都是新进程，不支持长驻后台任务，因此未暴露 background/job/list/wait_ms/kill 参数；需要后台任务请用 MCP 形态。',
+      '执行程序（argv 数组，不经过 shell）。替代 PowerShell 跑 cargo/git/npm/python：没有引号/插值、2>&1、ErrorRecord、$LASTEXITCODE 问题。非零退出不是错误（前缀写 exit=N 非零，要当失败使用 check=true）；超时结束整个进程树。启动命令时 program 必填。注意：本形态未暴露 background/job/list/wait_ms/kill 参数（任务生命周期绑在长驻会话上），需要后台任务请用 MCP 形态。',
     parameters: {
       program: { type: 'string', description: '可执行文件，如 cargo、git、python；走 PATH。本形态不支持后台任务，启动命令时必填' },
       args: { type: 'array', items: { type: 'string' }, description: '参数数组，每个参数独立，不拼字符串' },
@@ -178,13 +178,13 @@ const TOOL_SPECS = [
       env: { type: 'object', additionalProperties: true, description: '追加/覆盖环境变量' },
       shell: { type: 'boolean', description: '显式走 cmd /c（需要管道/重定向时才用）' },
       max_output: { type: 'integer', description: '每条流最多保留字节，默认 32768' },
-      check: { type: 'boolean', description: '非零退出按 E_EXIT 错误返回；默认 false，非零仍是 ok' },
+      check: { type: 'boolean', description: '非零退出按 E_EXIT 错误返回；默认 false，非零只标注 exit=N 非零、不算失败' },
     },
   },
   {
     name: 'fs_file',
     description:
-      '文件管理：copy/move/remove/mkdir/convert/archive/extract。替代 PowerShell 的 Copy-Item/Move-Item/Remove-Item/New-Item 与压缩解压。remove 必须 confirm=true。',
+      '文件管理：copy/move/remove/mkdir/convert/archive/extract。替代 PowerShell 的 Copy-Item/Move-Item/Remove-Item/New-Item 与压缩解压。必填映射：copy/move/archive/extract 要 src+dst；remove/mkdir/convert 要 path；remove 必须再给 confirm=true；convert 需要 encoding（只改换行也要给，如 utf-8）。',
     parameters: {
       op: {
         type: 'string',
@@ -209,7 +209,7 @@ const TOOL_SPECS = [
     description:
       '正则流式搜索。优先替代 grep/rg/Select-String。按文件稳定分组，支持文本和 DOCX/PDF 正文，output 可选 files/count/matches/snippets；截断时返回 next_offset。',
     parameters: {
-      pattern: { type: 'string', description: 'Rust/PCRE 风格正则；JSON 字符串里反斜杠需双写', required: true },
+      pattern: { type: 'string', description: 'Rust regex 语法（不支持 lookaround 与反向引用，与 PCRE 不同）；JSON 字符串里反斜杠需双写', required: true },
       path: { type: 'string', description: '搜索根目录，默认当前目录' },
       glob: { type: 'string', description: '只看匹配的文件，如 **/*.ts' },
       ignore_case: { type: 'boolean', description: '忽略大小写' },
@@ -234,7 +234,7 @@ const TOOL_SPECS = [
     name: 'fs_stat',
     readOnly: true,
     description:
-      '查看路径元信息。优先替代 stat/ls/Get-Item。返回类型、大小、修改时间、换行风格、编码、内容指纹。',
+      '查看路径元信息。优先替代 stat/ls/Get-Item。返回类型、大小、修改时间、换行风格、编码、内容指纹。path 或 paths 至少给一个；detail=server 是不带路径的自检，用来确认宿主连上的服务端版本与工具数。',
     parameters: {
       path: { type: 'string', description: '单个路径' },
       paths: { type: 'array', items: { type: 'string' }, description: '多个路径（最多 50 个）' },

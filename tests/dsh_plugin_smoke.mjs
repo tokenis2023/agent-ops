@@ -296,7 +296,7 @@ for (const [toolName, definition] of ctx.registered) {
   // 害模型先 fs_read 抄原文再 old/new，白多一轮。
   for (const [tool, words] of Object.entries({
     fs_edit: ['正则替换'],
-    fs_read: ['四选一'],
+    fs_read: ['模式表'],
   })) {
     const dshDesc = ctx.registered.get(tool)?.description ?? ''
     const mcpDesc = defs.find((d) => d.name === tool)?.description ?? ''

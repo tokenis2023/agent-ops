@@ -44,6 +44,16 @@
   `allowVersionMismatch: true` 或 `FSOPS_ALLOW_VERSION_MISMATCH=1`。
 - 冒烟测试新增 5 项：版本解析 4 项（含 `v` 前缀、空输出、乱文本）与「显式 binary 不做版本探测」（65 项全绿）。
 
+### 参数表述（让模型在调用前就能拼对）
+
+- `fs_read` 的「模式四选一」改为「模式表」：`path` 与 `paths` 实为**并集**（实测同给会读两个文件），旧文案会让模型以为非法；`focus`/`tail`/`summary` 的互斥对象逐条列出。
+- `fs_file` 补 op→必填映射（copy/move/archive/extract 要 `src`+`dst`；remove/mkdir/convert 要 `path`；convert 需 `encoding`）——原来只活在文档表格里，schema 看不到。
+- `fs_exec` 补「启动必须给 `program`」；`fs_stat` 补「`path`/`paths` 至少一个，`detail=server` 可免路径」。
+- `fs_edit` 写明 `old`+`new` 与 `pattern`+`replacement` 必须二选一，同时给报 `E_BAD_EDIT`。
+- `fs_grep` 的「Rust/PCRE 风格正则」更正为「Rust regex 语法（不支持 lookaround 与反向引用）」：引擎是 `regex` crate，按 PCRE 写 lookbehind 必然失败且原错误无引导。
+- DSH 插件 `fs_exec` 描述里「每次调用都是新进程，不支持长驻后台任务」已过期（现复用长驻会话），改为说明为何仍不暴露后台参数；`check` 参数也不再写「非零仍是 ok」。
+- 三处手写 schema（Rust / DSH / 工具参考）同步；单测与冒烟断言从钉住「四选一」改为钉住「模式表/并集」，避免测试继续维护一个错误事实。
+
 ### 测试
 
 - 新增 5 个 Rust 单测：`old`/`pattern` 互斥 3 个、多编辑中间态提示 1 个、
