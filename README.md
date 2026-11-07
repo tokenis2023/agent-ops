@@ -98,7 +98,7 @@ patch 插入 `dsh/index.js` 这个 Host 插件。在 Harness 的 **插件 → �
 粘贴仓库地址即可；**生产环境建议用 tag/commit 固定版本**，不要跟随默认分支：
 
 ```text
-github:tokenis2023/agent-ops#v0.8.0
+github:tokenis2023/agent-ops#v0.9.0
 ```
 
 安装后在会话里调用 `fs_stat`（`detail=server` 可免路径）自检：应返回与插件同版本的
