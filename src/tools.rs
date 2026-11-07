@@ -64,6 +64,7 @@ pub fn tool_defs() -> Vec<Value> {
                         "description": "仅对 >32MB 文件生效：window（默认）只读到请求区间末尾并探测是否还有内容，毫秒级返回，但不给全文 hash/总行数；full 全文件扫描，给精确 hash 与总行数"
                     },
                     "summary": {"type": "boolean", "description": "只输出结构摘要：声明行 + 行号，不展开函数体；行号可直接接 block=true 读实现。与 ranges/block/end 互斥，数据文件与超大文件不支持"},
+                    "tail": {"type": "integer", "minimum": 1, "description": "只读最后 N 行（日志场景）：与 start/end/ranges/block/summary/focus/paths 互斥，文件不足 N 行时读全部；免去先 fs_stat 拿总行数那一步"},
                     "focus": {"type": "string", "description": "只返回匹配该正则的完整代码块（含上下文），替代「先 fs_grep 再 block=true」两步。数据文件（JSON/YAML/Markdown 等）没有代码块，只给命中行 ±2 行。仅单文件，与 paths/reads/ranges/start/end/block/summary 互斥。JSON 字符串里反斜杠需双写"},
                     "force": {"type": "boolean", "description": "绕过未变更短路，强制返回正文。默认情况下，同一 MCP 会话里同文件同 hash 同区间再读只回一行摘要"}
                 },
@@ -841,6 +842,19 @@ fn read(args: &Value) -> String {
         return "E_BAD_ARGS focus 只能用于单文件 path，且不能与 paths/ranges/start/end/block/summary 同时使用"
             .into();
     }
+    // tail：只读最后 N 行。区间由总行数决定，因此与任何“指定区间”的参数互斥。
+    let tail = arg_usize(args, "tail", 0);
+    if tail > 0
+        && (args.get("start").is_some()
+            || args.get("end").is_some()
+            || args.get("ranges").is_some()
+            || arg_bool(args, "block", false)
+            || arg_bool(args, "summary", false)
+            || args.get("focus").is_some()
+            || args.get("paths").is_some())
+    {
+        return "E_BAD_ARGS tail 与 start/end/ranges/block/summary/focus/paths 互斥：tail 自己确定区间，只用于单文件".into();
+    }
     let budget_explicit = args.get("budget").is_some();
     let mut budget = arg_usize(args, "budget", render::DEFAULT_BUDGET);
     let mut targets: Vec<String> = Vec::new();
@@ -993,6 +1007,13 @@ fn read(args: &Value) -> String {
     } else {
         (Vec::new(), 0, 0)
     };
+    // 多文件时给公共前缀声明、文件间分隔和续读尾注留出余量；
+    // 否则各项预算之和正好等于 budget，尾部提示会被外层硬切。
+    let alloc_budget = if targets.len() > 1 {
+        budget.saturating_sub(64 + 40 * targets.len())
+    } else {
+        budget
+    };
 
     // 多文件且路径有公共目录时，只写一次前缀，各文件只显示剩余部分。
     // 只在确实能省下可观字节时启用，避免给普通场景增加噪声。
@@ -1044,6 +1065,14 @@ fn read(args: &Value) -> String {
                 if arg_bool(args, "summary", false) {
                     out.push_str(&format!(
                         "E_TOO_LARGE {} {}，超大文件不支持结构摘要；请先用 fs_grep 定位，或用 start/end 分段读取\n",
+                        fp.display(),
+                        io::human_size(m.size)
+                    ));
+                    continue;
+                }
+                if tail > 0 {
+                    out.push_str(&format!(
+                        "E_TOO_LARGE {} {}，超大文件不支持 tail（定位末尾需要全扫）；请用 fs_grep 定位，或 scan=full 拿总行数后用 start/end\n",
                         fp.display(),
                         io::human_size(m.size)
                     ));
@@ -1120,10 +1149,18 @@ fn read(args: &Value) -> String {
                 let header_len = out.len();
                 let want = if targets.len() > 1 {
                     let need = per_file_need.get(i).copied().unwrap_or(256);
-                    let share = if need <= 1024 {
-                        need
+                    let share = if small_total * 2 <= alloc_budget {
+                        if need <= 1024 {
+                            need
+                        } else {
+                            alloc_budget
+                                .saturating_sub(small_total)
+                                .saturating_mul(need)
+                                / big_total.max(1)
+                        }
                     } else {
-                        budget.saturating_sub(small_total).saturating_mul(need) / big_total.max(1)
+                        // 小文件总量已吃掉一半以上预算：全部按需要比例分，保证总和 ≤ budget。
+                        alloc_budget.saturating_mul(need) / (small_total + big_total).max(1)
                     };
                     share.max(256).saturating_sub(usize::from(i > 0))
                 } else {
@@ -1351,7 +1388,11 @@ fn read(args: &Value) -> String {
         // block=true 没找到花括号块时（Python 等缩进语言、或起始行不是块开头）
         // 必须显式说明已退回普通窗口读取，否则模型会以为拿到的是完整函数体。
         let mut block_fallback = false;
-        let per_file_ranges = if let Some((focus, _)) = &focus_info {
+        let per_file_ranges = if tail > 0 {
+            // tail：区间由总行数决定，读完才能算。
+            let from = total_lines.saturating_sub(tail).saturating_add(1).max(1);
+            vec![(from, total_lines.max(1))]
+        } else if let Some((focus, _)) = &focus_info {
             focus.blocks.clone()
         } else if arg_bool(args, "block", false) && args.get("ranges").is_none() {
             match enclosing_block(index.lines(), start) {
@@ -1435,10 +1476,18 @@ fn read(args: &Value) -> String {
 
         let want = if targets.len() > 1 {
             let need = per_file_need.get(i).copied().unwrap_or(256);
-            let share = if need <= 1024 {
-                need
+            let share = if small_total * 2 <= alloc_budget {
+                if need <= 1024 {
+                    need
+                } else {
+                    alloc_budget
+                        .saturating_sub(small_total)
+                        .saturating_mul(need)
+                        / big_total.max(1)
+                }
             } else {
-                budget.saturating_sub(small_total).saturating_mul(need) / big_total.max(1)
+                // 小文件总量已吃掉一半以上预算：全部按需要比例分，保证总和 ≤ budget。
+                alloc_budget.saturating_mul(need) / (small_total + big_total).max(1)
             };
             share.max(256).saturating_sub(usize::from(i > 0))
         } else {
@@ -1518,12 +1567,23 @@ fn read(args: &Value) -> String {
                 ));
             }
             if !r.continuation.is_empty() {
-                target.push_str(&format!(
-                    "… {}-{}/{} 行 | 续读: fs_read 同 path ",
-                    r.first_line.max(1),
-                    r.last_line,
-                    r.total_lines,
-                ));
+                // 多文件时必须带路径：一串「同 path」无法对应到具体文件。
+                if targets.len() > 1 {
+                    target.push_str(&format!(
+                        "… {}-{}/{} 行 | 续读: fs_read path={} ",
+                        r.first_line.max(1),
+                        r.last_line,
+                        r.total_lines,
+                        fp.display()
+                    ));
+                } else {
+                    target.push_str(&format!(
+                        "… {}-{}/{} 行 | 续读: fs_read 同 path ",
+                        r.first_line.max(1),
+                        r.last_line,
+                        r.total_lines,
+                    ));
+                }
                 if args.get("ranges").is_some() || arg_bool(args, "block", false) {
                     // block 已在首次请求中固定边界；续读只重放剩余区间，不再探测新块。
                     target.push_str(&format!(
@@ -5643,6 +5703,45 @@ mod roundtrip_tests {
             })
             .count();
         assert!(lines > 50, "大文件应拿到更多行，实际 {lines}");
+    }
+
+    #[test]
+    fn tail读最后几行() {
+        let dir = 目录("tail");
+        let path = dir.join("log.txt");
+        fs::write(&path, "a\nb\nc\nd\ne\n").unwrap();
+        let posix = path.to_string_lossy().replace('\\', "/");
+        let out = call("fs_read", &json!({"path": posix, "tail": 2, "force": true}));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(out.contains("4|d"), "{out}");
+        assert!(out.contains("5|e"), "{out}");
+        assert!(!out.contains("1|a"), "不应从头读: {out}");
+    }
+
+    #[test]
+    fn tail与start互斥() {
+        let out = call("fs_read", &json!({"path": "x.txt", "tail": 5, "start": 1}));
+        assert!(out.starts_with("E_BAD_ARGS"), "{out}");
+    }
+
+    #[test]
+    fn 多文件续读提示带各自路径() {
+        let dir = 目录("hint-multi");
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        let body: String = (1..=100).map(|n| format!("line{n}\n")).collect();
+        fs::write(&a, &body).unwrap();
+        fs::write(&b, &body).unwrap();
+        let pa = a.to_string_lossy().replace('\\', "/");
+        let pb = b.to_string_lossy().replace('\\', "/");
+        let out = call(
+            "fs_read",
+            &json!({"paths": [pa, pb], "budget": 900, "force": true}),
+        );
+        let _ = fs::remove_dir_all(&dir);
+        assert!(out.contains("续读: fs_read path="), "续读应带路径: {out}");
+        assert!(out.contains("a.txt"), "{out}");
+        assert!(out.contains("b.txt"), "{out}");
     }
 
     #[test]

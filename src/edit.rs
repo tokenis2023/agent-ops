@@ -484,29 +484,12 @@ fn col_of(s: &str, pos: usize) -> usize {
     s[..pos].rfind('\n').map(|i| pos - i).unwrap_or(pos + 1)
 }
 
-/// 在片段中的命中行上标出列号：不改变行内容，在命中列下加一个 ^ 指针行。
+/// 在命中行行尾标出列号；绝不改动正文。
+///
+/// 早期实现把 `^` 插在命中列，会直接吞掉那一列的字符
+/// （`x();` 显示成 `^();`），模型也会把标记当成文件内容。
 fn mark_column(text: &str, col: usize) -> String {
-    let base = snippet_line(text);
-    let shown_len = base.chars().count();
-    if col > shown_len || col == 0 {
-        return base;
-    }
-    let mut out = String::new();
-    let mut current = 0usize;
-    for ch in base.chars() {
-        current += 1;
-        if current == col {
-            out.push('^');
-            break;
-        }
-        out.push(ch);
-    }
-    if current == col {
-        for ch in base.chars().skip(col) {
-            out.push(ch);
-        }
-    }
-    out
+    format!("{} ← 列 {col}", snippet_line(text))
 }
 
 /// 歧义片段里的单行截断：定位用，不需要完整长行。
@@ -753,6 +736,16 @@ mod tests {
         // 附上下文片段：模型不必再 fs_read 就能构造出唯一的 old。
         assert!(err.contains("1|x();"), "应含命中行片段: {err}");
         assert!(err.contains("2|x();"), "应含命中行片段: {err}");
+    }
+
+    #[test]
+    fn 歧义片段不把标记插进正文() {
+        // 往 `行号|原文` 里插 `^` 会吞掉命中列字符（alpha → ^lpha），
+        // 模型重试时会抄到错的原文。
+        let src = "alpha one\nbeta two\nalpha three\n";
+        let err = apply(src, Eol::Lf, &[spec("alpha", "ALPHA")]).unwrap_err();
+        assert!(err.contains("1|alpha one ← 列 1"), "正文必须完整: {err}");
+        assert!(!err.contains("|^"), "标记不能占位正文: {err}");
     }
 
     #[test]

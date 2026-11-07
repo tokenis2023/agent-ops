@@ -45,7 +45,7 @@ const TOOL_SPECS = [
     name: 'fs_read',
     readOnly: true,
     description:
-      '读取文件。优先用本工具替代宿主 read_file/cat/head/tail/Get-Content。默认只返回前 12KB 并给出续读方式；支持行范围、多文件、reads 异构区间、focus 按模式取块、summary 结构摘要、block 代码块展开、DOCX/PDF 正文、自动识别 GBK/UTF-16/BOM 与 CRLF。模式四选一：单文件 path、多文件 paths、异构区间 reads、按正则取块 focus；summary 仅单文件且不能与 ranges/block/end 同用；reads 每项可带 focus 与 budget。',
+      '读取文件。优先用本工具替代宿主 read_file/cat/head/tail/Get-Content。默认最多返回 32KB 并给出续读方式；支持行范围、多文件、reads 异构区间、focus 按模式取块、summary 结构摘要、block 代码块展开、DOCX/PDF 正文、自动识别 GBK/UTF-16/BOM 与 CRLF。模式四选一：单文件 path、多文件 paths、异构区间 reads、按正则取块 focus；summary 仅单文件且不能与 ranges/block/end 同用；reads 每项可带 focus 与 budget。',
     parameters: {
       path: { type: 'string', description: '文件路径，如 /d/repo/app/src/main.rs' },
       paths: { type: 'array', items: { type: 'string' }, description: '一次读多个文件（最多 20 个）' },
@@ -57,7 +57,7 @@ const TOOL_SPECS = [
         items: { type: 'array', items: { type: 'integer' } },
         description: '单文件多段行区间，如 [[1,20],[80,100]]；优先于 start/end',
       },
-      budget: { type: 'integer', description: '最多返回字节数，默认 12288' },
+      budget: { type: 'integer', description: '最多返回字节数，默认 32768（约 8K token）' },
       max_line: { type: 'integer', description: '每行最多字符数，默认 240；0 表示不截断长行' },
       scan: {
         type: 'string',
@@ -67,6 +67,10 @@ const TOOL_SPECS = [
       summary: {
         type: 'boolean',
         description: '只输出结构摘要：声明行 + 行号，不展开函数体；行号可直接接 block=true 读实现。与 ranges/block/end 互斥',
+      },
+      tail: {
+        type: 'integer',
+        description: '只读最后 N 行（日志场景）；与 start/end/ranges/block/summary/focus/paths 互斥',
       },
       reads: {
         type: 'array',
