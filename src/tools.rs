@@ -1210,6 +1210,11 @@ fn read(args: &Value) -> String {
                         io::human_size(window.size)
                     ));
                 }
+                if window.encoding == "utf-8-lossy" {
+                    out.push_str(
+                        "… 警告：原文含无法解码的字节，正文里的 U+FFFD 是替换字符、不是原文；切勿据此写回，请先用 fs_file op=convert 转码\n",
+                    );
+                }
                 // 已写入 out 的全部内容（含公共前缀声明、路径头、元信息）都要扣掉。
                 let header_len = out.len();
                 let want = if targets.len() > 1 {
@@ -3614,6 +3619,28 @@ fn next_fn() {
     }
 
     #[test]
+    fn stat路径含空格时用引号可切分() {
+        // 空格既是路径又是字段分隔符，模型无法切出完整路径；引号给出稳定边界。
+        let dir = 临时目录("stat-space");
+        let path = dir.join("my file.txt");
+        fs::write(&path, "x").unwrap();
+        let posix = path.to_string_lossy().replace('\\', "/");
+        let out = call("fs_stat", &json!({"path": posix, "detail": "meta"}));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(out.starts_with('\"'), "路径应被引号包裹: {out}");
+        let close = out[1..].find('\"').map(|i| i + 1).unwrap_or(0);
+        assert!(close > 1, "应有闭合引号: {out}");
+        assert!(
+            out[1..close].contains("my file.txt"),
+            "含空格路径应完整落在引号内: {out}"
+        );
+        assert!(
+            out[close + 1..].trim_start().starts_with("file "),
+            "引号后应紧跟字段，模型才能稳定切分: {out}"
+        );
+    }
+
+    #[test]
     fn fs_read描述包含模式互斥表() {
         // 模式互斥只能靠运行时错误教学的话，模型要付一轮试错；
         // description 里给一张组合表，让它在发出调用前就能拼出合法参数。
@@ -5610,6 +5637,11 @@ fn grep_tool(args: &Value) -> String {
     }
 }
 
+/// stat 输出里路径可能含空格，用引号包裹让模型能稳定切出完整路径。
+fn quoted_stat_path(fp: &FsPath) -> String {
+    format!("\"{}\"", fp.display())
+}
+
 fn stat(args: &Value) -> String {
     let detail = arg_str(args, "detail").unwrap_or("full");
     if detail == "server" {
@@ -5657,7 +5689,7 @@ fn stat(args: &Value) -> String {
             if detail == "meta" {
                 out.push_str(&format!(
                     "{} file {} {} {}\n",
-                    fp.display(),
+                    quoted_stat_path(&fp),
                     io::human_size(m.size),
                     io::fmt_time(m.mtime),
                     if m.readonly { "ro" } else { "rw" }
@@ -5675,7 +5707,7 @@ fn stat(args: &Value) -> String {
                 if detail == "hash" {
                     out.push_str(&format!(
                         "{} file {} {} {} LF {} hash={}\n",
-                        fp.display(),
+                        quoted_stat_path(&fp),
                         io::human_size(m.size),
                         io::fmt_time(m.mtime),
                         format_label(format),
@@ -5685,7 +5717,7 @@ fn stat(args: &Value) -> String {
                 } else {
                     out.push_str(&format!(
                         "{} file {} {} {} LF {} {}行 hash={}\n",
-                        fp.display(),
+                        quoted_stat_path(&fp),
                         io::human_size(m.size),
                         io::fmt_time(m.mtime),
                         format_label(format),
@@ -5706,7 +5738,7 @@ fn stat(args: &Value) -> String {
             if crate::text::is_binary(&bytes) {
                 out.push_str(&format!(
                     "{} file {} {} binary {} hash={}\n",
-                    fp.display(),
+                    quoted_stat_path(&fp),
                     io::human_size(m.size),
                     io::fmt_time(m.mtime),
                     if m.readonly { "ro" } else { "rw" },
@@ -5720,7 +5752,7 @@ fn stat(args: &Value) -> String {
                     if detail == "hash" {
                         out.push_str(&format!(
                             "{} file {} {} {} {} {} hash={}\n",
-                            fp.display(),
+                            quoted_stat_path(&fp),
                             io::human_size(m.size),
                             io::fmt_time(m.mtime),
                             d.encoding,
@@ -5731,7 +5763,7 @@ fn stat(args: &Value) -> String {
                     } else {
                         out.push_str(&format!(
                             "{} file {} {} {} {} {} {}行 hash={}\n",
-                            fp.display(),
+                            quoted_stat_path(&fp),
                             io::human_size(m.size),
                             io::fmt_time(m.mtime),
                             d.encoding,
@@ -5744,7 +5776,7 @@ fn stat(args: &Value) -> String {
                 }
                 Err(e) => out.push_str(&format!(
                     "{} file {}\n{e}\n",
-                    fp.display(),
+                    quoted_stat_path(&fp),
                     io::human_size(m.size)
                 )),
             }
@@ -5753,7 +5785,7 @@ fn stat(args: &Value) -> String {
             match &m.link {
                 Some((target, target_size)) => out.push_str(&format!(
                     "{} {} {} {} -> {} {}\n",
-                    fp.display(),
+                    quoted_stat_path(&fp),
                     m.kind,
                     io::human_size(m.size),
                     io::fmt_time(m.mtime),
@@ -5762,7 +5794,7 @@ fn stat(args: &Value) -> String {
                 )),
                 None => out.push_str(&format!(
                     "{} {} {} {}\n",
-                    fp.display(),
+                    quoted_stat_path(&fp),
                     m.kind,
                     io::human_size(m.size),
                     io::fmt_time(m.mtime)
