@@ -263,18 +263,18 @@ fn read_document(
 }
 
 /// 合并重叠或相邻的区间：重叠的 ranges 会把同一批行输出多次，纯属浪费 token。
-/// 保持调用方给定的先后顺序（乱序 ranges 仍按原顺序输出）。
+///
+/// 必须先全局排序：模型常从多段 grep 结果里拼区间，顺序不可控；
+/// 只与「已输出的最后一个区间」比较会把后到的 [1,6] 吞进先到的 [10,14]，
+/// 静默丢掉一整段内容——这比多输出几行危险得多。
 fn merge_ranges(ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
-    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
-    for (from, to) in ranges {
-        // 只与已输出的区间比较；乱序时不做全局排序，保持用户预期。
+    let mut sorted = ranges;
+    sorted.sort_unstable();
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(sorted.len());
+    for (from, to) in sorted {
         if let Some(last) = out.last_mut() {
-            if from <= last.1 {
+            if from <= last.1.saturating_add(1) {
                 last.1 = last.1.max(to);
-                continue;
-            }
-            if from == last.1 + 1 {
-                last.1 = to;
                 continue;
             }
         }
@@ -617,37 +617,61 @@ fn render_summary(
     budget: usize,
     max_line: usize,
 ) -> String {
-    let mut out = String::with_capacity(budget.min(8 * 1024));
-    out.push_str(header);
-    if symbols.is_empty() {
-        out.push_str("… 未识别到声明（可能是数据文件或不支持的语言）；请直接 fs_read 或 fs_grep\n");
-        return out;
-    }
-    let full_footer = format!(
+    // 尾注必须完整：预算再紧也不能给出「或调大 bud」这种半句。
+    // 先按「一个符号都不显示」估算尾部，连它都放不下时直接报预算错误。
+    let partial_tail = |shown: usize| {
+        format!(
+            "… 已显示 {}/{} 个符号（共 {} 行）| 用 fs_grep 精确定位，或调大 budget\n",
+            shown,
+            symbols.len(),
+            total_lines
+        )
+    };
+    let full_tail = format!(
         "… {} 个符号（共 {} 行）| 用 fs_read block=true start=<行号> 读实现\n",
         symbols.len(),
         total_lines
     );
-    // 尾注优先占位：宁少列几个符号，也不给缺参数的半截续读提示。
-    let reserve = full_footer.len().min(160);
+    if symbols.is_empty() {
+        let tail = "… 未识别到声明（可能是数据文件或不支持的语言）；请直接 fs_read 或 fs_grep\n";
+        if header.len() + tail.len() > budget {
+            return format!(
+                "E_BUDGET 结构摘要至少需要 {}B（文件头 {}B），当前 budget={budget}；请调大 budget",
+                header.len() + tail.len(),
+                header.len()
+            );
+        }
+        return format!("{header}{tail}");
+    }
+    let minimal_tail = partial_tail(0);
+    if header.len() + minimal_tail.len() > budget {
+        return format!(
+            "E_BUDGET 结构摘要至少需要 {}B（文件头 {}B + 尾注 {}B），当前 budget={budget}；请调大 budget",
+            header.len() + minimal_tail.len(),
+            header.len(),
+            minimal_tail.len()
+        );
+    }
+    let mut out = String::with_capacity(budget.min(8 * 1024));
+    out.push_str(header);
     let mut shown = 0usize;
     for symbol in symbols {
         let line = format!("{}|{}\n", symbol.line, shorten_line(&symbol.text, max_line));
-        if out.len() + line.len() + reserve > budget {
+        let tail_len = if shown + 1 == symbols.len() {
+            full_tail.len()
+        } else {
+            partial_tail(shown + 1).len()
+        };
+        if out.len() + line.len() + tail_len > budget {
             break;
         }
         out.push_str(&line);
         shown += 1;
     }
-    if shown < symbols.len() {
-        out.push_str(&format!(
-            "… 已显示 {}/{} 个符号（共 {} 行）| 用 fs_grep 精确定位，或调大 budget\n",
-            shown,
-            symbols.len(),
-            total_lines
-        ));
+    if shown == symbols.len() {
+        out.push_str(&full_tail);
     } else {
-        out.push_str(&full_footer);
+        out.push_str(&partial_tail(shown));
     }
     out
 }
@@ -1384,6 +1408,15 @@ fn read(args: &Value) -> String {
                 },
             );
             if r.body.is_empty() && !r.continuation.is_empty() {
+                // body_budget 被收敛到 0：真正吃掉预算的是 header（路径/编码/hash）
+                // 加续读尾注，不是“第 N 行太长”。报行太长会把模型引向错误的调参方向。
+                if body_budget == 0 {
+                    return format!(
+                        "E_BUDGET budget={want} 连文件头（约 {}B）和续读尾注都放不下；请把 budget 提到至少 {}",
+                        header.len(),
+                        header.len() + 240
+                    );
+                }
                 let line_no = r.continuation[0].0;
                 let need = line_need_bytes(&doc.text, line_no);
                 return format!(
@@ -1571,6 +1604,60 @@ mod tests {
         }
         assert!(!out.contains("… 区间"), "合并后不应有越界提示: {out}");
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn 乱序区间合并后不丢行() {
+        // 模型常从 grep 结果里拼区间，顺序不保证；只与已输出区间比较
+        // 会把 [1,6] 吞进先到的 [10,14]，静默少读一整段。
+        assert_eq!(
+            merge_ranges(vec![(10, 14), (1, 6), (12, 20)]),
+            vec![(1, 6), (10, 20)]
+        );
+    }
+
+    #[test]
+    fn 预算小于文件头时报告头开销() {
+        let path = 临时文本文件("line1\nline2\n");
+        let posix_path = path.to_string_lossy().replace('\\', "/");
+        let out = read(&json!({"path": posix_path, "budget": 100, "force": true}));
+        let _ = fs::remove_file(path);
+        assert!(out.starts_with("E_BUDGET"), "应报告预算而非行太长: {out}");
+        assert!(out.contains("文件头"), "{out}");
+    }
+
+    #[test]
+    fn summary预算紧张时尾注不被截成半句() {
+        let path = std::env::current_dir().unwrap().join(format!(
+            "fsops-summary-budget-{}-{}.rs",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // 函数体要足够长，否则会触发“ summary 不比全文更省”的退化分支。
+        let body: String = (0..12)
+            .map(|i| format!("fn f{i}() {{\n    let a = 1;\n    let b = 2;\n}}\n"))
+            .collect();
+        fs::write(&path, body).unwrap();
+        let posix_path = path.to_string_lossy().replace('\\', "/");
+        let out = read(&json!({
+            "path": posix_path,
+            "summary": true,
+            "budget": 260,
+            "force": true
+        }));
+        let _ = fs::remove_file(path);
+        assert!(out.contains("个符号"), "应走摘要路径: {out}");
+        assert!(
+            out.contains("或调大 budget") || out.contains("E_BUDGET"),
+            "尾注被硬切: {out:?}"
+        );
+        assert!(
+            out.contains("调大 budget") || out.contains("E_BUDGET"),
+            "预算不足必须给出可执行提示: {out}"
+        );
     }
 
     #[test]

@@ -242,19 +242,24 @@ fn is_declaration(trimmed: &str, lang: Language) -> bool {
 pub fn extract(text: &str, lang: Language) -> Vec<Symbol> {
     let mut out = Vec::new();
     // Rust 的 mod tests 会贡献上百个测试函数，对「文件结构」是纯噪声。
-    // 这里不数花括号——测试里的字符串常量常含 '{' '}'，计数会漂移并吞掉后面的实现；
-    // 只认「列 0 的 '}'」作为模块结束，和 rustfmt 的顶层书写一致。
+    // 不能只认「列 0 的 '}'」：测试体里的多行字符串常把 '}' 写在列 0
+    // （本文件的测试就是这样），会提前退出并把后面的测试函数当成正式声明。
+    // 这里做字符串感知的括号计数：字符串里的花括号不计入深度。
     let mut in_tests = false;
+    let mut test_depth = 0i64;
+    let mut in_string = false;
     for (index, line) in text.lines().enumerate() {
         let trimmed = line.trim();
         if in_tests {
-            if !line.starts_with(char::is_whitespace) && trimmed == "}" {
+            test_depth += brace_delta(line, &mut in_string);
+            if test_depth <= 0 && !in_string {
                 in_tests = false;
             }
             continue;
         }
-        if lang == Language::Rust && trimmed.contains("mod tests") && trimmed.contains('{') {
+        if lang == Language::Rust && is_test_module(trimmed) {
             in_tests = true;
+            test_depth = brace_delta(line, &mut in_string);
             continue;
         }
         if is_declaration(trimmed, lang) {
@@ -265,6 +270,60 @@ pub fn extract(text: &str, lang: Language) -> Vec<Symbol> {
         }
     }
     out
+}
+
+/// 判断一行是否是 Rust 测试模块声明（mod tests / mod summary_tests / mod io_tests…）。
+///
+/// 只认 "mod tests" 会漏掉 `mod summary_tests` 这类按模块命名的测试块，
+/// 它们后面的测试函数会全被当成正式声明。
+fn is_test_module(trimmed: &str) -> bool {
+    if trimmed.starts_with("//") || !trimmed.contains('{') {
+        return false;
+    }
+    let Some((_, rest)) = trimmed.split_once("mod ") else {
+        return false;
+    };
+    let name: String = rest
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    name.ends_with("tests")
+}
+
+/// 统计一行里参与语法结构的花括号增量，跳过字符串字面量。
+///
+/// `in_string` 跨行保持：Rust 的多行字符串（行尾 `\` 续行）里的花括号
+/// 不能计入，否则测试模块会在字符串中途被判定结束。
+fn brace_delta(line: &str, in_string: &mut bool) -> i64 {
+    let bytes = line.as_bytes();
+    let mut i = 0usize;
+    let mut delta = 0i64;
+    let mut string = *in_string;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if string {
+            // 行尾反斜杠是字符串续行，保持 string 状态。
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == b'"' {
+                string = false;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'/' if bytes.get(i + 1) == Some(&b'/') => break,
+            b'"' => string = true,
+            b'{' => delta += 1,
+            b'}' => delta -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    *in_string = string;
+    delta
 }
 
 #[cfg(test)]
@@ -299,6 +358,28 @@ mod tests {
         assert_eq!(names.len(), 2, "{names:?}");
         assert!(names[0].contains("keep"));
         assert!(names[1].contains("also_keep"));
+    }
+
+    #[test]
+    fn rust_测试体多行字符串里的列首括号不提前结束跳过() {
+        // 测试体里写多行字符串时，内容里的 `}` 可能落在列 0；
+        // 只认“列 0 的 }”会提前退出，把后面的测试函数当成正式声明。
+        let text = "fn keep() {}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn case_one() {\n        let content = \"\\\nfn fake() {\n}\n\";\n    }\n\n    #[test]\n    fn case_two() {\n        assert!(true);\n    }\n}\n\nfn also_keep() {}\n";
+        let symbols = extract(text, Language::Rust);
+        let names: Vec<&str> = symbols.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(names.len(), 2, "测试体不应漏出符号: {names:?}");
+        assert!(names[1].contains("also_keep"));
+    }
+
+    #[test]
+    fn rust_命名测试模块也跳过() {
+        // tools.rs 用 mod summary_tests 分块；只认 “mod tests” 会漏掉它，
+        // 导致后面的测试函数全被当成正式声明。
+        let text =
+            "fn keep() {}\n\nmod summary_tests {\n    fn case() {}\n}\n\nfn also_keep() {}\n";
+        let symbols = extract(text, Language::Rust);
+        let names: Vec<&str> = symbols.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(names.len(), 2, "命名测试模块未跳过: {names:?}");
     }
 
     #[test]

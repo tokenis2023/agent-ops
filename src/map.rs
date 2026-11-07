@@ -151,7 +151,14 @@ pub fn build(
         file.score = score;
         file.refs = ref_total;
     }
-    files.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.path.cmp(&b.path)));
+    files.sort_by(|a, b| {
+        // 测试/基准文件统一排到实现文件之后：它们引用大量符号，
+        // 只按中心性会把 tests/ 顶到最前，而 map 要回答的是「先看哪些实现」。
+        is_test_path(&a.path)
+            .cmp(&is_test_path(&b.path))
+            .then_with(|| b.score.cmp(&a.score))
+            .then_with(|| a.path.cmp(&b.path))
+    });
 
     let blocks: Vec<String> = files
         .iter()
@@ -209,6 +216,24 @@ fn resolve(root: &FsPath, rel: &str) -> String {
     )
 }
 
+/// 测试/基准路径：它们不是「先看哪些实现」的答案。
+fn is_test_path(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    if lower.contains("/tests/")
+        || lower.contains("/test/")
+        || lower.contains("/benches/")
+        || lower.contains("/__tests__/")
+    {
+        return true;
+    }
+    let name = lower.rsplit('/').next().unwrap_or("");
+    name.starts_with("test_")
+        || name.contains("_test.")
+        || name.contains("_tests.")
+        || name.contains(".spec.")
+        || name.contains(".test.")
+}
+
 fn render_block(file: &FileInfo, focus_terms: &[String]) -> String {
     let mut block = format!(
         "\n{}  符号 {} · 被引用 {} 处\n",
@@ -229,7 +254,7 @@ fn render_block(file: &FileInfo, focus_terms: &[String]) -> String {
     }
     if file.symbols.len() > MAX_SYMBOLS_PER_FILE {
         block.push_str(&format!(
-            "  … 还有 {} 个符号\n",
+            "  … 还有 {} 个符号（完整结构用 fs_read summary=true）\n",
             file.symbols.len() - MAX_SYMBOLS_PER_FILE
         ));
     }
@@ -432,6 +457,24 @@ mod tests {
         assert!(core < user, "被引用的 core.rs 应排在 user.rs 前: {out}");
         assert!(!out.contains("notes.md"), "数据文件应跳过: {out}");
         assert!(!out.contains("tiny.txt"), "未知语言应跳过: {out}");
+    }
+
+    #[test]
+    fn 测试目录的文件排在实现文件之后() {
+        let dir = 建仓库("tests-order");
+        fs::create_dir_all(dir.join("tests")).unwrap();
+        // 测试文件引用所有实现符号，只按引用数会让它排到最前，
+        // 而 repo map 要回答的是「先看哪些实现文件」。
+        fs::write(
+            dir.join("tests").join("integration.rs"),
+            "fn case() {\n    Token;\n    verify();\n    use_it();\n    main();\n}\n",
+        )
+        .unwrap();
+        let out = 输出(&dir, "", 200);
+        let _ = fs::remove_dir_all(&dir);
+        let tests_at = out.find("/tests/integration.rs").expect("应包含测试文件");
+        let impl_at = out.find("/core.rs").expect("应包含 core.rs");
+        assert!(impl_at < tests_at, "实现文件应排在测试文件之前: {out}");
     }
 
     #[test]
