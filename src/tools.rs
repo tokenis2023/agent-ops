@@ -618,6 +618,17 @@ fn edit_distance(a: &str, b: &str) -> usize {
     previous[b_chars.len()]
 }
 
+/// 顶层简写模式可接受的字段：直接把单条修改写在顶层时，按这个顺序折进 edits[0]。
+const EDIT_ITEM_FIELDS_FOR_SHORTHAND: [&str; 7] = [
+    "old",
+    "new",
+    "pattern",
+    "replacement",
+    "all",
+    "start",
+    "end",
+];
+
 /// fs_edit 单条修改项自己的字段：容易被模型误提到顶层的关键字。
 const EDIT_ITEM_FIELDS: [&str; 7] = [
     "old",
@@ -649,12 +660,17 @@ fn validate_args(name: &str, args: &Value) -> Option<String> {
     }
     for (key, value) in obj {
         let Some(spec) = props.get(key) else {
-            // fs_edit 的字段级参数常被模型提到顶层。机械地报「最接近的合法字段」
-            // 会把它猜成 path，反而把模型引向更错的方向，所以这里给定向指引。
+            // fs_edit 的字段级参数提到顶层是模型的自然写法（实测 3/3 次独立任务都这么写）。
+            // 单条修改场景直接接受（edit_tool 会折进 edits[0]）；只有在已经给了 edits/files、
+            // 或与批量模式混用时才报错——那时顶层字段确实无处安放。
             if name == "fs_edit" && EDIT_ITEM_FIELDS.contains(&key.as_str()) {
-                return Some(format!(
-                    "E_BAD_ARGS fs_edit.{key} 是单条修改自己的字段，请放进 edits[] 或 files[].edits[] 的每一项里，例如 edits: [{{\"old\": \"...\", \"{key}\": ...}}]"
-                ));
+                let shorthand_ok = obj.get("edits").is_none() && obj.get("files").is_none();
+                if !shorthand_ok {
+                    return Some(format!(
+                        "E_BAD_ARGS fs_edit.{key} 是单条修改自己的字段：给了 edits/files 时它必须在每一项里，不能放顶层"
+                    ));
+                }
+                continue;
             }
             let nearest = props
                 .keys()
@@ -2475,7 +2491,9 @@ mod tests {
     }
 
     #[test]
-    fn edit字段级参数提到顶层时指引放进edits() {
+    fn edit字段级参数与edits混用时报错且不猜最接近字段() {
+        // 单条修改时顶层写法已被接受（见「顶层单条修改简写被接受」）；
+        // 但一旦给了 edits，顶层字段就无处安放，必须报错而不是静默忽略。
         // 通用「最接近合法字段」会把它猜成 path，反而把模型引到更错的方向。
         for key in [
             "all",
@@ -2486,7 +2504,10 @@ mod tests {
             "pattern",
             "replacement",
         ] {
-            let mut args = json!({ "path": "a.txt" });
+            let mut args = json!({
+                "path": "a.txt",
+                "edits": [{"old": "a", "new": "b"}]
+            });
             args[key] = json!(true);
             let output = call("fs_edit", &args);
             assert!(output.starts_with("E_BAD_ARGS"), "{key}: {output}");
@@ -2654,6 +2675,38 @@ mod tests {
         assert_eq!(after, "a\n", "拒绝后文件必须一字不改");
     }
 
+    #[test]
+    fn 顶层单条修改简写被接受() {
+        // 实测三次独立任务 3/3 都把 old/new 或 pattern/replacement 放顶层，
+        // 每次都因 E_BAD_ARGS 白费一轮。单条修改时应直接接受这种自然写法。
+        let dir = 临时目录("edit-shorthand");
+        let f = dir.join("a.ts");
+        fs::write(&f, "export function log() {\n  console.log(1)\n}\n").unwrap();
+        let path = f.to_string_lossy().replace('\\', "/");
+        let out = call(
+            "fs_edit",
+            &json!({"path": path, "pattern": "console\\.log", "replacement": "console.error"}),
+        );
+        assert!(out.starts_with("ok"), "顶层 pattern 应被接受: {out}");
+        assert!(
+            fs::read_to_string(&f).unwrap().contains("console.error"),
+            "简写应真的落盘"
+        );
+
+        let out = call(
+            "fs_edit",
+            &json!({"path": path, "old": "console.error(1)", "new": "console.warn(1)"}),
+        );
+        assert!(out.starts_with("ok"), "顶层 old/new 应被接受: {out}");
+
+        // 给了 edits 时顶层字段仍必须嵌进去，不能被静默忽略
+        let mixed = call(
+            "fs_edit",
+            &json!({"path": path, "old": "x", "new": "y", "edits": [{"old": "warn", "new": "error"}]}),
+        );
+        assert!(mixed.starts_with("E_BAD_ARGS"), "混用应报错: {mixed}");
+        let _ = fs::remove_dir_all(&dir);
+    }
     #[test]
     fn 半行old截断在词中间时给警告() {
         // 实测踩坑：文件是 `# mini-task-service`，从片段抄了 `# mini-task-servic`，
@@ -5596,7 +5649,28 @@ fn edit_tool(args: &Value) -> String {
             Some(path) => path,
             None => return "E_BAD_ARGS 需要 path+edits 或 files".into(),
         };
-        let edits = match parse_edits(args.get("edits").unwrap_or(&Value::Null)) {
+        // 单条修改的简写：模型很自然会把 old/new 或 pattern/replacement 直接放顶层，
+        // 而不是嵌进 edits:[{...}]——实测三次独立任务全部这么写（3/3），每次白费一轮。
+        // 与其报错纠正，不如接受这种写法：把顶层关键字折进一个 edits 项。
+        let has_top_level_edit = ["old", "new", "pattern", "replacement", "all"]
+            .iter()
+            .any(|key| args.get(*key).is_some());
+        let shorthand = if args.get("edits").is_none() && has_top_level_edit {
+            let mut item = serde_json::Map::new();
+            for key in EDIT_ITEM_FIELDS_FOR_SHORTHAND {
+                if let Some(value) = args.get(key) {
+                    item.insert(key.to_string(), value.clone());
+                }
+            }
+            Some(Value::Array(vec![Value::Object(item)]))
+        } else {
+            None
+        };
+        let edits = match parse_edits(
+            shorthand
+                .as_ref()
+                .unwrap_or_else(|| args.get("edits").unwrap_or(&Value::Null)),
+        ) {
             Ok(edits) => edits,
             Err(e) => return e,
         };
@@ -6131,9 +6205,12 @@ fn inspect_tool(args: &Value) -> String {
             Ok(result) if !result.file_counts.is_empty() => {
                 let mut dist: Vec<&(String, usize)> = result.file_counts.iter().collect();
                 dist.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                // 分布条数跟着 limit 走：写死 8 时，模型想拿全 12 个文件名只能再跑一次
+                // fs_grep（实测 A/B 两侧都因此多花一轮）。上限 40 防止超大结果撑爆。
+                let dist_cap = limit.clamp(8, 40);
                 let shown: Vec<String> = dist
                     .iter()
-                    .take(8)
+                    .take(dist_cap)
                     .map(|(path, count)| format!("{path}:{count}"))
                     .collect();
                 out.push_str(&format!(

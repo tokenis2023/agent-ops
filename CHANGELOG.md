@@ -4,6 +4,16 @@
 
 ## [Unreleased]
 
+### 减少返工（真实 A/B 实测暴露）
+
+- **`fs_edit` 接受顶层单条修改简写**：`old`/`new`、`pattern`/`replacement`、`all`、`start`/`end`
+  可直接放顶层，不必包一层 `edits:[{...}]`。依据：三次独立真实任务（ab-runner / A 侧 / B 侧）
+  **3/3 都这么写**，每次都被 `E_BAD_ARGS` 拒绝后重试，白费一轮。给了 `edits`/`files` 时仍强制
+  嵌进每一项（不能静默忽略）。`E_AMBIGUOUS` 里过时的「传到顶层会被 schema 拒绝」同步改掉。
+- **`fs_inspect` 命中分布不再写死 8 条**：跟随 `limit`（默认 15，上限 40）。A/B 两侧都报告
+  「清单在第 8 个后被 `…` 截断，调 limit 也不展开」，因此仍要补一次 `fs_grep output=files`
+  才拿全 12 个文件名——一个 bug 直接吃掉了本该省下的那一轮。
+
 ### 新增工具
 
 - **`fs_inspect`（第 9 个工具）**：一次给出「文件规模 + 可选的正则命中分布 + 命中样例」，

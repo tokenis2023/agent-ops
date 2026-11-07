@@ -196,7 +196,7 @@ pub fn apply(original: &str, eol: Eol, edits: &[EditSpec]) -> Result<(String, Ed
             }
             return Err(with_partial_note(
                 format!(
-                    "E_AMBIGUOUS 第{}处匹配到 {} 个位置（行 {} 列 {}）；加更多上下文，或在该条 edits 项里设 \"all\": true 全部替换，或用该条 edits 项里的 \"start\"/\"end\" 限定行范围（这三个字段属于 edits[] 内的单条修改项，传到顶层会被 schema 拒绝）{}",
+                    "E_AMBIGUOUS 第{}处匹配到 {} 个位置（行 {} 列 {}）；加更多上下文，或用 \"all\": true 全部替换，或用 \"start\"/\"end\" 限定行范围（单条修改时这些字段可直接放顶层，也可放进 edits[] 项里）{}",
                     i + 1,
                     positions.len(),
                     line_list.join(","),
