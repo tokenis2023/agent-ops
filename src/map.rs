@@ -190,6 +190,9 @@ pub fn build(
         files.iter().map(|f| f.symbols.len()).sum::<usize>(),
         shown
     ));
+    if shown < files.len() {
+        out.push_str(" | 想看其余文件: 调大 budget 或 fs_glob focus=<词> 缩小");
+    }
     if report.stopped {
         out.push_str("（达到 max_files 上限）");
     }

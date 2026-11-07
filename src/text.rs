@@ -287,7 +287,7 @@ pub fn encode(doc: &Doc, text: &str) -> Result<Vec<u8>, String> {
             .collect::<Vec<_>>()
             .join("、");
         return Err(format!(
-            "E_ENCODING_LOSS 新文本有 {} 无法表示的字符：{}；请替换这些字符或改用 UTF-8 文件，文件未修改",
+            "E_ENCODING_LOSS 新文本有 {} 无法表示的字符：{}；请替换这些字符，或先 fs_file op=convert path=<文件> encoding=utf-8 把文件转成 UTF-8 再编辑；文件未修改",
             doc.encoding, detail
         ));
     }
@@ -337,6 +337,17 @@ pub fn levenshtein(a: &str, b: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 编码损失错误给出转码命令() {
+        let doc = decode(b"\xd6\xd0\xce\xc4\n");
+        let err = encode(&doc, "中文\n😀\n").unwrap_err();
+        assert!(err.contains("E_ENCODING_LOSS"), "{err}");
+        assert!(
+            err.contains("fs_file op=convert") && err.contains("encoding=utf-8"),
+            "应点名已有的转码命令: {err}"
+        );
+    }
 
     #[test]
     fn 编码损失时报出具体字符与行号() {

@@ -3408,6 +3408,73 @@ fn next_fn() {
     }
 
     #[test]
+    fn next_offset尾注给出可重放命令() {
+        // 只给一个裸数字，模型还得回查 schema 才知道把它塞进哪个参数。
+        let dir = 临时目录("hint-next");
+        for i in 0..12 {
+            fs::write(dir.join(format!("f{i:02}.txt")), "needle\n").unwrap();
+        }
+        let path = dir.to_string_lossy().replace('\\', "/");
+        let glob_out = glob_tool(&json!({
+            "path": path, "pattern": "*.txt", "limit": 2
+        }));
+        let grep_out = grep_tool(&json!({
+            "pattern": "needle", "path": path, "limit": 1
+        }));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            glob_out.contains("续读: fs_glob offset="),
+            "glob 尾注应给可重放命令: {glob_out}"
+        );
+        assert!(
+            grep_out.contains("续读: fs_grep offset="),
+            "grep 尾注应给可重放命令: {grep_out}"
+        );
+        assert!(
+            grep_out.contains("output="),
+            "grep 尾注应固定 output 单位: {grep_out}"
+        );
+    }
+
+    #[test]
+    fn 批量部分失败错误列出已写路径() {
+        let msg = batch_partial_error(
+            &["a.txt".to_string(), "b.txt".to_string()],
+            "c.txt",
+            "E_OPEN",
+            3,
+        );
+        assert!(msg.starts_with("E_BATCH_PARTIAL"), "{msg}");
+        assert!(
+            msg.contains("a.txt") && msg.contains("b.txt"),
+            "应列已写路径: {msg}"
+        );
+        assert!(msg.contains("仅对剩余文件重发"), "应给下一步: {msg}");
+    }
+
+    #[test]
+    fn docx错误警告格式丢失并给重建命令() {
+        let dir = 临时目录("docx-hint");
+        let path = dir.join("a.docx");
+        fs::write(&path, "x").unwrap();
+        let posix = path.to_string_lossy().replace('\\', "/");
+        let out = call(
+            "fs_edit",
+            &json!({"files": [{"path": posix, "edits": [{"old": "x", "new": "y"}]}]}),
+        );
+        let _ = fs::remove_dir_all(&dir);
+        assert!(out.starts_with("E_DOCX"), "{out}");
+        assert!(
+            out.contains("格式") && out.contains("图片"),
+            "必须警告会丢光格式: {out}"
+        );
+        assert!(
+            out.contains("fs_write") && out.contains("content="),
+            "应给重建命令形状: {out}"
+        );
+    }
+
+    #[test]
     fn fs_read描述包含模式互斥表() {
         // 模式互斥只能靠运行时错误教学的话，模型要付一轮试错；
         // description 里给一张组合表，让它在发出调用前就能拼出合法参数。
@@ -4023,12 +4090,12 @@ fn next_fn() {
                 "pattern": "needle", "path": path, "output": "files",
                 "limit": 3, "parallel": parallel
             }));
-            assert_eq!(
-                first, "a.txt\n… next_offset=1",
+            assert!(
+                first.starts_with("a.txt\n") && first.contains("next_offset=1"),
                 "parallel={parallel}: {first}"
             );
-            assert_eq!(
-                second, "b.txt\n… next_offset=2",
+            assert!(
+                second.starts_with("b.txt\n") && second.contains("next_offset=2"),
                 "parallel={parallel}: {second}"
             );
             assert_eq!(last, "a.txt\nb.txt\nc.txt", "parallel={parallel}: {last}");
@@ -4631,6 +4698,27 @@ fn next_fn() {
     }
 }
 
+/// 批量写入部分失败时把「哪些已写」列全，避免模型整批重发造成二次替换。
+fn batch_partial_error(written: &[String], failed: &str, err: &str, total: usize) -> String {
+    let done = if written.is_empty() {
+        "无".to_string()
+    } else {
+        written.join(",")
+    };
+    format!(
+        "E_BATCH_PARTIAL 已写入 {}/{}；已写 {done}；失败 {failed}: {err}；仅对剩余文件重发，已写的跳过或用其 hash 作 expect_hash",
+        written.len(),
+        total
+    )
+}
+
+/// DOCX/PDF 不支持精确替换；把「会丢什么」和重建命令一次说清。
+fn doc_rebuild_hint(code: &str, path: &str) -> String {
+    format!(
+        "{code} 不支持精确替换 {path}：整体重建只生成纯文本段落，会丢弃全部格式/图片/表格；如确需重建，先 fs_read 取正文，改好后 fs_write path={path} content=<改后全文>；需保留格式请勿用 fsops 编辑"
+    )
+}
+
 /// 并发冲突把「下一步」写成可直接复制的指令，省掉整轮 fs_read。
 fn stale_changed(hash: &str) -> String {
     format!(
@@ -4773,11 +4861,7 @@ fn edit_tool(args: &Value) -> String {
                 Err(e) => return format!("E_BATCH {path}: E_BAD_PATH {e}"),
             };
             if let Some(format) = crate::documents::format_of(fp.native()) {
-                return format!(
-                    "{} 不支持精确替换 {}；请用 fs_write 整体重建",
-                    doc_format_error(format),
-                    fp.display()
-                );
+                return doc_rebuild_hint(doc_format_error(format), &fp.display().to_string());
             }
             let shown = fp.display();
             if seen.contains(&shown) {
@@ -4811,11 +4895,7 @@ fn edit_tool(args: &Value) -> String {
             Err(e) => return format!("E_BAD_PATH {e}"),
         };
         if let Some(format) = crate::documents::format_of(fp.native()) {
-            return format!(
-                "{} 不支持精确替换 {}；请用 fs_write 整体重建",
-                doc_format_error(format),
-                fp.display()
-            );
+            return doc_rebuild_hint(doc_format_error(format), &fp.display().to_string());
         }
         requests.push(EditRequest {
             path: path.to_string(),
@@ -4877,15 +4957,12 @@ fn edit_tool(args: &Value) -> String {
         return out;
     }
 
-    for (index, item) in prepared.iter().enumerate() {
+    let mut written: Vec<String> = Vec::new();
+    for item in prepared.iter() {
         if let Err(e) = io::atomic_write(&item.fp, &item.bytes) {
-            return format!(
-                "E_BATCH_PARTIAL 已写入 {}/{}；失败 {}: {e}",
-                index,
-                file_count,
-                item.fp.display()
-            );
+            return batch_partial_error(&written, &item.fp.display().to_string(), &e, file_count);
         }
+        written.push(item.fp.display().to_string());
     }
     // 写入成功后清掉读取缓存：即使 hash 校验已能挡住旧内容，这里再兜一层。
     for item in &prepared {
@@ -5193,7 +5270,10 @@ fn glob_tool(args: &Value) -> String {
                         text.push('\n');
                     }
                     if budget_cut || (report.stopped && !report.lookahead_limited) {
-                        text.push_str(&format!("… next_offset={}\n", offset + shown));
+                        let next = offset + shown;
+                        text.push_str(&format!(
+                            "… next_offset={next} | 续读: fs_glob offset={next}（单位：匹配条目）\n"
+                        ));
                     }
                     if report.lookahead_limited {
                         // 只探测了有限个后续项，无法确认是否还有下一页。
@@ -5357,7 +5437,15 @@ fn grep_tool(args: &Value) -> String {
                 }
                 if (r.truncated || render_cut || r.timed_out) && rendered_matches > 0 {
                     let next = opts.offset.saturating_add(rendered_matches);
-                    text.push_str(&format!("\n… next_offset={next}"));
+                    let mode = format!("{output:?}").to_ascii_lowercase();
+                    let unit = if output == GrepOutput::Files {
+                        "匹配文件"
+                    } else {
+                        "命中"
+                    };
+                    text.push_str(&format!(
+                        "\n… next_offset={next} | 续读: fs_grep offset={next} output={mode}（单位：{unit}）"
+                    ));
                 }
                 text.trim_end().to_string()
             });
