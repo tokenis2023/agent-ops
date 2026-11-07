@@ -26,6 +26,21 @@ const exeIndex = args.indexOf('--exe')
 const EXE = exeIndex >= 0 ? resolve(args[exeIndex + 1]) : join(ROOT, 'target', 'debug', 'fsops.exe')
 
 let failures = 0
+/** Windows 上被杀内核的子进程可能短暂占住目录，清理时重试几次。 */
+async function rmWithRetry(target) {
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    try {
+      await rm(target, { recursive: true, force: true })
+      return
+    } catch (error) {
+      const code = error?.code
+      if (code !== 'EBUSY' && code !== 'EPERM' && code !== 'ENOTEMPTY') throw error
+      await new Promise((resolve) => setTimeout(resolve, 200))
+    }
+  }
+  await rm(target, { recursive: true, force: true })
+}
+
 function check(condition, message, detail) {
   if (condition) {
     console.log('PASS ' + message)
@@ -315,6 +330,21 @@ for (const [toolName, definition] of ctx.registered) {
       '生成物渲染结果稳定（可直接提交）',
       '渲染不一致：检查生成器输出格式',
     )
+    // 插件形态的描述必须与 schema 一致：不能再教模型用被剔除的后台任务参数。
+    const generatedExec = generated.TOOL_SPECS.find((spec) => spec.name === 'fs_exec')
+    const execDesc = generatedExec?.description ?? ''
+    check(
+      !execDesc.includes('job=') && !execDesc.includes('list=true'),
+      'fs_exec 描述不再宣传后台任务参数',
+      execDesc.slice(0, 160),
+    )
+    check(execDesc.includes('DSH 插件形态'), 'fs_exec 描述点明插件形态边界', execDesc.slice(-120))
+    // 自由映射对象（fs_exec.env）必须投影成 json：空对象 + additionalProperties:false 会把任意键拒掉。
+    check(
+      generatedExec?.parameters?.env?.type === 'json',
+      'fs_exec.env 投影为开放 json',
+      JSON.stringify(generatedExec?.parameters?.env),
+    )
   }
 
   // 关键能力词必须在两端 description 里都出现：MCP 端曾漏写「正则替换」，
@@ -342,9 +372,9 @@ for (const [toolName, definition] of ctx.registered) {
 
 // ---- 5. 真实调用 -----------------------------------------------------------
 
-async function call(name, args) {
+async function call(name, args, exec = { agent: {}, signal: undefined }) {
   const definition = ctx.registered.get(name)
-  return await definition.execute(args ?? {}, { agent: {}, signal: undefined })
+  return await definition.execute(args ?? {}, exec)
 }
 
 try {
@@ -377,6 +407,27 @@ try {
 
   const execOut = await call('fs_exec', { program: 'cmd', args: ['/c', 'echo', 'hi-from-exec'] })
   check(execOut.includes('exit=0') && execOut.includes('hi-from-exec'), 'fs_exec 返回退出码与输出', execOut.slice(0, 200))
+
+  // env 曾是宿主 schema 的 P1：自由映射被投影成空封闭对象，任何键都被拒。
+  const envOut = await call('fs_exec', {
+    program: 'node',
+    args: ['-e', 'console.log(process.env.SMOKE_ENV||"MISSING")'],
+    env: { SMOKE_ENV: 'ok-from-env' },
+  })
+  check(envOut.includes('ok-from-env'), 'fs_exec env 注入生效（插件形态）', envOut.slice(0, 200))
+
+  // 后台任务参数：schema 不声明，传输层显式拒绝，避免"文档说没有、运行时却穿透"。
+  let backgroundRejected = ''
+  try {
+    await call('fs_exec', { program: 'cmd', args: ['/c', 'echo', 'x'], background: true })
+  } catch (error) {
+    backgroundRejected = String(error.message)
+  }
+  check(
+    backgroundRejected.includes('后台任务') && backgroundRejected.includes('MCP'),
+    'fs_exec 后台任务参数被显式拒绝',
+    backgroundRejected.slice(0, 200),
+  )
 
   const copied = await call('fs_file', { op: 'copy', src: file, dst: join(work, 'copy.rs') })
   check(copied.startsWith('ok copy'), 'fs_file copy 成功', copied.slice(0, 200))
@@ -419,16 +470,43 @@ try {
   const versionProbes = ctx.spawns.filter((argv) => argv[1] === 'version').length
   check(versionProbes === 0, '显式 binary 不做版本探测', 'version spawn 次数=' + versionProbes)
 
+  // 取消语义：唯一在途的写/执行请求被 abort 时结束内核会话，下次调用重建；
+  // 否则用户取消后 fsops 可能继续写盘/跑命令。
+  {
+    const controller = new AbortController()
+    const pendingExec = call(
+      'fs_exec',
+      { program: 'node', args: ['-e', 'setTimeout(() => {}, 5000)'], cwd: tmpdir() },
+      { agent: {}, signal: controller.signal },
+    )
+    setTimeout(() => controller.abort(), 150)
+    let abortMessage = ''
+    try {
+      await pendingExec
+    } catch (error) {
+      abortMessage = String(error?.message ?? error)
+    }
+    check(abortMessage.includes('取消'), 'abort 后抛出取消错误', abortMessage.slice(0, 120))
+    const afterAbortSpawns = ctx.spawns.filter((argv) => argv[1] === 'mcp').length
+    check(afterAbortSpawns === 1, 'abort 结束旧会话（不重放）', 'mcp spawn 次数=' + afterAbortSpawns)
+    const oneshotAfterAbort = ctx.spawns.filter((argv) => argv[1] === 'call').length
+    check(oneshotAfterAbort === 0, '取消不触发一次性 spawn 重放', 'call spawn 次数=' + oneshotAfterAbort)
+    const afterAbort = await call('fs_read', { path: parallelFiles[0] })
+    check(afterAbort.includes('marker-0'), 'abort 后自动重建会话')
+    const rebuilt = ctx.spawns.filter((argv) => argv[1] === 'mcp').length
+    check(rebuilt === 2, 'abort 重建只再 spawn 一次', 'mcp spawn 次数=' + rebuilt)
+  }
+
   // 会话释放后重建：插件重载 / 会话崩溃都要能自愈。
   for (const dispose of ctx.disposers) dispose()
   const revived = await call('fs_read', { path: parallelFiles[0] })
   check(revived.includes('marker-0'), '会话释放后自动重建', revived.slice(0, 120))
   const respawns = ctx.spawns.filter((argv) => argv[1] === 'mcp').length
-  check(respawns === 2, '重建会话只再 spawn 一次', 'mcp spawn 次数=' + respawns)
+  check(respawns === 3, '重建会话只再 spawn 一次', 'mcp spawn 次数=' + respawns)
 } finally {
   for (const dispose of ctx.disposers) dispose()
-  await rm(work, { recursive: true, force: true })
-  await rm(stubDir, { recursive: true, force: true })
+  await rmWithRetry(work)
+  await rmWithRetry(stubDir)
 }
 
 console.log('')

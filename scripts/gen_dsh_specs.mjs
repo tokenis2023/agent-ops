@@ -39,6 +39,23 @@ const EXCLUDED = {
   fs_exec: ['background', 'job', 'list', 'wait_ms', 'kill'],
 }
 
+/**
+ * 插件形态需要改写描述的条目：Rust 侧描述是 MCP/CLI 的完整能力，其中后台任务
+ * 用法在插件形态不存在（schema 不声明，运行时也会显式拒绝，见 dsh/index.js 的
+ * EXCLUDED_ARGS）。不在这里覆写，模型会按描述拼出拿不到的参数（评测 P2 漂移）。
+ */
+const DESCRIPTION_PATCHES = {
+  fs_exec: (description) => {
+    const cut = description.indexOf('启动任务必须给 program')
+    const head = cut >= 0 ? description.slice(0, cut) : description
+    return (
+      head +
+      '启动任务必须给 program。DSH 插件形态不提供后台任务参数（background/job/list/wait_ms/kill）；' +
+      '需要后台任务请用 MCP 形态 `fsops mcp`。'
+    )
+  },
+}
+
 /** 把一个 JSON-Schema 节点投影成 DSH DSL 节点。 */
 function projectNode(node, inPropertyMap) {
   const out = {}
@@ -54,6 +71,13 @@ function projectNode(node, inPropertyMap) {
     return out
   }
   if (node.type === 'object') {
+    // 自由映射（MCP 只声明 type:"object"，例如 fs_exec.env 的任意环境变量）必须保留
+    // “可以带任意键”。DSH 的 value-schema DSL 没有开放对象写法，用 json 表达最接近；
+    // 若投影成空对象 + additionalProperties:false，宿主会拒绝一切键（评测 P1）。
+    if (Object.keys(node.properties ?? {}).length === 0 && node.additionalProperties !== false) {
+      out.type = 'json'
+      return out
+    }
     out.type = 'object'
     out.additionalProperties = node.additionalProperties === true
     out.properties = projectProperties(node, inPropertyMap)
@@ -83,7 +107,10 @@ export function projectSpecs(defs) {
     const schema = def.inputSchema ?? {}
     const spec = { name: def.name }
     if (READ_ONLY.has(def.name)) spec.readOnly = true
-    if (typeof def.description === 'string') spec.description = def.description
+    if (typeof def.description === 'string') {
+      const patch = DESCRIPTION_PATCHES[def.name]
+      spec.description = patch === undefined ? def.description : patch(def.description)
+    }
     spec.parameters = projectProperties(schema, true, def.name)
     return spec
   })

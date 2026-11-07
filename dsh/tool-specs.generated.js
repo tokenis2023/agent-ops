@@ -192,31 +192,24 @@ export const TOOL_SPECS = [
                 "additionalProperties": false,
                 "properties": {
                   "all": {
-                    "description": "替换全部出现位置",
                     "type": "boolean"
                   },
                   "end": {
-                    "description": "行范围结束行（含）；省略表示到文件末尾",
                     "type": "integer"
                   },
                   "new": {
-                    "description": "替换内容，空串表示删除；与 replacement 二选一",
                     "type": "string"
                   },
                   "old": {
-                    "description": "原文片段（需唯一，除非 all=true）；与 pattern 二选一",
                     "type": "string"
                   },
                   "pattern": {
-                    "description": "正则模式：替换范围内所有匹配，可用 $1 引用捕获组；不知道确切原文时用它，省掉为抄原文而做的一次 fs_read",
                     "type": "string"
                   },
                   "replacement": {
-                    "description": "正则替换内容，与 pattern 配套",
                     "type": "string"
                   },
                   "start": {
-                    "description": "限定替换只发生在第 start..=end 行内（1 基）；配合 all=true 只改某个函数内的重复字面量",
                     "type": "integer"
                   }
                 }
@@ -248,11 +241,10 @@ export const TOOL_SPECS = [
   },
   {
     "name": "fs_write",
-    "description": "写入文件。优先替代 write_file/Write。原子替换、自动建目录、保留原有编码与换行风格；文本外也支持生成 DOCX（纯文本段落，整体重建）。",
+    "description": "写入文件。优先替代 write_file/Write。原子替换、自动建目录、保留原有编码与换行风格；文本外也支持生成 DOCX（纯文本段落，整体重建）。多文件用 files 一次提交（全部预检通过才写），不要一个文件一轮。",
     "parameters": {
       "content": {
-        "type": "string",
-        "required": true
+        "type": "string"
       },
       "dry_run": {
         "description": "只做路径/编码/换行/hash 预检，不创建也不覆盖文件",
@@ -262,13 +254,34 @@ export const TOOL_SPECS = [
         "description": "并发保护：文件已变则拒绝覆盖",
         "type": "string"
       },
+      "files": {
+        "description": "多文件批量写入（一次建 10 个文件不再 10 轮）；全部预检通过才写入，最多 50 个；与 path/content 互斥",
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "content": {
+              "type": "string"
+            },
+            "expect_hash": {
+              "type": "string"
+            },
+            "normalize_eol": {
+              "type": "boolean"
+            },
+            "path": {
+              "type": "string"
+            }
+          }
+        }
+      },
       "normalize_eol": {
         "description": "新文件或原文件为混合换行时，显式归一为主换行风格（多数行使用的风格，平局取 LF）；已有稳定文件始终沿用原换行",
         "type": "boolean"
       },
       "path": {
-        "type": "string",
-        "required": true
+        "type": "string"
       }
     }
   },
@@ -340,6 +353,13 @@ export const TOOL_SPECS = [
         "description": "上下文行数（最多 5）；matches 默认 0，snippets 默认 2",
         "type": "integer"
       },
+      "expand": {
+        "description": "expand=block：把每条命中展开成它所在的完整代码块（花括号配平）。省掉「grep 拿行号 → fs_read block=true 再读一遍」那一轮；只在 matches/snippets 生效，预算不足时降级为普通命中行",
+        "type": "string",
+        "enum": [
+          "block"
+        ]
+      },
       "glob": {
         "description": "只看匹配的文件，如 **/*.ts",
         "type": "string"
@@ -348,7 +368,7 @@ export const TOOL_SPECS = [
         "type": "boolean"
       },
       "limit": {
-        "description": "本页上限：files 按文件，matches/snippets 按命中，count 显式设置时按命中；默认 100（count 省略时完整统计），必须大于 0",
+        "description": "本页上限：files 按文件，matches/snippets 按命中，count 显式设置时按命中；默认 200（count 省略时完整统计），必须大于 0；预算才是真正的输出上限",
         "type": "integer"
       },
       "max_file_size": {
@@ -428,7 +448,7 @@ export const TOOL_SPECS = [
   },
   {
     "name": "fs_exec",
-    "description": "执行程序（argv 数组，不经过 shell）。替代 PowerShell 跑 cargo/git/npm/python：没有引号/插值、2>&1、ErrorRecord、$LASTEXITCODE 问题。非零退出不是错误（前缀写 exit=N 非零，要当失败使用 check=true）；超时会结束整个进程树。启动任务必须给 program；只轮询/终止用 job=<id>，列任务用 list=true。",
+    "description": "执行程序（argv 数组，不经过 shell）。替代 PowerShell 跑 cargo/git/npm/python：没有引号/插值、2>&1、ErrorRecord、$LASTEXITCODE 问题。非零退出不是错误（前缀写 exit=N 非零，要当失败使用 check=true）；超时会结束整个进程树。启动任务必须给 program。DSH 插件形态不提供后台任务参数（background/job/list/wait_ms/kill）；需要后台任务请用 MCP 形态 `fsops mcp`。",
     "parameters": {
       "args": {
         "description": "参数数组，每个参数独立，不拼字符串",
@@ -447,9 +467,7 @@ export const TOOL_SPECS = [
       },
       "env": {
         "description": "追加/覆盖环境变量，如 {\"RUST_BACKTRACE\":\"1\"}",
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {}
+        "type": "json"
       },
       "max_output": {
         "description": "每条流最多保留字节，默认 32768",

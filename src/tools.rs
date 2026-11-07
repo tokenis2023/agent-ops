@@ -81,7 +81,7 @@ pub fn tool_defs() -> Vec<Value> {
                     "edits": {
                         "type": "array",
                         "description": "单文件的修改列表",
-                        "items": edit_item_schema()
+                        "items": edit_item_schema(false)
                     },
                     "files": {
                         "type": "array",
@@ -90,7 +90,7 @@ pub fn tool_defs() -> Vec<Value> {
                             "type": "object",
                             "properties": {
                                 "path": {"type": "string"},
-                                "edits": {"type": "array", "items": edit_item_schema()},
+                                "edits": {"type": "array", "items": edit_item_schema(true)},
                                 "expect_hash": {"type": "string", "description": "该文件的并发保护指纹"},
                                 "normalize_eol": {"type": "boolean", "description": "该文件含混合换行时，显式允许归一为主换行风格（多数行使用的风格，平局取 LF）"}
                             },
@@ -107,17 +107,31 @@ pub fn tool_defs() -> Vec<Value> {
         }),
         json!({
             "name": "fs_write",
-            "description": "写入文件。优先替代 write_file/Write。原子替换、自动建目录、保留原有编码与换行风格；文本外也支持生成 DOCX（纯文本段落，整体重建）。",
+            "description": "写入文件。优先替代 write_file/Write。原子替换、自动建目录、保留原有编码与换行风格；文本外也支持生成 DOCX（纯文本段落，整体重建）。多文件用 files 一次提交（全部预检通过才写），不要一个文件一轮。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
                     "content": {"type": "string"},
+                    "files": {
+                        "type": "array",
+                        "description": "多文件批量写入（一次建 10 个文件不再 10 轮）；全部预检通过才写入，最多 50 个；与 path/content 互斥",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string"},
+                                "content": {"type": "string"},
+                                "expect_hash": {"type": "string"},
+                                "normalize_eol": {"type": "boolean"}
+                            },
+                            "required": ["path", "content"]
+                        }
+                    },
                     "normalize_eol": {"type": "boolean", "description": "新文件或原文件为混合换行时，显式归一为主换行风格（多数行使用的风格，平局取 LF）；已有稳定文件始终沿用原换行"},
                     "expect_hash": {"type": "string", "description": "并发保护：文件已变则拒绝覆盖"},
                     "dry_run": {"type": "boolean", "description": "只做路径/编码/换行/hash 预检，不创建也不覆盖文件"}
                 },
-                "required": ["path", "content"]
+                "required": []
             }
         }),
         json!({
@@ -158,7 +172,12 @@ pub fn tool_defs() -> Vec<Value> {
                         "description": "files 每个匹配文件只给路径；count 给路径和真实行命中数（默认完整统计）；matches 给命中行；snippets 默认带 2 行上下文"
                     },
                     "context": {"type": "integer", "description": "上下文行数（最多 5）；matches 默认 0，snippets 默认 2"},
-                    "limit": {"type": "integer", "description": "本页上限：files 按文件，matches/snippets 按命中，count 显式设置时按命中；默认 100（count 省略时完整统计），必须大于 0"},
+                    "expand": {
+                        "type": "string",
+                        "enum": ["block"],
+                        "description": "expand=block：把每条命中展开成它所在的完整代码块（花括号配平）。省掉「grep 拿行号 → fs_read block=true 再读一遍」那一轮；只在 matches/snippets 生效，预算不足时降级为普通命中行"
+                    },
+                    "limit": {"type": "integer", "description": "本页上限：files 按文件，matches/snippets 按命中，count 显式设置时按命中；默认 200（count 省略时完整统计），必须大于 0；预算才是真正的输出上限"},
                     "max_per_file": {"type": "integer", "description": "每个文件最多返回的命中数，默认不限制；省略部分会在尾注说明"},
                     "max_line": {"type": "integer", "description": "命中行最多显示字符数，默认 240（与 fs_read 一致）；0 表示不截断，一次拿到完整长行，省掉再 fs_read 一轮"},
                     "offset": {"type": "integer", "description": "files 跳过前 N 个匹配文件，其他模式跳过前 N 个命中；用于 next_offset 续取"},
@@ -365,6 +384,74 @@ fn enclosing_block(lines: &[&str], start: usize) -> Option<(usize, usize)> {
     Some((from, to))
 }
 
+/// 把 grep 命中行展开成它所在的完整代码块（供 `fs_grep expand=block`）。
+///
+/// 只对花括号语言有意义：`enclosing_block` 找不到边界时，该命中保持原样（只给行）。
+/// 同一文件的多条命中若落在同一个块里，只输出一次，避免重复内容撑爆上下文。
+fn expand_hits_to_blocks(r: &search::GrepResult, root: &FsPath) -> Option<String> {
+    if r.hits.is_empty() {
+        return None;
+    }
+    // 每个文件只读一次。按首次出现顺序处理，输出顺序对模型更可预测。
+    let mut order: Vec<&str> = Vec::new();
+    let mut by_file: std::collections::HashMap<&str, Vec<usize>> = std::collections::HashMap::new();
+    for hit in &r.hits {
+        if hit.is_context {
+            continue;
+        }
+        let entry = by_file.entry(hit.path.as_str()).or_default();
+        if entry.is_empty() {
+            order.push(hit.path.as_str());
+        }
+        if !entry.contains(&hit.line) {
+            entry.push(hit.line);
+        }
+    }
+    let mut out = String::new();
+    for path in order {
+        // grep 返回的 path 相对搜索根；直接 parse 会按进程 cwd 解析而读不到。
+        let joined = std::path::Path::new(&root.native()).join(path);
+        let fp = match FsPath::parse(&joined.to_string_lossy()) {
+            Ok(fp) => fp,
+            Err(_) => continue,
+        };
+        let snapshot = match io::read_snapshot(&fp) {
+            Ok(snapshot) => snapshot,
+            Err(_) => continue,
+        };
+        let lines: Vec<&str> = snapshot.doc.text.split('\n').collect();
+        let mut printed: Vec<(usize, usize)> = Vec::new();
+        for line in by_file.get(path).into_iter().flatten() {
+            let (from, to) = match enclosing_block(&lines, *line) {
+                Some(range) => range,
+                None => (*line, *line),
+            };
+            // 同一个块里的多条命中只打印一次（grep 常在一个函数里命中好几行）。
+            if printed.iter().any(|(a, b)| from >= *a && to <= *b) {
+                continue;
+            }
+            if out.is_empty() {
+                out.push_str(path);
+            } else {
+                out.push('\n');
+                out.push_str(path);
+            }
+            out.push('\n');
+            for n in from..=to.min(lines.len()) {
+                let text = lines.get(n - 1).copied().unwrap_or("");
+                let sep = if n == *line { ":" } else { "-" };
+                out.push_str(&format!("{n}{sep}{text}\n"));
+            }
+            printed.push((from, to));
+        }
+    }
+    if out.is_empty() {
+        return None;
+    }
+    out.push_str("… expand=block：已把命中展开为所在代码块；只需了解命中行本身时去掉该参数");
+    Some(out)
+}
+
 /// 从起始行按括号配平推算代码块的结束行。
 ///
 /// 模型从 `fs_grep` 得知"fn foo 在第 N 行"后，无法预知函数有多长：
@@ -406,7 +493,27 @@ fn block_end(lines: &[&str], start: usize) -> Option<usize> {
 ///
 /// `edits` 与 `files[].edits` 必须同形：分开手写会出现一处更新、另一处漂移，
 /// 模型在 `files` 里只能看到一个空对象，只能靠猜字段名。
-fn edit_item_schema() -> serde_json::Value {
+/// fs_edit 的单条修改项 schema。
+///
+/// `compact` 用于 `files[].edits`：字段名与类型必须与顶层完全一致（校验靠它），
+/// 但 7 条说明在嵌套里重复一遍要多花约 700 字符——工具 schema 每轮都进上下文，
+/// 这是纯浪费。嵌套处只留字段名，模型看顶层说明即可。
+fn edit_item_schema(compact: bool) -> serde_json::Value {
+    if compact {
+        return json!({
+            "type": "object",
+            "properties": {
+                "old": {"type": "string"},
+                "new": {"type": "string"},
+                "pattern": {"type": "string"},
+                "replacement": {"type": "string"},
+                "all": {"type": "boolean"},
+                "start": {"type": "integer", "minimum": 1},
+                "end": {"type": "integer", "minimum": 1}
+            },
+            "required": []
+        });
+    }
     json!({
         "type": "object",
         "properties": {
@@ -876,8 +983,12 @@ fn focus_blocks(
     pattern: &str,
     data_file: bool,
 ) -> Result<FocusBlocks, String> {
-    let regex = regex::Regex::new(pattern)
-        .map_err(|e| format!("E_BAD_REGEX 正则非法: {e}；检查转义，或先用 fs_grep 确认形状"))?;
+    let regex = regex::Regex::new(pattern).map_err(|e| {
+        format!(
+            "E_BAD_REGEX 正则非法: {e}；检查转义，或先用 fs_grep 确认形状；{}",
+            crate::search::REGEX_DIALECT_HINT
+        )
+    })?;
     let mut blocks: Vec<(usize, usize)> = Vec::new();
     for (offset, line) in index.lines().iter().enumerate() {
         if regex.is_match(line) {
@@ -2041,6 +2152,11 @@ mod tests {
             "应明确报只读而不是 E_BATCH_PARTIAL: {out}"
         );
         assert!(!out.contains("E_BATCH_PARTIAL"));
+        assert!(
+            out.contains("Set-ItemProperty"),
+            "应给可直接照做的 PowerShell 命令: {out}"
+        );
+        assert!(out.contains("IsReadOnly"), "{out}");
     }
 
     #[test]
@@ -2522,6 +2638,46 @@ mod tests {
         assert_eq!(after, "a\n", "拒绝后文件必须一字不改");
     }
 
+    #[test]
+    fn 半行old截断在词中间时给警告() {
+        // 实测踩坑：文件是 `# mini-task-service`，从片段抄了 `# mini-task-servic`，
+        // 替换后留下 `# 新标题e`——工具返回 ok，内容却坏了，要等下一轮 fs_read 才发现。
+        let dir = 临时目录("edit-half-word");
+        let f = dir.join("README.md");
+        fs::write(&f, "# mini-task-service\n").unwrap();
+        let out = call(
+            "fs_edit",
+            &json!({"path": f.to_string_lossy().replace('\\', "/"),
+                    "edits": [{"old": "# mini-task-servic", "new": "# 新标题"}]}),
+        );
+        let _ = fs::remove_dir_all(&dir);
+        assert!(out.starts_with("ok"), "仍应成功（只是提示）: {out}");
+        assert!(out.contains("截断在词中间"), "应提示半行 old: {out}");
+        assert!(out.contains("mini-task-service"), "应给出原文整行: {out}");
+    }
+
+    #[test]
+    fn 整词与行内片段替换不报警告() {
+        // 正常编辑不该被提示干扰，否则警告会被模型当噪声忽略。
+        let dir = 临时目录("edit-no-half-word");
+        let f = dir.join("a.txt");
+        fs::write(&f, "let limit_0 = 100;\nconst x = 1 + 2;\n").unwrap();
+        let path = f.to_string_lossy().replace('\\', "/");
+        let whole = call(
+            "fs_edit",
+            &json!({"path": path, "edits": [{"old": "limit_0", "new": "cap_0"}]}),
+        );
+        assert!(!whole.contains("截断在词中间"), "整词替换不该警告: {whole}");
+        let inline = call(
+            "fs_edit",
+            &json!({"path": path, "edits": [{"old": "1 + 2", "new": "3"}]}),
+        );
+        assert!(
+            !inline.contains("截断在词中间"),
+            "行内片段不该警告: {inline}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
     #[test]
     fn 同一行多处修改只算一次行数() {
         // `+N -M` 表达"改动了几行"，不是"执行了几次替换"。
@@ -3085,11 +3241,18 @@ fn next_fn() {
             "output": "count",
             "limit": 100
         }));
-        // matches 模式默认仍受 limit 约束
+        // matches 模式默认 limit=200：150 条能一次装完（旧默认 100 要多翻一页，
+        // 那一页要把整个上下文重发一次）。超过默认值仍应给 next_offset。
         let matches = grep_tool(&json!({
             "path": root.display(),
             "pattern": "needle",
             "output": "matches"
+        }));
+        let overflow = grep_tool(&json!({
+            "path": root.display(),
+            "pattern": "needle",
+            "output": "matches",
+            "limit": 20
         }));
         let _ = fs::remove_dir_all(&dir);
 
@@ -3100,8 +3263,12 @@ fn next_fn() {
         assert!(!out.contains("本页可见"), "未截断不应标注: {out}");
         assert!(capped.contains("本页可见"), "显式 limit 仍应标注: {capped}");
         assert!(
-            matches.contains("next_offset"),
-            "matches 仍受 limit 约束: {matches}"
+            !matches.contains("next_offset") && matches.contains("150 处命中"),
+            "matches 默认 200 应一次装完 150 条: {matches}"
+        );
+        assert!(
+            overflow.contains("next_offset"),
+            "超过 limit 时仍给 next_offset: {overflow}"
         );
     }
 
@@ -3176,6 +3343,70 @@ fn next_fn() {
     }
 
     #[test]
+    fn 批量写入一次建多个文件() {
+        // 建 10 个文件不该 10 轮：fs_edit 早就有 files，fs_write 没有是明显不对称。
+        let dir = 临时目录("write-batch");
+        let files: Vec<Value> = (0..10)
+            .map(|i| {
+                json!({
+                    "path": dir.join(format!("m{i}.js")).to_string_lossy().replace('\\', "/"),
+                    "content": format!("// module {i}\n"),
+                })
+            })
+            .collect();
+        let out = call("fs_write", &json!({ "files": files }));
+        assert!(out.starts_with("ok 10 个文件已写入"), "{out}");
+        for i in 0..10 {
+            assert!(dir.join(format!("m{i}.js")).exists(), "m{i}.js 未写入");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 批量写入预检失败时一个都不写() {
+        // 与 fs_edit files 一致：全部预检通过才写入，不留“写了一半”。
+        let dir = 临时目录("write-batch-preflight");
+        let out = call(
+            "fs_write",
+            &json!({"files": [
+                {"path": dir.join("a.txt").to_string_lossy().replace('\\', "/"), "content": "a\n"},
+                {"path": dir.join("b.txt").to_string_lossy().replace('\\', "/"), "content": 42}
+            ]}),
+        );
+        assert!(out.starts_with("E_BATCH"), "{out}");
+        assert!(
+            !dir.join("a.txt").exists(),
+            "预检失败不该写出任何文件: {out}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 批量写入拒绝与单文件混用() {
+        let dir = 临时目录("write-batch-mixed");
+        let out = call(
+            "fs_write",
+            &json!({"path": dir.join("x.txt").to_string_lossy().replace('\\', "/"), "content": "a", "files": []}),
+        );
+        assert!(out.starts_with("E_BAD_ARGS"), "{out}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 批量写入dry_run不落盘() {
+        let dir = 临时目录("write-batch-dry");
+        let out = call(
+            "fs_write",
+            &json!({"dry_run": true, "files": [
+                {"path": dir.join("a.txt").to_string_lossy().replace('\\', "/"), "content": "a\n"}
+            ]}),
+        );
+        assert!(out.starts_with("ok dry_run"), "{out}");
+        assert!(!dir.join("a.txt").exists(), "dry_run 不该落盘: {out}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn 写入目录时报目录错误而不是拒绝访问() {
         // 旧实现会在 rename 阶段报 `E_RENAME 拒绝访问`，模型看不出真正原因。
         let dir = 临时目录("write-to-dir");
@@ -3188,6 +3419,11 @@ fn next_fn() {
         assert!(out.starts_with("E_IS_DIR"), "应报目录错误: {out}");
         assert!(out.contains("是目录"), "{out}");
         assert!(!out.contains("E_RENAME"), "不应泄漏底层 rename 错误: {out}");
+        assert!(
+            out.contains("fs_glob"),
+            "写入目录也给列出内容的下一步: {out}"
+        );
+        assert!(out.contains("改为文件路径"), "{out}");
     }
 
     #[test]
@@ -4265,8 +4501,10 @@ fn next_fn() {
 
     #[test]
     fn edit_schema两处嵌套结构一致() {
-        // `edits` 与 `files[].edits` 分开手写会漂移；
-        // 嵌套处若只剩 {"type":"object"}，模型只能猜字段名。
+        // `edits` 与 `files[].edits` 分开手写会漂移；嵌套处若只剩 {"type":"object"}，
+        // 模型只能猜字段名。但嵌套处复制一份完整描述要多花约 700 字符 schema，
+        // 而 schema 每轮都进上下文——所以只要求「字段名 + 类型 + enum」一致，
+        // 描述可以在嵌套处省略（顶层已经写清了）。
         let defs = tool_defs();
         let edit = defs
             .iter()
@@ -4275,9 +4513,23 @@ fn next_fn() {
         let props = &edit["inputSchema"]["properties"];
         let single = &props["edits"]["items"];
         let nested = &props["files"]["items"]["properties"]["edits"]["items"];
+        let shape = |node: &Value| -> Value {
+            let mut out = serde_json::Map::new();
+            for (key, spec) in node["properties"].as_object().expect("必须有 properties") {
+                let mut item = serde_json::Map::new();
+                for field in ["type", "enum", "minimum"] {
+                    if let Some(value) = spec.get(field) {
+                        item.insert(field.to_string(), value.clone());
+                    }
+                }
+                out.insert(key.clone(), Value::Object(item));
+            }
+            Value::Object(out)
+        };
         assert_eq!(
-            single["properties"], nested["properties"],
-            "两处 items 必须同形"
+            shape(single),
+            shape(nested),
+            "两处 items 的字段与类型必须一致"
         );
         // pattern 模式下不需要 old，所以两个字段都不强制。
         assert_eq!(nested["required"], json!([]));
@@ -4314,6 +4566,67 @@ fn next_fn() {
         }
     }
 
+    #[test]
+    fn expand_同一块内多命中只输出一次() {
+        // grep 常在一个函数里命中好几行；展开时重复输出同一个块会白白撑爆上下文。
+        let dir = 临时目录("grep-expand-dedup");
+        fs::write(
+            dir.join("a.rs"),
+            "fn alpha() {\n    // TODO one\n    // TODO two\n}\n",
+        )
+        .unwrap();
+        let path = dir.to_string_lossy().replace('\\', "/");
+        let out = grep_tool(
+            &json!({"pattern": "TODO", "path": path, "output": "snippets", "context": 0, "expand": "block"}),
+        );
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(
+            out.matches("fn alpha()").count(),
+            1,
+            "同一块只应输出一次: {out}"
+        );
+        assert!(
+            out.contains("TODO one") && out.contains("TODO two"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn expand_非花括号语言退回命中行() {
+        // Python 等缩进语言没有花括号：找不到块边界时只给命中行，不能假装展开。
+        let dir = 临时目录("grep-expand-fallback");
+        fs::write(dir.join("a.py"), "def alpha():\n    x = 1  # TODO\n").unwrap();
+        let path = dir.to_string_lossy().replace('\\', "/");
+        let out = grep_tool(
+            &json!({"pattern": "TODO", "path": path, "output": "snippets", "context": 0, "expand": "block"}),
+        );
+        let _ = fs::remove_dir_all(&dir);
+        assert!(out.contains("TODO"), "仍要给出命中: {out}");
+    }
+    #[test]
+    fn expand_把命中展开成整块() {
+        let dir = 临时目录("grep-expand-block");
+        fs::write(
+            dir.join("a.rs"),
+            "fn alpha() {\n    let x = 1;\n    let todo = \"TODO\";\n    x + 1\n}\n",
+        )
+        .unwrap();
+        let path = dir.to_string_lossy().replace('\\', "/");
+        let plain = grep_tool(
+            &json!({"pattern": "TODO", "path": path, "output": "snippets", "context": 0}),
+        );
+        let expanded = grep_tool(
+            &json!({"pattern": "TODO", "path": path, "output": "snippets", "context": 0, "expand": "block"}),
+        );
+        fs::remove_dir_all(dir).unwrap();
+        assert!(plain.contains("3:    let todo"), "{plain}");
+        assert!(!plain.contains("1-fn alpha"), "普通模式不该展开: {plain}");
+        assert!(
+            expanded.contains("1-fn alpha()"),
+            "应展开块首行: {expanded}"
+        );
+        assert!(expanded.contains("5-}"), "应展开到块尾: {expanded}");
+    }
     #[test]
     fn grep_files模式只返回文件名() {
         let dir = 临时目录("grep-files");
@@ -4419,8 +4732,10 @@ fn next_fn() {
         }));
         fs::remove_dir_all(dir).unwrap();
 
+        // 摘要头是新加的：一次调用就给出「几个文件、分布在哪」，省掉先 files 再 count 两轮。
         assert_eq!(
-            output, "a.txt\n1-top1\n2-top2\n3:needle\n4-after1\n5-after2",
+            output,
+            "ok 共 1 个文件 1 处命中；最多：a.txt:1\na.txt\n1-top1\n2-top2\n3:needle\n4-after1\n5-after2",
             "{output}"
         );
     }
@@ -4438,7 +4753,10 @@ fn next_fn() {
         }));
         fs::remove_dir_all(dir).unwrap();
 
-        assert_eq!(output, "a.txt\n1-before\n2:needle\n3-after", "{output}");
+        assert_eq!(
+            output, "ok 共 1 个文件 1 处命中；最多：a.txt:1\na.txt\n1-before\n2:needle\n3-after",
+            "{output}"
+        );
     }
 
     #[test]
@@ -5078,7 +5396,9 @@ fn prepare_edit(
         .unwrap_or(false)
     {
         return Err(format!(
-            "E_READONLY {} 是只读文件；先去掉只读属性再编辑",
+            "E_READONLY {} 是只读文件；先去掉只读属性（PowerShell: \
+             Set-ItemProperty -Path '{}' -Name IsReadOnly -Value $false）再编辑",
+            fp.display(),
             fp.display()
         ));
     }
@@ -5283,6 +5603,10 @@ fn edit_tool(args: &Value) -> String {
         if arg_bool(args, "diff", false) {
             out.push_str(&render_hunks(&item.result.hunks));
         }
+        for warning in &item.result.warnings {
+            out.push_str("\n  ⚠ ");
+            out.push_str(warning);
+        }
         return out;
     }
 
@@ -5299,6 +5623,10 @@ fn edit_tool(args: &Value) -> String {
         ));
         if arg_bool(args, "diff", false) {
             out.push_str(&render_hunks(&item.result.hunks));
+        }
+        for warning in &item.result.warnings {
+            out.push_str("\n  ⚠ ");
+            out.push_str(warning);
         }
     }
     out
@@ -5335,7 +5663,115 @@ fn render_hunks(hunks: &[crate::edit::Hunk]) -> String {
     out
 }
 
+/// fs_write 批量：一次建/覆盖多个文件。
+///
+/// 为什么要有：`fs_edit` 早就有 `files` 批量，`fs_write` 没有——改 10 个文件 1 轮，
+/// 建 10 个文件 10 轮。生成类任务（脚手架、测试夹具、多文件代码生成）里每一轮都要
+/// 重发整个上下文，这是最贵的浪费。语义对齐 `fs_edit files`：全部预检通过才写入。
 fn write(args: &Value) -> String {
+    let batch = match args.get("files").and_then(Value::as_array) {
+        Some(files) => files,
+        None => return write_one(args),
+    };
+    if args.get("path").is_some() || args.get("content").is_some() {
+        return "E_BAD_ARGS path/content 与 files 不能混用".into();
+    }
+    if batch.is_empty() {
+        return "E_BAD_ARGS files 不能为空".into();
+    }
+    if batch.len() > 50 {
+        return "E_BAD_ARGS 一次最多写入 50 个文件".into();
+    }
+    let global_dry_run = arg_bool(args, "dry_run", false);
+    let global_normalize = arg_bool(args, "normalize_eol", false);
+
+    // 每个文件单独成 args，复用单文件逻辑（路径/编码/换行/hash 校验完全相同）。
+    let mut items: Vec<(String, serde_json::Map<String, Value>)> = Vec::with_capacity(batch.len());
+    let mut seen: Vec<String> = Vec::new();
+    for (index, item) in batch.iter().enumerate() {
+        let path = match item.get("path").and_then(Value::as_str) {
+            Some(path) if !path.is_empty() => path,
+            _ => return format!("E_BATCH 第{}个文件缺少 path", index + 1),
+        };
+        let fp = match FsPath::parse(path) {
+            Ok(fp) => fp,
+            Err(e) => return format!("E_BATCH {path}: E_BAD_PATH {e}"),
+        };
+        let shown = fp.display();
+        if seen.contains(&shown) {
+            return format!("E_BATCH 重复路径 {shown}；同一文件请合并为一项");
+        }
+        seen.push(shown);
+        let mut single = serde_json::Map::new();
+        single.insert("path".into(), Value::String(path.to_string()));
+        match item.get("content") {
+            Some(content @ Value::String(_)) => {
+                single.insert("content".into(), content.clone());
+            }
+            Some(other) => {
+                return format!(
+                    "E_BATCH {path}: content 必须是字符串；当前是 {}",
+                    type_name(other)
+                )
+            }
+            None => return format!("E_BATCH {path}: 缺少 content"),
+        }
+        if let Some(expect) = item.get("expect_hash").and_then(Value::as_str) {
+            single.insert("expect_hash".into(), Value::String(expect.to_string()));
+        }
+        if global_normalize || arg_bool(item, "normalize_eol", false) {
+            single.insert("normalize_eol".into(), Value::Bool(true));
+        }
+        items.push((path.to_string(), single));
+    }
+
+    if global_dry_run {
+        // 预演：逐项跑完整校验（不落盘），任何一项失败都不写。
+        let mut lines = Vec::with_capacity(items.len());
+        for (path, single) in &items {
+            let mut args = single.clone();
+            args.insert("dry_run".into(), Value::Bool(true));
+            let out = write_one(&Value::Object(args));
+            if !out.starts_with("ok") {
+                return format!("E_BATCH {path}: {out}");
+            }
+            lines.push(out);
+        }
+        return format!(
+            "ok dry_run: {} 个文件将写入（未落盘）\n{}",
+            items.len(),
+            lines.join("\n")
+        );
+    }
+
+    // 两阶段：先全部预检，再统一写入。预检失败时一个文件都不动，
+    // 避免"写了一半"这种最难排查的中间态。
+    for (path, single) in &items {
+        let mut args = single.clone();
+        args.insert("dry_run".into(), Value::Bool(true));
+        let out = write_one(&Value::Object(args));
+        if !out.starts_with("ok") {
+            return format!("E_BATCH {path}: {out}");
+        }
+    }
+    let mut lines = Vec::with_capacity(items.len());
+    let mut written = 0usize;
+    for (path, single) in &items {
+        let out = write_one(&Value::Object(single.clone()));
+        if !out.starts_with("ok") {
+            // 预检已通过，这里失败通常是并发改动/IO 故障；如实报告已写入数量。
+            return format!(
+                "E_BATCH {path}: {out}（已写入 {written}/{} 个文件，其余未动）",
+                items.len()
+            );
+        }
+        written += 1;
+        lines.push(out);
+    }
+    format!("ok {} 个文件已写入\n{}", written, lines.join("\n"))
+}
+
+fn write_one(args: &Value) -> String {
     let path = match arg_str(args, "path") {
         Some(p) => p,
         None => return "E_BAD_ARGS 缺少 path".into(),
@@ -5644,9 +6080,13 @@ fn grep_tool(args: &Value) -> String {
         None if output == GrepOutput::Snippets => 2,
         None => 0,
     };
-    let mut limit = arg_usize(args, "limit", 100);
+    // 默认 200（原 100）：预算才是真正的上限（默认 32KB，渲染层按 budget 收敛），
+    // limit 只是"最多取多少条"的保护。100 条在小仓库里经常卡在翻页边界上，
+    // 模型要多跑一轮 offset=100 才拿到剩下的命中——而那一轮要把整个上下文重发一次。
+    // 给到 200 让常见仓库一次装完，超出预算时仍会截断并给 next_offset。
+    let mut limit = arg_usize(args, "limit", 200);
     if limit == 0 {
-        return render::truncate_utf8("E_BAD_ARGS limit 必须大于 0；省略表示默认 100", budget)
+        return render::truncate_utf8("E_BAD_ARGS limit 必须大于 0；省略表示默认 200", budget)
             .to_string();
     }
     // count 模式是"统计"，受 limit 截断会得出错误的数字
@@ -5735,15 +6175,74 @@ fn grep_tool(args: &Value) -> String {
                 )
                 .to_string();
             }
+            // expand=block：把每条命中展开成它所在的完整代码块。
+            // 真实编码循环是「grep 拿行号 → fs_read block=true 读实现」，两轮；
+            // 这里把第二步吞掉。只对 matches/snippets 生效，读不到块时退回原命中行。
+            let expanded = if arg_str(args, "expand") == Some("block")
+                && matches!(output, GrepOutput::Matches | GrepOutput::Snippets)
+            {
+                expand_hits_to_blocks(&r, &root)
+            } else {
+                None
+            };
             let mut rendered_matches = 0usize;
             let mut render_cut = false;
             let output = render::converge_budget(budget, |body_budget| {
-                let rendered = search::render_mode(&r, output, body_budget);
+                let rendered = match &expanded {
+                    Some(text) => {
+                        // 展开结果自己就是最终正文（已按预算收敛），不再走行渲染。
+                        let cut = text.len() > body_budget;
+                        let body = render::truncate_utf8(text, body_budget).to_string();
+                        rendered_matches = r.match_count;
+                        render_cut = cut;
+                        search::GrepRendered {
+                            text: body,
+                            matches_rendered: r.match_count,
+                            files_rendered: r.file_counts.len(),
+                            truncated: cut,
+                        }
+                    }
+                    None => search::render_mode(&r, output, body_budget),
+                };
                 rendered_matches = rendered.matches_rendered;
                 render_cut = rendered.truncated;
                 let mut text = rendered.text.trim_end().to_string();
                 if !skip_note.is_empty() {
                     text.push_str(&skip_note);
+                }
+                // 摘要头：一次调用就告诉模型「总共多少文件/命中、分布在哪」。
+                // 没有这一行时，模型必须先 fs_grep output=files 看范围、再 output=count
+                // 看分布，最后才回 snippets 看内容——同一个 pattern 白花两轮上下文。
+                if matches!(output, GrepOutput::Matches | GrepOutput::Snippets)
+                    && !r.file_counts.is_empty()
+                {
+                    let total_files = r.file_counts.len();
+                    let mut dist: Vec<(&str, usize)> = r
+                        .file_counts
+                        .iter()
+                        .map(|(path, count)| (path.as_str(), *count))
+                        .collect();
+                    dist.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+                    let shown_dist: Vec<String> = dist
+                        .iter()
+                        .take(5)
+                        .map(|(path, count)| format!("{path}:{count}"))
+                        .collect();
+                    let more = if total_files > shown_dist.len() {
+                        "…".to_string()
+                    } else {
+                        String::new()
+                    };
+                    let scope = if r.truncated { "本页覆盖 " } else { "共 " };
+                    text = format!(
+                        "ok {}{} 个文件 {} 处命中；最多：{}{}\n{}",
+                        scope,
+                        total_files,
+                        r.match_count,
+                        shown_dist.join(", "),
+                        more,
+                        text
+                    );
                 }
                 if r.timed_out {
                     text.push_str(&format!(
@@ -6183,6 +6682,23 @@ mod roundtrip_tests {
         let _ = fs::remove_dir_all(&dir);
         assert!(out.starts_with("E_NO_MATCH"), "{out}");
         assert!(out.contains("fs_grep"), "{out}");
+    }
+
+    #[test]
+    fn focus正则方言错误点明lookaround与反向引用() {
+        // focus 与 fs_grep/fs_edit 同用 Rust regex：PCRE 写法要直接点破方言差异。
+        let dir = 目录("focus-dialect");
+        let path = dir.join("a.rs");
+        fs::write(&path, "fn alpha() {}\n").unwrap();
+        let out = call(
+            "fs_read",
+            &json!({"path": path.to_string_lossy().replace('\\', "/"), "focus": "(?=alpha)"}),
+        );
+        let _ = fs::remove_dir_all(&dir);
+        assert!(out.starts_with("E_BAD_REGEX"), "{out}");
+        assert!(out.contains("lookaround"), "{out}");
+        assert!(out.contains("反向引用"), "{out}");
+        assert!(out.contains("${1}"), "{out}");
     }
 
     #[test]

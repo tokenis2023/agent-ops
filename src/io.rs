@@ -328,7 +328,10 @@ pub struct Snapshot {
 
 pub fn read_snapshot(fp: &FsPath) -> Result<Snapshot, String> {
     if fp.is_dir() {
-        return Err(format!("E_IS_DIR {} 是目录", fp.display()));
+        return Err(format!(
+            "E_IS_DIR {} 是目录；用 fs_glob 列出目录内容，或改为文件路径",
+            fp.display()
+        ));
     }
     let bytes = read_bytes(&fp.wide()).map_err(|e| with_path(e, fp))?;
     snapshot_from_bytes(fp, bytes)
@@ -338,7 +341,8 @@ pub fn read_snapshot(fp: &FsPath) -> Result<Snapshot, String> {
 pub fn snapshot_from_bytes(fp: &FsPath, bytes: Vec<u8>) -> Result<Snapshot, String> {
     if text::is_binary(&bytes) {
         return Err(format!(
-            "E_BINARY {} 是二进制文件（{}），fsops 只处理文本和 DOCX/PDF",
+            "E_BINARY {} 是二进制文件（{}），fsops 只处理文本和 DOCX/PDF；\
+             二进制/图片不解析（可回退宿主工具）；.docx/.pdf 请用 fs_read 读取正文",
             fp.display(),
             human_size(bytes.len() as u64)
         ));
@@ -396,7 +400,11 @@ pub fn read_large_window(
         ));
     }
     if sample[..sample.len().min(8192)].contains(&0) {
-        return Err(format!("E_BINARY {} 看起来是二进制文件", fp.display()));
+        return Err(format!(
+            "E_BINARY {} 看起来是二进制文件；二进制/图片不解析（可回退宿主工具）；\
+             .docx/.pdf 请用 fs_read 读取正文",
+            fp.display()
+        ));
     }
     // 样本是否被 64KB 截断：决定末尾孤立的 `\r` 可不可信（可能只是 CRLF 被切开）。
     let sample_truncated = (sample_len as u64) < size;
@@ -581,7 +589,7 @@ pub fn atomic_write(dp: &FsPath, bytes: &[u8]) -> Result<(), String> {
     // `E_RENAME 拒绝访问`，模型看不出真正原因。
     if native.is_dir() {
         return Err(format!(
-            "E_IS_DIR {} 是目录，不能用 fs_write 写入",
+            "E_IS_DIR {} 是目录，不能用 fs_write 写入；用 fs_glob 列出目录内容，或改为文件路径",
             dp.display()
         ));
     }
@@ -865,6 +873,93 @@ mod tests {
         assert_eq!(snapshot.bytes, bytes);
         assert_eq!(snapshot.doc.text, "中文\r\nabc\r\n");
         assert_eq!(snapshot.hash, hash_hex(&bytes));
+    }
+
+    #[test]
+    fn 读取目录时补fs_glob下一步() {
+        let dir = std::env::temp_dir().join(format!(
+            "fsops-read-dir-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fp = FsPath::parse(&dir.to_string_lossy()).unwrap();
+        let err = read_snapshot(&fp).unwrap_err();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(err.starts_with("E_IS_DIR"), "{err}");
+        assert!(err.contains("fs_glob"), "目录要给出列出内容的下一步: {err}");
+        assert!(err.contains("改为文件路径"), "{err}");
+    }
+
+    #[test]
+    fn 写入目录时补fs_glob下一步() {
+        let dir = std::env::temp_dir().join(format!(
+            "fsops-write-dir-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fp = FsPath::parse(&dir.to_string_lossy()).unwrap();
+        let err = atomic_write(&fp, b"x").unwrap_err();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(err.starts_with("E_IS_DIR"), "{err}");
+        assert!(err.contains("不能用 fs_write 写入"), "{err}");
+        assert!(
+            err.contains("fs_glob"),
+            "写入目录同样要给列出内容的下一步: {err}"
+        );
+    }
+
+    #[test]
+    fn 二进制快照补回退与docxpdf读取方式() {
+        let path = std::env::temp_dir().join(format!(
+            "fsops-binary-{}-{}.bin",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, [0u8, 1, 2, 3]).unwrap();
+        let fp = FsPath::parse(path.to_str().unwrap()).unwrap();
+        let err = read_snapshot(&fp).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert!(err.starts_with("E_BINARY"), "{err}");
+        assert!(err.contains("回退宿主工具"), "应给出回退手段: {err}");
+        assert!(
+            err.contains("fs_read 读取正文"),
+            "应说明 docx/pdf 的读取方式: {err}"
+        );
+    }
+
+    #[test]
+    fn 大文件窗口二进制探测补回退提示() {
+        let path = std::env::temp_dir().join(format!(
+            "fsops-window-binary-{}-{}.bin",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, b"abc\0def\n").unwrap();
+        let fp = FsPath::parse(path.to_str().unwrap()).unwrap();
+        let err = match read_large_window(&fp, 1, 1, false) {
+            Ok(_) => panic!("二进制文件应被拒绝"),
+            Err(e) => e,
+        };
+        let _ = std::fs::remove_file(&path);
+        assert!(err.starts_with("E_BINARY"), "{err}");
+        assert!(err.contains("回退宿主工具"), "{err}");
+        assert!(err.contains("fs_read 读取正文"), "{err}");
     }
 
     #[test]

@@ -51,6 +51,9 @@ pub struct EditResult {
     pub hunks: Vec<Hunk>,
     pub encoding: String,
     pub eol: String,
+    /// 字面量替换的可疑提示：old 恰好截断在标识符中间时会留下残句
+    /// （实测踩过 old="# mini-task-servic" 把标题改成 "# xe"）。
+    pub warnings: Vec<String>,
 }
 
 /// loci 只用于展示摘要，保留前若干个即可；全量保存会让大文件批量替换变成 O(n²)。
@@ -204,6 +207,14 @@ pub fn apply(original: &str, eol: Eol, edits: &[EditSpec]) -> Result<(String, Ed
             ));
         }
 
+        // 「半行 old」检测：old 掐在标识符/单词中间时，替换后会把原词切剩半截
+        // （old="# mini-task-servic" 少了最后一个字母，结果留下 "# xe"）。
+        // 只在「两侧都是同类词字符」时提示，避免误报正常的行内片段替换。
+        if let Some(notice) = half_word_notice(&work, &needle, &positions) {
+            if res.warnings.len() < 3 {
+                res.warnings.push(format!("第{}处 {notice}", i + 1));
+            }
+        }
         let targets = if e.all {
             positions.clone()
         } else {
@@ -253,8 +264,12 @@ fn apply_regex(
         .replacement
         .as_deref()
         .ok_or_else(|| format!("E_BAD_EDIT 第{ordinal}处：pattern 模式需要同时给出 replacement"))?;
-    let re = regex::Regex::new(pat)
-        .map_err(|err| format!("E_BAD_REGEX 第{ordinal}处 pattern 无效: {err}"))?;
+    let re = regex::Regex::new(pat).map_err(|err| {
+        format!(
+            "E_BAD_REGEX 第{ordinal}处 pattern 无效: {err}；{}",
+            crate::search::REGEX_DIALECT_HINT
+        )
+    })?;
     // 可匹配空位置的正则会命中每一处，等于把文件改烂。守卫与 fs_grep 共用：
     // 只看 `is_match("")` 会放过 `\b`（空串没有词边界，但每个词边界都命中）。
     if crate::search::matches_everywhere(&re) {
@@ -499,6 +514,43 @@ fn replace_at(work: &str, needle: &str, repl: &str, positions: &[usize]) -> (Str
     }
     out.push_str(&work[last..]);
     (out, lines)
+}
+
+/// 判断字面量是否恰好截断在词中间，返回可读提示。
+///
+/// 典型踩坑：文件里是 `# mini-task-service`，模型从 fs_grep 片段里抄了
+/// `# mini-task-servic`（少一个字母），替换后变成 `# xe`——工具返回 ok，
+/// 内容却坏了，要等下一次 fs_read 才发现，白花两轮。
+///
+/// 只在一侧相邻字符与 old 边界字符「同类」时提示：字母/数字/下划线视为同一类，
+/// 免得把 `let limit_0` 里的 `limit_0` 这种正常整词替换误报成可疑。
+fn half_word_notice(work: &str, needle: &str, positions: &[usize]) -> Option<String> {
+    let first = *positions.first()?;
+    let bytes = work.as_bytes();
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80;
+    let head_char = needle.chars().next()?;
+    let tail_char = needle.chars().next_back()?;
+    let tail_bytes = needle.len();
+    // 前边界：old 首字符前一个字节
+    let head_cut = first > 0 && bytes[first - 1] != b'\n';
+    let head_word = head_cut && (head_char as u8).is_ascii_alphanumeric();
+    // 后边界：old 末字节之后一个字节
+    let after = first + tail_bytes;
+    let tail_cut = after < bytes.len() && bytes[after] != b'\n';
+    let tail_word = tail_cut && (tail_char as u8).is_ascii_alphanumeric();
+    let cut_head = head_word && is_word(bytes[first - 1]);
+    let cut_tail = tail_word && is_word(bytes[after]);
+    if !cut_head && !cut_tail {
+        return None;
+    }
+    // 取整行做证据，让模型直接看到被切开的原词。
+    let line_start = work[..first].rfind('\n').map_or(0, |p| p + 1);
+    let line_end = work[first..].find('\n').map_or(work.len(), |p| first + p);
+    let line = &work[line_start..line_end];
+    Some(format!(
+        "提示：old `{needle}` 截断在词中间（原文 `{}`），替换后可能留下残句；先 fs_read 确认整行再改，或把完整词写进 old",
+        line.trim()
+    ))
 }
 
 fn push_locus(loci: &mut Vec<String>, line_no: usize, col_no: usize, repl: &str) {
@@ -749,6 +801,19 @@ mod tests {
         assert!(err.starts_with("E_NO_MATCH"), "{err}");
         let err = apply("abc\n", Eol::Lf, &[regex_spec("a*", "y")]).unwrap_err();
         assert!(err.starts_with("E_BAD_REGEX"), "{err}");
+    }
+
+    #[test]
+    fn 正则方言失败给出lookaround与反向引用提示() {
+        // 模型常把 PCRE 写法直接搬来：Rust regex 不支持 lookaround 与反向引用，
+        // 报错要直接点破方言差异，并给出捕获组引用的正确写法。
+        for pat in ["(?=a)", r"(a)\1"] {
+            let err = apply("a\n", Eol::Lf, &[regex_spec(pat, "b")]).unwrap_err();
+            assert!(err.starts_with("E_BAD_REGEX"), "{pat}: {err}");
+            assert!(err.contains("lookaround"), "{pat}: {err}");
+            assert!(err.contains("反向引用"), "{pat}: {err}");
+            assert!(err.contains("${1}"), "{pat}: {err}");
+        }
     }
 
     #[test]

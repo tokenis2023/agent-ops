@@ -27,6 +27,8 @@ const PLUGIN_VERSION = JSON.parse(readFileSync(resolve(PKG_ROOT, 'package.json')
 const MAX_STDOUT_BYTES = 8 * 1024 * 1024
 const MAX_STDERR_BYTES = 256 * 1024
 const GRACE_MS = 5000
+/** 长驻会话按 cwd 缓存；上限避免长命 Host 切换目录时进程无界累积（LRU 回收）。 */
+const MAX_SESSIONS = 8
 /** 与 fsops mcp 的 initialize 应答对齐（它原样回显请求的版本）。 */
 const MCP_PROTOCOL_VERSION = '2025-06-18'
 
@@ -35,6 +37,18 @@ const MCP_PROTOCOL_VERSION = '2025-06-18'
  * 保证描述与参数只有 Rust 一份真源（手写三份时漂移过 11 处）。
  */
 import { TOOL_SPECS } from './tool-specs.generated.js'
+
+/** 只读工具：取消时不必杀会话（没有副作用），也允许并发调用。 */
+const READ_ONLY_TOOLS = new Set(TOOL_SPECS.filter((spec) => spec.readOnly === true).map((spec) => spec.name))
+
+/**
+ * 插件形态刻意不声明、也不接受的后台任务参数（与 scripts/gen_dsh_specs.mjs 的
+ * EXCLUDED 对齐）。DSH 的顶层参数校验放行 schema 外的键，如果不在传输层显式拒绝，
+ * 就会出现“schema 说没有、文档说没有、运行时却能穿透”的第三种行为。
+ */
+const EXCLUDED_ARGS = {
+  fs_exec: ['background', 'job', 'list', 'wait_ms', 'kill'],
+}
 
 /** 收集模式：有界尾部 + 同额 spill。 */
 function collect(maxBytes) {
@@ -86,9 +100,13 @@ function messageOf(value) {
   return String(value)
 }
 
-function abortReason(signal) {
+/** 取消错误打标记：传输层据此决定是否结束内核会话，避免取消后继续写。 */
+function abortedError(signal) {
   const reason = signal === undefined ? undefined : signal.reason
-  return reason instanceof Error ? reason : new Error('已取消')
+  const detail = reason instanceof Error ? reason.message : ''
+  const error = new Error(detail.length > 0 && detail !== '已取消' ? '已取消：' + detail : '已取消')
+  error.aborted = true
+  return error
 }
 
 /**
@@ -172,13 +190,13 @@ function startSession(ctx, executable, cwd) {
         return
       }
       if (signal !== undefined && signal.aborted) {
-        reject(abortReason(signal))
+        reject(abortedError(signal))
         return
       }
       const id = ++nextId
       const onAbort = () => {
         pending.delete(id)
-        reject(abortReason(signal))
+        reject(abortedError(signal))
       }
       pending.set(id, {
         resolve: (message) => {
@@ -213,6 +231,8 @@ function startSession(ctx, executable, cwd) {
     ready,
     request,
     isExited: () => exited,
+    /** 未完成请求数：取消时只有在没有其他在途调用时才敢结束会话。 */
+    pendingCount: () => pending.size,
     dispose() {
       exited = true
       failPending(sessionError('fsops mcp 会话已关闭'))
@@ -250,9 +270,19 @@ function createTransport(ctx, options) {
     const existing = sessions.get(cwd)
     if (existing !== undefined && !existing.isExited()) {
       await existing.ready
+      // Map 的插入顺序即 LRU 顺序：命中的会话挪到末尾，回收时淘汰最久未用。
+      sessions.delete(cwd)
+      sessions.set(cwd, existing)
       return existing
     }
     sessions.delete(cwd)
+    if (sessions.size >= MAX_SESSIONS) {
+      const oldest = sessions.keys().next()
+      if (oldest.done !== true) {
+        sessions.get(oldest.value)?.dispose()
+        sessions.delete(oldest.value)
+      }
+    }
     const fresh = startSession(ctx, executable, cwd)
     sessions.set(cwd, fresh)
     try {
@@ -275,11 +305,24 @@ function createTransport(ctx, options) {
     const executable = await executableOnce()
     const cwd = await agentCwd(ctx, exec)
     const session = await sessionFor(executable, cwd)
-    const response = await session.request(
-      'tools/call',
-      { name: toolName, arguments: args ?? {} },
-      exec.signal,
-    )
+    let response
+    try {
+      response = await session.request(
+        'tools/call',
+        { name: toolName, arguments: args ?? {} },
+        exec.signal,
+      )
+    } catch (error) {
+      // 用户取消：如果这是唯一在途调用且属于写/执行类工具，结束内核会话，
+      // 避免“取消后 fsops 继续写盘/跑命令”。下一次调用会自动重建会话。
+      // 有并发在途调用时不杀会话：避免它们的失败触发一次性 spawn 重放（可能重复写）。
+      const aborted = error !== null && typeof error === 'object' && error.aborted === true
+      if (aborted && !session.isExited() && session.pendingCount() === 0 && !READ_ONLY_TOOLS.has(toolName)) {
+        sessions.delete(cwd)
+        session.dispose()
+      }
+      throw error
+    }
     if (response.error !== undefined) {
       // 协议层错误（未知方法/参数）不是会话故障，直接抛给模型。
       throw new Error('fsops ' + toolName + ' 失败：' + messageOf(response.error))
@@ -332,6 +375,17 @@ export function apply(ctx, config) {
         render: (_args, value) => [{ type: 'text', text: value }],
       },
       async execute(args, exec) {
+        const excluded = EXCLUDED_ARGS[spec.name]
+        if (excluded !== undefined) {
+          for (const key of excluded) {
+            if (args !== null && typeof args === 'object' && Object.hasOwn(args, key)) {
+              throw new Error(
+                'E_BAD_ARGS ' + spec.name + ' 在 DSH 插件形态不支持 ' + key +
+                  '（后台任务生命周期绑在长驻会话，插件重载会丢）；需要后台任务请用 MCP 形态 `fsops mcp`。',
+              )
+            }
+          }
+        }
         return transport.call(spec.name, args, exec)
       },
     }

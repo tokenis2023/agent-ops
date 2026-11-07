@@ -5,7 +5,8 @@
   "type": "module",
   "license": "MIT",
   "engines": {
-    "node": ">=24"
+    "node": ">=24",
+    "dsh": ">=0.2.2-rc.1"
   },
   "exports": {
     ".": "./dsh/index.js",

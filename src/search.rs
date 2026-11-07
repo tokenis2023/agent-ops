@@ -141,6 +141,9 @@ fn test_parallel_waves() -> usize {
     TEST_PARALLEL_WAVES.with(|c| c.get())
 }
 
+/// Rust regex 与 PCRE 的方言差异提示：正则编译失败时统一附加，避免模型反复试错。
+pub(crate) const REGEX_DIALECT_HINT: &str = "Rust regex 语法不支持 lookaround 与反向引用（如 (?=)、(?<=)、\\1）；捕获组引用写 $1，$1 后紧跟字母请写 ${1}";
+
 pub fn grep(root: &FsPath, opts: &GrepOpts) -> Result<GrepResult, String> {
     let mut pat = opts.pattern.clone();
     if opts.ignore_case {
@@ -157,6 +160,8 @@ pub fn grep(root: &FsPath, opts: &GrepOpts) -> Result<GrepResult, String> {
                 opts.pattern, hint
             ));
         }
+        // fs_edit、fs_read 的 focus 共用同一段方言提示：三处说法必须一致。
+        msg.push_str(&format!("\n提示：{REGEX_DIALECT_HINT}"));
         msg
     })?;
     // 能匹配空串的模式（`^`、`$`、`a*`、`.*`、`\b`、`\d*`）会命中每一行：
@@ -320,12 +325,19 @@ pub fn grep(root: &FsPath, opts: &GrepOpts) -> Result<GrepResult, String> {
                 match_count += 1;
             }
 
-            if opts.output == GrepOutput::Count && file_count > 0 {
+            // 每文件命中数原先只在 count 模式收集。但 matches/snippets 的摘要行
+            // 需要「一共几个文件、分布在哪」——否则模型得先跑一遍 files 再跑一遍
+            // count 才敢回来看内容，同一个 pattern 白花两轮上下文。
+            // 这里始终收集（只多一个 String+usize，可忽略），渲染层按需使用。
+            if file_count > 0 {
                 matched_files += 1;
                 file_counts.push((e.path.clone(), file_count));
             }
             if !selected.is_empty() {
                 matched_files += 1;
+                // matches/snippets 也记每文件命中数（并行侧同款）：摘要行要给出
+                // 「几个文件、分布在哪」，省掉先 files 再 count 的两轮。
+                file_counts.push((e.path.clone(), selected.len()));
                 // 先标记所有命中及其上下文，再按行号输出；相邻命中不会重复上下文。
                 let mut in_snippet = vec![false; lines.len()];
                 let mut is_match = vec![false; lines.len()];
@@ -571,6 +583,10 @@ impl MergeState {
                 }
                 if !selected_lines.is_empty() {
                     self.matched_files += 1;
+                    // matches/snippets 也记每文件命中数：摘要行要「一共几文件、分布在哪」，
+                    // 否则模型得先 files 再 count 才敢回来看内容（同一个 pattern 白花两轮）。
+                    self.file_counts
+                        .push((scan.path.clone(), selected_lines.len()));
                     for (line, body, _) in &scan.entries {
                         let is_selected = selected_lines.contains(line);
                         let is_context = !is_selected
@@ -1207,6 +1223,40 @@ mod tests {
         assert!(err.starts_with("E_BAD_REGEX"), "{err}");
         assert!(err.contains("是正则不是 glob"), "{err}");
         assert!(err.contains(r".*\.txt"), "应给出正确等价写法: {err}");
+        assert!(
+            err.contains("lookaround"),
+            "glob 误用分支也要带方言提示: {err}"
+        );
+        assert!(err.contains("${1}"), "应给捕获组引用的正确写法: {err}");
+    }
+
+    #[test]
+    fn 正则方言错误点明lookaround与反向引用() {
+        // Rust regex 与 PCRE 不同：lookaround/反向引用不支持，捕获组引用写法也不同。
+        // 不点破方言，模型容易在同一类模式上反复试错。
+        let dir = std::env::temp_dir().join(format!("fsops-regex-dialect-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+        let root = FsPath::parse(&dir.to_string_lossy()).unwrap();
+        for pat in ["(?=a)", r"(a)\1"] {
+            let result = grep(
+                &root,
+                &GrepOpts {
+                    pattern: pat.to_string(),
+                    ..Default::default()
+                },
+            );
+            let err = match result {
+                Ok(_) => panic!("方言不兼容的模式 {pat} 应报错"),
+                Err(e) => e,
+            };
+            assert!(err.starts_with("E_BAD_REGEX"), "{pat}: {err}");
+            assert!(err.contains("lookaround"), "{pat}: {err}");
+            assert!(err.contains("反向引用"), "{pat}: {err}");
+            assert!(err.contains("${1}"), "{pat}: {err}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

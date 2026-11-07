@@ -51,6 +51,7 @@
 ### 执行命令
 
 1. 前台 `fs_exec` 单次控制在 2 分钟内；更长的构建/测试用 `background=true` 拿 job id，再 `job=<id> wait_ms=60000` 轮询，别反复短轮询。
+   > DSH 插件形态（`fs_*` 直接作为工具）**不提供**后台任务参数（`background`/`job`/`list`/`wait_ms`/`kill`，会返回 `E_BAD_ARGS`）；需要后台任务时改用 MCP 形态（`fsops mcp`）。
 2. `program` 用 PATH 名或原生绝对路径；相对路径不随 `cwd` 解析。
 
 ### 大文件

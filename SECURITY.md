@@ -24,6 +24,19 @@ fsops 是本地文件操作工具，**没有路径沙箱**。
 3. 重要仓库先提交或备份，再允许批量编辑。
 4. 不要向不可信的 MCP 客户端暴露本服务。
 
+## DSH 插件形态
+
+DSH 插件是 Host 代码：它在 Harness 宿主进程内运行，经 `ctx.subprocess` 直接启动 `fsops.exe`
+（长驻 `fsops mcp` 会话）。
+
+- Harness 的 fs 沙箱（`ctx.fs`）与审批（`ctx.approval`）只约束内置文件工具和受限 shell，
+  **不覆盖本插件的 `fs_*`**；
+- 因此把 DSH 会话切到 `workspace-write`/`read-only` 不会限制 `fs_write`/`fs_edit`/`fs_file`/`fs_exec`，
+  它们仍以宿主用户权限运行；
+- 需要强制隔离时请改用 MCP 形态并配合宿主沙箱，或只在可信工作区启用本插件；
+- 取消（abort）单个进行中的写/执行请求会结束长驻会话，但已被拉起的子进程可能残留，
+  与 `fs_exec` 超时一样不保证外部副作用被撤销。
+
 ## 命令执行（fs_exec）
 
 `fs_exec` 会用当前用户权限启动任意程序，**它不是安全沙箱，也不构成权限边界**。

@@ -95,13 +95,16 @@ args = ["mcp"]
 
 仓库根同时是一个标准 DSH bundle：`package.json` 的 `dsh.bundle.patch` 指向 `cordis.patch.yml`，
 patch 插入 `dsh/index.js` 这个 Host 插件。在 Harness 的 **插件 → 添加插件 → 安装第三方插件** 里
-粘贴仓库地址即可：
+粘贴仓库地址即可；**生产环境建议用 tag/commit 固定版本**，不要跟随默认分支：
 
 ```text
-https://github.com/tokenis2023/agent-ops
+github:tokenis2023/agent-ops#v0.7.0
 ```
 
-安装后默认启用，提供 8 个 `fs_*` 工具，与 MCP 形态同名、同错误码。插件**复用一条长驻 `fsops mcp` 会话**（换行分隔 JSON-RPC、按 id 匹配响应），不是每次调用新起进程：实测单次工具调用 **~33ms → 0.3–0.6ms**。会话不可用（spawn 失败、进程退出、初始化失败）时自动退回一次性 `fsops call`，功能不降级；想强制走一次性调用可配 `mcp: false`。参数集合与 MCP 形态基本一致，唯一差异是插件形态不暴露 `fs_exec` 的 `background`/`job`/`list`/`wait_ms`/`kill` 五个后台任务参数（需要后台任务请用 MCP 形态）。
+安装后在会话里调用 `fs_stat`（`detail=server` 可免路径）自检：应返回与插件同版本的
+`fsops x.y.z tools=8`；二进制版本不符时插件会报 `E_VERSION` 并点名实际版本。
+
+安装后默认启用，提供 8 个 `fs_*` 工具，与 MCP 形态同名、同错误码。插件**复用一条长驻 `fsops mcp` 会话**（换行分隔 JSON-RPC、按 id 匹配响应），不是每次调用新起进程：release 构建实测单次工具调用 **~33ms → 0.3–0.6ms**（本机 debug 构建复跑约 0.5–0.8ms）。会话不可用（spawn 失败、进程退出、初始化失败）时自动退回一次性 `fsops call`，功能不降级；想强制走一次性调用可配 `mcp: false`。取消（abort）单个进行中的写/执行请求会结束长驻会话以阻止后台继续执行，下一次调用自动重建。参数集合与 MCP 形态基本一致；唯一差异是插件形态**不提供** `fs_exec` 的后台任务参数（`background`/`job`/`list`/`wait_ms`/`kill`）：schema 不声明，运行时也会显式拒绝并提示改用 MCP 形态——后台任务的 job id 绑在长驻会话上，插件重载/宿主重启后就会失效。
 
 - **二进制来源**：优先用 `%LOCALAPPDATA%\fsops` 或 PATH 上已有的 `fsops.exe`；都没有时按本仓库版本
   从 GitHub Release 下载并校验 SHA-256（该版本还没发 Release 时回退到 latest），缓存在
@@ -114,8 +117,12 @@ https://github.com/tokenis2023/agent-ops
   或用 `autoDownload: false` 关闭下载。确认就要用旧版本时设 `allowVersionMismatch: true`
   或环境变量 `FSOPS_ALLOW_VERSION_MISMATCH=1`。
 - **平台**：`dsh.bundle.platforms` 声明为 `win32`，非 Windows 宿主不会展示也不允许启用。
-- **安全边界**：与 MCP 接入一致——fsops 没有路径沙箱，权限等于 Harness 进程用户；需要隔离时
-  依赖 Harness 自己的沙箱策略或限定工作区。
+- **安全边界**：与 MCP 接入一致——fsops 没有路径沙箱，权限等于 Harness 进程用户。注意 DSH 插件是
+  Host 代码，Harness 的 fs 沙箱与审批只约束内置文件工具和受限 shell，**不覆盖本插件的 `fs_*`**；
+  需要强制隔离时请改用 MCP 形态并配合宿主沙箱，或只在可信工作区启用本插件。
+- **错误分层**：DSH 会先按 schema 校验参数（type/enum），失败时是英文 `invalid arguments: ...`；
+  通过后才进入 fsops 内核，返回中文 `E_*`。Agent 需要识别这两种错误形态。
+- **兼容声明**：`engines.dsh` 声明兼容 DSH `>=0.2.2-rc.1`（当前加载器不强制校验）。
 
 本地验证插件（桩替代 Harness 服务，真跑 fsops.exe）：
 
@@ -316,6 +323,8 @@ node tests/bench_dsh_latency.mjs       # 插件调用延迟：一次性 spawn vs
 - 超大 UTF-16 文件暂不支持流式读取。
 - 超大文件只支持一个连续 `start`/`end` 区间，不支持多区间；默认 `scan=window` 只做窗口扫描，需要全文 hash/总行数时用 `scan=full`。
 - `fs_edit` 遇到混合换行默认拒绝，必须显式 `normalize_eol=true`。
+- `fs_edit` 的 `old` 是子串匹配（不要求整行）：只抄半行可能留下残句，尽量给完整行或更多上下文。
+- CR-only（裸 `\r`）文本的行号统计不一致：`fs_stat`/`fs_read` 按 LF 统计、`fs_edit` 按 CR 分行；处理前建议先用 `fs_file` 的 `op=convert` 转成 LF/CRLF。
 - 多文件编辑不是跨文件事务，写入阶段失败会返回 `E_BATCH_PARTIAL`。
 - `fs_edit` 的摘要只列前 64 处落点，其余用总数表示。
 - 编码识别是启发式的；极短 GBK 文件可能被判为 UTF-8-lossy。
