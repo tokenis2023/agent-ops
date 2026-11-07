@@ -17,7 +17,7 @@ pub fn tool_defs() -> Vec<Value> {
     let mut defs = vec![
         json!({
             "name": "fs_read",
-            "description": "读取文件。优先用本工具替代宿主 read_file/cat/head/tail/Get-Content。默认只返回前 12KB 并给出续读方式；支持行范围、多文件、DOCX/PDF 正文、自动识别 GBK/UTF-16/BOM 与 CRLF。模式四选一：单文件 path、多文件 paths、异构区间 reads、按正则取块 focus；summary 仅单文件且不能与 ranges/block/end 同用；reads 每项可带 focus 与 budget。",
+            "description": "读取文件。优先用本工具替代宿主 read_file/cat/head/tail/Get-Content。默认最多返回 32KB 并给出续读方式；支持行范围、多文件、DOCX/PDF 正文、自动识别 GBK/UTF-16/BOM 与 CRLF。模式四选一：单文件 path、多文件 paths、异构区间 reads、按正则取块 focus；summary 仅单文件且不能与 ranges/block/end 同用；reads 每项可带 focus 与 budget。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -56,7 +56,7 @@ pub fn tool_defs() -> Vec<Value> {
                             "maxItems": 2
                         }
                     },
-                    "budget": {"type": "integer", "description": "最多返回字节数，默认 12288"},
+                    "budget": {"type": "integer", "description": "最多返回字节数，默认 32768（约 8K token）；文件 ≤32KB 且未显式指定时自动读全文"},
                     "max_line": {"type": "integer", "description": "每行最多字符数，默认 240；0 表示不截断长行"},
                     "scan": {
                         "type": "string",
@@ -1229,14 +1229,17 @@ fn read(args: &Value) -> String {
             }
         };
         let doc = &snapshot.doc;
-        // 自适应预算：小文件一次读完，省掉一次「12KB 截断 → 续读」的往返。
+        // 自适应预算：小文件一次读完，省掉一次「预算截断 → 续读」的往返。
         // 多送几 KB 换掉一整轮上下文重发，划算；显式 budget 永远优先。
         if !budget_explicit
             && targets.len() == 1
             && budget == render::DEFAULT_BUDGET
-            && doc.size <= 16 * 1024
+            && doc.size <= render::DEFAULT_BUDGET as u64
         {
-            budget = doc.size as usize + 4096;
+            // 行号前缀每行 4-6 字节，大文件能轻松吃掉 4096 的余量；
+            // 按行数补足，否则「一次读完」仍会被截断成续读。
+            let lines = doc.text.lines().count();
+            budget = doc.size as usize + 4096 + lines * 6;
         }
         // 行索引只建一次：总行数、block 探测和 converge 多轮渲染共用，
         // 避免每次缩预算都把整个文件重新 split 一遍。
@@ -5560,6 +5563,20 @@ mod roundtrip_tests {
         assert!(second.contains("未变更"), "{second}");
         assert!(!second.contains("1|line1"), "{second}");
         assert!(second.contains("force=true"), "{second}");
+    }
+
+    #[test]
+    fn 三十kb文件默认一次读完() {
+        // 默认预算 32KB：多一轮续读就是一次完整上下文重发，比多给几 KB 贵。
+        let dir = 目录("default-budget");
+        let path = dir.join("big.txt");
+        let content: String = (1..=3000).map(|i| format!("line{i:04}\n")).collect();
+        fs::write(&path, &content).unwrap();
+        let posix = path.to_string_lossy().replace('\\', "/");
+        let out = call("fs_read", &json!({"path": posix, "force": true}));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(out.len() > 24_000, "应一次读完 27KB: {} 字节", out.len());
+        assert!(!out.contains("续读"), "不应需要续读: {out}");
     }
 
     #[test]

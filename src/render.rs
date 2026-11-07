@@ -5,7 +5,9 @@
 //! 2. 连续空行折叠成一个 `⋯`，长行截断并标注剩余字符数；
 //! 3. 每次返回都有硬预算，超出就少给行、并在末尾告诉模型怎么继续取。
 
-pub const DEFAULT_BUDGET: usize = 12 * 1024;
+/// 默认响应预算。32KB ≈ 8K token：多数源码文件一次读完，
+/// 少一轮续读就省一次完整上下文重发，比省这几 KB 划算。
+pub const DEFAULT_BUDGET: usize = 32 * 1024;
 pub const MAX_LINE_CHARS: usize = 240;
 
 #[derive(Debug, Clone, Copy)]

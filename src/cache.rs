@@ -21,9 +21,15 @@ fn cache() -> &'static Mutex<HashMap<String, Entry>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// `FSOPS_MCP_CACHE=0` 可整体关闭。
+/// 默认关闭，`FSOPS_MCP_CACHE=1` 显式开启（单元测试内默认开启）。
+///
+/// 默认关掉的原因：stub 只省单次响应（~12KB），却让模型多花一轮 `force=true`，
+/// 而多一轮等于整个上下文重发。按总成本算，返回正文永远更便宜。
 pub fn enabled() -> bool {
-    !matches!(std::env::var("FSOPS_MCP_CACHE").as_deref(), Ok("0"))
+    if cfg!(test) {
+        return !matches!(std::env::var("FSOPS_MCP_CACHE").as_deref(), Ok("0"));
+    }
+    matches!(std::env::var("FSOPS_MCP_CACHE").as_deref(), Ok("1"))
 }
 
 /// 已读区间能覆盖全部请求区间时返回覆盖范围。

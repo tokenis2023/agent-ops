@@ -441,9 +441,11 @@ pub fn render_entries(entries: &[Entry], detail: bool) -> String {
             out.push('\n');
             continue;
         }
-        let kind = if e.is_dir { "d" } else { "f" };
+        // 文件不带前缀：默认 dirs=false 时全是文件，`f` 是纯噪声；
+        // 目录保留 `d ` 标记，和路径末尾的 `/` 一起消除歧义。
+        let kind = if e.is_dir { "d " } else { "" };
         out.push_str(&format!(
-            "{kind} {} {} {}\n",
+            "{kind}{} {} {}\n",
             human_size(e.size),
             &fmt_time(e.mtime)[5..],
             e.path

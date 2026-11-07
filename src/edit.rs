@@ -555,8 +555,8 @@ fn no_match_error(work: &str, needle: &str, idx: usize) -> String {
             }
         }
     }
-    if candidates.is_empty() {
-        // 退一步：按首行前 8 个非空白字符找
+    if candidates.is_empty() && !first.is_empty() {
+        // 退一步：按首行前 8 个非空白字符找（缩进/空白差异）
         let short: String = first
             .chars()
             .filter(|c| !c.is_whitespace())
@@ -573,6 +573,11 @@ fn no_match_error(work: &str, needle: &str, idx: usize) -> String {
             }
         }
     }
+    if candidates.is_empty() && !first.is_empty() {
+        // 再退一步：拼错一两个字母时前缀全落空，按编辑距离找最相似的行。
+        // 让模型直接看到正确原文，比让它再读一次文件便宜得多。
+        candidates = closest_lines(work, first, 3);
+    }
     let mut msg = format!("E_NO_MATCH 第{}处未找到目标文本", idx);
     if candidates.is_empty() {
         msg.push_str("；请先 fs_read 确认当前内容");
@@ -586,11 +591,63 @@ fn no_match_error(work: &str, needle: &str, idx: usize) -> String {
             };
             msg.push_str(&format!("\n{n}|{t}"));
         }
+        // E_NO_MATCH 是 old 抄错，不是并发冲突；并发冲突由 E_STALE 报。
+        // 把模型引向 hash 操作只会白跑一轮。
+        msg.push_str("\n以上是实际内容；核对缩进与空白后直接用其中一行作为 old 重试");
     }
-    // 多个 agent 并行时，“找不到目标”可能是因为别人刚改过。
-    // 不说这句，模型会以为自己的 old 写错了，反复重试同一个文本。
-    msg.push_str("；若他人刚改过此文件，重新 fs_read 取新 hash 后用 expect_hash 重试");
     msg
+}
+
+/// 按编辑距离找最相似的行；只看长度接近的行，避免大文件里做无谓的 DP。
+fn closest_lines<'a>(work: &'a str, needle: &str, limit: usize) -> Vec<(usize, &'a str)> {
+    let width = needle.chars().count();
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut scored: Vec<(usize, usize, &str)> = Vec::new();
+    for (i, line) in work.lines().enumerate() {
+        let text = line.trim();
+        let n = text.chars().count();
+        // 长度差超过一倍的不可能是有用的近似行。
+        if n * 2 < width || n > width * 2 {
+            continue;
+        }
+        let d = levenshtein(needle, text);
+        // 只保留「确实很像」的行：短行差 2 个字符、长行按比例放宽。
+        // 否则整个文件的行都成了候选，提示本身变成噪声。
+        if d <= 2 || d * 4 <= width {
+            scored.push((d, i + 1, line));
+        }
+    }
+    scored.sort_by_key(|(d, n, _)| (*d, *n));
+    scored
+        .into_iter()
+        .take(limit)
+        .map(|(_, n, line)| (n, line))
+        .collect()
+}
+
+/// 字符级 Levenshtein 距离，两行滚动数组。
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    if a.is_empty() {
+        return b.len();
+    }
+    if b.is_empty() {
+        return a.len();
+    }
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur[j + 1] = (prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
 }
 
 #[cfg(test)]
@@ -645,6 +702,16 @@ mod tests {
         let (out, res) = apply("let a = 1;\nlet b = 1;\nlet c = 1;\n", Eol::Lf, &[e]).unwrap();
         assert_eq!(res.applied, 1);
         assert_eq!(out, "let a = 1;\nlet b = 2;\nlet c = 1;\n");
+    }
+
+    #[test]
+    fn 拼错一个字母时按编辑距离给出最接近的行() {
+        // 前缀匹配对「少一个字母」无效（alfa 不含于 alpha）；
+        // 模型拼错时应该直接看到正确原文，而不是再读一次文件。
+        let src = "let alpha = 1;\nlet beta = 2;\n";
+        let err = apply(src, Eol::Lf, &[spec("let alfa = 1;", "x")]).unwrap_err();
+        assert!(err.contains("1|let alpha = 1;"), "{err}");
+        assert!(!err.contains("expect_hash"), "{err}");
     }
 
     #[test]

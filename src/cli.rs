@@ -123,7 +123,7 @@ fn cmd_read(args: &[String]) -> String {
         v["end"] = json!(e.parse::<u64>().unwrap_or(u64::MAX));
     }
     if let Some(b) = flag(args, "--budget") {
-        v["budget"] = json!(b.parse::<u64>().unwrap_or(12288));
+        v["budget"] = json!(b.parse::<u64>().unwrap_or(32768));
     }
     tools::call("fs_read", &v)
 }
