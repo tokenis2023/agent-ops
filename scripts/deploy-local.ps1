@@ -1,25 +1,6 @@
-﻿<#
-.SYNOPSIS
-  把 v0.8.0 的 fsops.exe 换到 %LOCALAPPDATA%\fsops（DSH 插件默认使用的位置）。
-
-.DESCRIPTION
-  为什么单独一步：%LOCALAPPDATA%\fsops\fsops.exe 被 DSH 的长驻 `fsops mcp` 会话
-  占用，运行中替换会 EBUSY。必须在 DeepSeek Harness 完全退出后执行。
-
-  版本必须与插件一致：插件 0.8.0 的 tool-specs 声明了 fs_write.files / fs_grep.expand，
-  旧内核会把这些新参数拒绝成 E_BAD_ARGS。
-
-  默认从 GitHub Release 下载并校验 SHA-256；也可以 -FromLocal 用仓库里的构建产物。
-
-.PARAMETER FromLocal
-  用 <仓库>/target/release/fsops.exe，而不是从 Release 下载。
-
-.PARAMETER Version
-  目标版本，默认 v0.8.0。
-#>
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
-    [string]$Version = 'v0.8.0',
+    [string]$Version = 'v0.9.0',
     [switch]$FromLocal
 )
 
