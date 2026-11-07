@@ -266,12 +266,15 @@ const work = await mkdtemp(join(tmpdir(), 'fsops-dsh-'))
 const ctx = makeContext(work)
 plugin.apply(ctx, { binary: EXE })
 
+// 工具清单是契约的一部分：新增工具必须同时出现在这里，避免「悄悄多/少一个」。
+const EXPECTED_TOOLS = [
+  'fs_edit', 'fs_exec', 'fs_file', 'fs_glob', 'fs_grep', 'fs_inspect',
+  'fs_read', 'fs_stat', 'fs_write',
+]
 const names = [...ctx.registered.keys()].sort()
 check(
-  JSON.stringify(names) === JSON.stringify([
-    'fs_edit', 'fs_exec', 'fs_file', 'fs_glob', 'fs_grep', 'fs_read', 'fs_stat', 'fs_write',
-  ]),
-  '注册 8 个 fs_* 工具',
+  JSON.stringify(names) === JSON.stringify(EXPECTED_TOOLS),
+  '注册全部 ' + EXPECTED_TOOLS.length + ' 个 fs_* 工具',
   names.join(','),
 )
 for (const [toolName, definition] of ctx.registered) {

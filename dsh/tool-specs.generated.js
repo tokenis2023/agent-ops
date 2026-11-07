@@ -341,6 +341,32 @@ export const TOOL_SPECS = [
     }
   },
   {
+    "name": "fs_inspect",
+    "description": "一次看清目录：文件规模分布 + 可选的正则命中分布与样例，替代「先 fs_glob 看结构、再 fs_stat 查大小、再 fs_grep 找目标」的多轮探索。适合接手陌生仓库或任务开头；已知具体目标后改用 fs_grep/fs_read。",
+    "parameters": {
+      "budget": {
+        "description": "响应字节上限，默认 16384",
+        "type": "integer"
+      },
+      "focus": {
+        "description": "可选关键词（空格分隔）：影响「最相关文件」的排序，命中文件名或路径的优先",
+        "type": "string"
+      },
+      "limit": {
+        "description": "列出的文件数，默认 15",
+        "type": "integer"
+      },
+      "path": {
+        "description": "根目录，默认当前目录",
+        "type": "string"
+      },
+      "pattern": {
+        "description": "可选 Rust 正则：给了就附带命中分布与前几条命中样例",
+        "type": "string"
+      }
+    }
+  },
+  {
     "name": "fs_grep",
     "readOnly": true,
     "description": "正则流式搜索。优先替代 grep/rg/Select-String。按文件稳定分组，支持文本和 DOCX/PDF 正文，output 可选 files/count/matches/snippets；截断时返回 next_offset。",

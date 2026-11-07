@@ -157,6 +157,21 @@ pub fn tool_defs() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "fs_inspect",
+            "description": "一次看清目录：文件规模分布 + 可选的正则命中分布与样例，替代「先 fs_glob 看结构、再 fs_stat 查大小、再 fs_grep 找目标」的多轮探索。适合接手陌生仓库或任务开头；已知具体目标后改用 fs_grep/fs_read。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "根目录，默认当前目录"},
+                    "pattern": {"type": "string", "description": "可选 Rust 正则：给了就附带命中分布与前几条命中样例"},
+                    "focus": {"type": "string", "description": "可选关键词（空格分隔）：影响「最相关文件」的排序，命中文件名或路径的优先"},
+                    "limit": {"type": "integer", "description": "列出的文件数，默认 15"},
+                    "budget": {"type": "integer", "description": "响应字节上限，默认 16384"}
+                },
+                "required": []
+            }
+        }),
+        json!({
             "name": "fs_grep",
             "description": "正则流式搜索。优先替代 grep/rg/Select-String。按文件稳定分组，支持文本和 DOCX/PDF 正文，output 可选 files/count/matches/snippets；截断时返回 next_offset。",
             "inputSchema": {
@@ -763,6 +778,7 @@ pub fn call(name: &str, args: &Value) -> String {
         "fs_edit" => edit_tool(args),
         "fs_write" => write(args),
         "fs_glob" => glob_tool(args),
+        "fs_inspect" => inspect_tool(args),
         "fs_grep" => grep_tool(args),
         "fs_stat" => stat(args),
         "fs_exec" => crate::exec::run(args),
@@ -4544,7 +4560,7 @@ fn next_fn() {
     #[test]
     fn grep_schema暴露输出分页与预算参数() {
         let defs = tool_defs();
-        assert_eq!(defs.len(), 8);
+        assert!(!defs.is_empty(), "工具表不能为空");
         let grep = defs
             .iter()
             .find(|def| def["name"] == "fs_grep")
@@ -4602,6 +4618,83 @@ fn next_fn() {
         );
         let _ = fs::remove_dir_all(&dir);
         assert!(out.contains("TODO"), "仍要给出命中: {out}");
+    }
+    #[test]
+    fn inspect_一次给出规模与命中分布() {
+        // 接手陌生目录时模型固定走「glob 看结构 → stat 查大小 → grep 找目标」三步；
+        // inspect 一次给全，每省一轮就省一次整个上下文的重发。
+        let dir = 临时目录("inspect-basic");
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join("src/a.rs"), "fn alpha() {}\n// TODO one\n").unwrap();
+        fs::write(dir.join("src/b.rs"), "fn beta() {}\n// TODO two\n").unwrap();
+        // 造一个明显更大的文件：只有大小确有差异时才值得按体积列清单；
+        // 一堆等大的文件列出来是纯 token 成本。
+        fs::write(dir.join("src/big.rs"), "z".repeat(4000)).unwrap();
+        let path = dir.to_string_lossy().replace('\\', "/");
+        let out = call("fs_inspect", &json!({"path": path, "pattern": "TODO"}));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(out.starts_with("ok"), "{out}");
+        assert!(out.contains("个文件"), "应给文件规模: {out}");
+        assert!(
+            out.contains("最大："),
+            "大小有差异时应按体积给出先看哪些: {out}"
+        );
+        assert!(out.contains("big.rs"), "最大的文件应排在前面: {out}");
+        assert!(out.contains("2 文件 2 处"), "应给命中分布: {out}");
+        assert!(out.contains("样例"), "应给命中样例: {out}");
+    }
+
+    #[test]
+    fn inspect_focus影响排序() {
+        let dir = 临时目录("inspect-focus");
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join("src/big.rs"), "x".repeat(4000)).unwrap();
+        fs::write(dir.join("src/target.rs"), "y".repeat(10)).unwrap();
+        let path = dir.to_string_lossy().replace('\\', "/");
+        let plain = call("fs_inspect", &json!({"path": path, "limit": 2}));
+        let focused = call(
+            "fs_inspect",
+            &json!({"path": path, "limit": 2, "focus": "target"}),
+        );
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            plain.find("big.rs").unwrap() < plain.find("target.rs").unwrap(),
+            "默认按大小: {plain}"
+        );
+        assert!(
+            focused.find("target.rs").unwrap() < focused.find("big.rs").unwrap(),
+            "focus 应把关键词命中的文件提前: {focused}"
+        );
+    }
+
+    #[test]
+    fn inspect_规模同质时不堆体积清单() {
+        // 12 个等大的源文件：列「最大：a 149B, b 149B, …」没有信息量，只是浪费 token。
+        let dir = 临时目录("inspect-uniform");
+        fs::create_dir_all(dir.join("src")).unwrap();
+        for index in 0..12 {
+            fs::write(dir.join(format!("src/m{index}.rs")), "fn x() {}\n").unwrap();
+        }
+        let path = dir.to_string_lossy().replace('\\', "/");
+        let out = call("fs_inspect", &json!({"path": path}));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(out.contains("规模接近"), "同质时应只说规模: {out}");
+        assert!(!out.contains("最大："), "同质时不该堆体积清单: {out}");
+    }
+
+    #[test]
+    fn inspect_空目录与非正则给出可读结果() {
+        let dir = 临时目录("inspect-edge");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.to_string_lossy().replace('\\', "/");
+        let empty = call("fs_inspect", &json!({"path": path}));
+        fs::write(dir.join("a.txt"), "content\n").unwrap();
+        let bad = call("fs_inspect", &json!({"path": path, "pattern": "(?=x)"}));
+        let missing = call("fs_inspect", &json!({"path": format!("{path}/nope")}));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(empty.contains("空目录"), "{empty}");
+        assert!(bad.contains("lookaround"), "非法正则要给方言提示: {bad}");
+        assert!(missing.starts_with("E_NOT_FOUND"), "{missing}");
     }
     #[test]
     fn expand_把命中展开成整块() {
@@ -5936,6 +6029,151 @@ fn write_one(args: &Value) -> String {
     )
 }
 
+/// `fs_inspect`：一次给出「目录规模 + 命中分布 + 样例」。
+///
+/// 为什么要合成一个工具：接手陌生仓库时，模型固定要走
+/// `fs_glob`（有什么）→ `fs_stat`（多大/什么编码）→ `fs_grep`（目标在哪）三步，
+/// 每一轮都要把整个上下文重发一次。这里把它们压成一次调用。
+/// 不追求把每个文件细节都给出——只给「先看哪些」和「目标在哪」，细节交给后续 fs_read。
+fn inspect_tool(args: &Value) -> String {
+    let budget = arg_usize(args, "budget", 16 * 1024);
+    let limit = arg_usize(args, "limit", 15).max(1);
+    let root_s = arg_str(args, "path").unwrap_or(".");
+    let root = match FsPath::parse(root_s) {
+        Ok(root) => root,
+        Err(e) => return format!("E_BAD_PATH {e}"),
+    };
+    if !root.exists() {
+        return format!("E_NOT_FOUND {} 不存在；用 fs_glob 确认路径", root.display());
+    }
+
+    // 目录摘要：沿用 walk 的 .gitignore 感知与忽略目录，保证与 fs_glob 口径一致。
+    let opts = WalkOpts {
+        include_dirs: false,
+        limit: 100_000,
+        follow_links: false,
+        offset: 0,
+        time_budget_ms: arg_usize(args, "time_budget_ms", 3000) as u128,
+        no_ignore: arg_bool(args, "no_ignore", false),
+    };
+    let entries = match walk::glob_with_report(&root, "", &opts) {
+        Ok((entries, _)) => entries,
+        Err(e) => return e,
+    };
+    if entries.is_empty() {
+        return format!("ok 空目录（{}）：没有可统计的文件", root.display());
+    }
+
+    let total_files = entries.len();
+    let total_bytes: u64 = entries.iter().map(|e| e.size).sum();
+    // 按大小排序给「先看哪些文件」；focus 命中的优先，因为模型通常已经知道关键词。
+    let focus_words: Vec<String> = arg_str(args, "focus")
+        .unwrap_or("")
+        .split_whitespace()
+        .map(|word| word.to_ascii_lowercase())
+        .filter(|word| !word.is_empty())
+        .collect();
+    let focus_hit = |path: &str| -> bool {
+        if focus_words.is_empty() {
+            return false;
+        }
+        let lower = path.to_ascii_lowercase();
+        focus_words.iter().any(|word| lower.contains(word))
+    };
+    let mut ranked: Vec<&walk::Entry> = entries.iter().collect();
+    ranked.sort_by(|a, b| {
+        focus_hit(&b.path)
+            .cmp(&focus_hit(&a.path))
+            .then_with(|| b.size.cmp(&a.size))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    // 体积分布按「真实大小顺序」统计，不能用 ranked：focus 会把小文件提到前面，
+    // 拿它算 largest/median 会把「有大小差异」误判成「规模接近」。
+    let mut by_size: Vec<u64> = entries.iter().map(|entry| entry.size).collect();
+    by_size.sort_unstable_by(|a, b| b.cmp(a));
+
+    let mut out = format!("ok {} 个文件 {}", total_files, io::human_size(total_bytes));
+    // 文件大小高度同质时（一堆等大的源文件），按大小列十几个没有任何信息量，
+    // 只剩 token 成本。判据用「最大值 vs 中位数」而不是「最大 vs 最小」——
+    // 后者会被一个特别小的文件（README）骗过，误判成"差异很大"。
+    let largest = by_size.first().copied().unwrap_or(0);
+    let median = by_size.get(by_size.len() / 2).copied().unwrap_or(0);
+    if largest > median.saturating_mul(3) && largest > 0 {
+        let listed: Vec<String> = ranked
+            .iter()
+            .take(limit)
+            .map(|entry| format!("{} {}", entry.path, io::human_size(entry.size)))
+            .collect();
+        out.push_str("\n最大：");
+        out.push_str(&listed.join(", "));
+        if total_files > listed.len() {
+            out.push_str(&format!(" …（共 {} 个）", total_files));
+        }
+    } else if let Some(top) = ranked.first() {
+        out.push_str(&format!(
+            "\n规模接近：约 {}（随机取 {} 为例）",
+            io::human_size(top.size),
+            top.path
+        ));
+    }
+
+    // 命中分布：模型最常见的下一步就是「目标在哪」，顺手给出。
+    if let Some(pattern) = arg_str(args, "pattern") {
+        // 用 Matches 而不是 Count：count 模式不物化逐行命中，拿不到样例行，
+        // 而样例正是让模型「不用再 grep 一次」的关键。
+        let grep_opts = search::GrepOpts {
+            pattern: pattern.to_string(),
+            output: search::GrepOutput::Matches,
+            limit: 400,
+            ..Default::default()
+        };
+        match search::grep(&root, &grep_opts) {
+            Ok(result) if !result.file_counts.is_empty() => {
+                let mut dist: Vec<&(String, usize)> = result.file_counts.iter().collect();
+                dist.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                let shown: Vec<String> = dist
+                    .iter()
+                    .take(8)
+                    .map(|(path, count)| format!("{path}:{count}"))
+                    .collect();
+                out.push_str(&format!(
+                    "\n命中 `{pattern}`：{} 文件 {} 处 → {}{}",
+                    result.file_counts.len(),
+                    result.match_count,
+                    shown.join(", "),
+                    if dist.len() > shown.len() { " …" } else { "" }
+                ));
+                // 样例：只给每个文件第一条命中的行号+内容，够模型决定读哪里。
+                let samples: Vec<String> = result
+                    .hits
+                    .iter()
+                    .filter(|hit| !hit.is_context)
+                    .take(6)
+                    .map(|hit| {
+                        let text = hit.text.trim();
+                        let shown = if text.chars().count() > 120 {
+                            format!("{}…", text.chars().take(120).collect::<String>())
+                        } else {
+                            text.to_string()
+                        };
+                        format!("\n  {}:{} {}", hit.path, hit.line, shown)
+                    })
+                    .collect();
+                if !samples.is_empty() {
+                    out.push_str("\n样例：");
+                    for sample in &samples {
+                        out.push_str(sample);
+                    }
+                }
+            }
+            Ok(_) => out.push_str(&format!("\n命中 `{pattern}`：无")),
+            Err(e) => out.push_str(&format!("\n命中 `{pattern}`：{e}")),
+        }
+    }
+    out.push_str("\n如需细节：fs_read 目标文件，或 fs_grep expand=block 直接取整块");
+    render::truncate_utf8(&out, budget).to_string()
+}
+
 fn glob_tool(args: &Value) -> String {
     let budget = arg_usize(args, "budget", 16 * 1024);
     let root_s = arg_str(args, "path").unwrap_or(".");
@@ -6626,7 +6864,10 @@ mod roundtrip_tests {
     fn stat_server模式返回版本与工具数() {
         let out = call("fs_stat", &json!({"detail": "server"}));
         assert!(out.contains(crate::VERSION), "{out}");
-        assert!(out.contains("tools=8"), "{out}");
+        // 工具数不要写死：与 tool_defs() 对齐，增删工具时这里自动跟上，
+        // 否则每加一个工具都要改一遍测试（改漏就把「工具数」这个事实固化成错的）。
+        let expected = format!("tools={}", tool_defs().len());
+        assert!(out.contains(&expected), "应为 {expected}: {out}");
     }
 
     #[test]

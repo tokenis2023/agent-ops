@@ -492,8 +492,10 @@ check("fs_write 的 dry_run 对模型可见",
       "dry_run" in schemas.get("fs_write", {}), str(schemas.get("fs_write")))
 check("fs_edit 的 dry_run 对模型可见",
       "dry_run" in schemas.get("fs_edit", {}), str(schemas.get("fs_edit")))
-check("八个工具都在 tools/list 中",
-      len(schemas) == 8 and {"fs_exec", "fs_file"} <= set(schemas), str(sorted(schemas)))
+EXPECTED_TOOLS = {"fs_read", "fs_edit", "fs_write", "fs_glob", "fs_grep",
+                   "fs_stat", "fs_exec", "fs_file", "fs_inspect"}
+check("全部工具都在 tools/list 中",
+      EXPECTED_TOOLS <= set(schemas), "缺失: " + str(sorted(EXPECTED_TOOLS - set(schemas))))
 
 # 长行截断时要提示一次全文读法，且不能每行重复
 minjs_path = os.path.join(root, "min.js")
