@@ -13,7 +13,20 @@ use crate::search::{self, GrepOpts, GrepOutput};
 use crate::walk::{self, WalkOpts};
 use serde_json::{json, Value};
 
-pub fn tool_defs() -> Vec<Value> {
+/// 工具定义（schema）的缓存。
+///
+/// 为什么必须缓存：`call()` 每次都要做参数校验，而校验需要 schema；
+/// 直接构建一次 `tool_defs()` 要分配约 10KB 的 JSON（9 个工具、上百个字段），
+/// 单个工具调用光这一项就花掉约 200µs——比实际读写文件还贵。
+/// schema 是编译期常量，只读，进程内复用一份即可。
+static TOOL_DEFS: std::sync::OnceLock<Vec<Value>> = std::sync::OnceLock::new();
+
+/// 取工具定义（进程内只构建一次）。
+pub fn tool_defs() -> &'static [Value] {
+    TOOL_DEFS.get_or_init(build_tool_defs)
+}
+
+fn build_tool_defs() -> Vec<Value> {
     let mut defs = vec![
         json!({
             "name": "fs_read",
@@ -645,7 +658,7 @@ const EDIT_ITEM_FIELDS: [&str; 7] = [
 /// 为什么必须有：类型写错时旧代码会用 `unwrap_or(default)` 静默退回默认值，
 /// 模型以为参数生效了却得到不同行为——这比直接报错危险得多。
 fn validate_args(name: &str, args: &Value) -> Option<String> {
-    let def = tool_defs().into_iter().find(|d| d["name"] == name)?;
+    let def = tool_defs().iter().find(|d| d["name"] == name)?;
     let props = def["inputSchema"]["properties"].as_object()?;
     let obj = args.as_object()?;
     // required：宿主把 schema 当提示文本时，漏必填不该等深层逻辑才发现。
@@ -3063,7 +3076,7 @@ mod tests {
         );
         let defs = tool_defs();
         let mut problems = Vec::new();
-        for def in &defs {
+        for def in defs.iter() {
             let name = def["name"].as_str().unwrap_or("");
             let props = def["inputSchema"]["properties"]
                 .as_object()
