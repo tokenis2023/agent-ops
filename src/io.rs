@@ -92,10 +92,7 @@ pub fn lock_path(fp: &FsPath, timeout_ms: u32) -> Result<PathLock, String> {
         CloseHandle(handle);
     }
     if wait == WAIT_TIMEOUT {
-        Err(format!(
-            "E_LOCKED {} 正被其他进程修改；请稍后重试",
-            fp.display()
-        ))
+        Err(locked_error(&fp.display().to_string(), timeout_ms))
     } else {
         Err(format!("E_LOCK 获取文件写锁失败（wait={wait}）"))
     }
@@ -139,10 +136,7 @@ pub fn lock_path(fp: &FsPath, timeout_ms: u32) -> Result<PathLock, String> {
             Ok(_) => return Ok(PathLock { path }),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 if Instant::now() >= deadline {
-                    return Err(format!(
-                        "E_LOCKED {} 正被其他进程修改；请稍后重试",
-                        fp.display()
-                    ));
+                    return Err(locked_error(&fp.display().to_string(), timeout_ms));
                 }
                 sleep(Duration::from_millis(20));
             }
@@ -679,9 +673,27 @@ pub fn human_size(n: u64) -> String {
     }
 }
 
+/// 锁超时时把「已经等过」和「参数不变直接重试」写清，避免模型整轮重发后还白等。
+pub fn locked_error(path: &str, waited_ms: u32) -> String {
+    format!(
+        "E_LOCKED {path} 正被其他进程修改；已自动等待 {waited_ms}ms，本次未写入任何内容，参数不变直接重试即可"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 锁错误给出无需重读的重试指令() {
+        let msg = locked_error("a.txt", 3000);
+        assert!(msg.starts_with("E_LOCKED"), "{msg}");
+        assert!(msg.contains("3000ms"), "应说明已等多久: {msg}");
+        assert!(
+            msg.contains("参数不变直接重试"),
+            "应给可直接照做的下一步: {msg}"
+        );
+    }
 
     #[test]
     fn 文件不存在时提示同目录相似文件() {

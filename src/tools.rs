@@ -237,7 +237,7 @@ pub fn tool_defs() -> Vec<Value> {
         def["inputSchema"]["additionalProperties"] = json!(false);
         if let Some(props) = def["inputSchema"]["properties"].as_object_mut() {
             for (key, spec) in props {
-                if spec["type"] == "integer" {
+                if spec["type"] == "integer" && spec.get("minimum").is_none() {
                     spec["minimum"] = json!(if matches!(key.as_str(), "start" | "end" | "limit") {
                         1
                     } else {
@@ -503,6 +503,16 @@ fn validate_args(name: &str, args: &Value) -> Option<String> {
     let def = tool_defs().into_iter().find(|d| d["name"] == name)?;
     let props = def["inputSchema"]["properties"].as_object()?;
     let obj = args.as_object()?;
+    // required：宿主把 schema 当提示文本时，漏必填不该等深层逻辑才发现。
+    if let Some(required) = def["inputSchema"]["required"].as_array() {
+        for key in required.iter().filter_map(|v| v.as_str()) {
+            if !obj.contains_key(key) {
+                return Some(format!(
+                    "E_BAD_ARGS {name} 缺少必填参数 {key}；补上后原样重试"
+                ));
+            }
+        }
+    }
     for (key, value) in obj {
         let Some(spec) = props.get(key) else {
             let nearest = props
@@ -544,6 +554,48 @@ fn validate_args(name: &str, args: &Value) -> Option<String> {
                 expected,
                 type_name(value)
             ));
+        }
+        // enum / minimum / maxItems / 数组项必填：这些约束写在 schema 里，
+        // 宿主未做严格校验时入口必须自己执行，否则模型要多付一轮试错。
+        if let Some(allowed) = spec["enum"].as_array() {
+            if !allowed.iter().any(|v| v == value) {
+                let options = allowed
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                return Some(format!(
+                    "E_BAD_ARGS {name}.{key}={value} 不在允许值内；可用 {options}"
+                ));
+            }
+        }
+        if let (Some(min), Some(n)) = (spec["minimum"].as_u64(), value.as_u64()) {
+            if n < min {
+                return Some(format!(
+                    "E_BAD_ARGS {name}.{key} 最小为 {min}，收到 {n}；改为 {min} 或更大值重试"
+                ));
+            }
+        }
+        if wanted == "array" {
+            if let (Some(max), Some(items)) = (spec["maxItems"].as_u64(), value.as_array()) {
+                if items.len() as u64 > max {
+                    return Some(format!(
+                        "E_BAD_ARGS {name}.{key} 最多 {max} 项，收到 {}；分批或改用 fs_grep 缩小范围",
+                        items.len()
+                    ));
+                }
+            }
+            if let Some(item_required) = spec["items"]["required"].as_array() {
+                for (index, item) in value.as_array().into_iter().flatten().enumerate() {
+                    for field in item_required.iter().filter_map(|v| v.as_str()) {
+                        if item.get(field).is_none() {
+                            return Some(format!(
+                                "E_BAD_ARGS {name}.{key}[{index}] 缺少必填字段 {field}；补上后原样重试"
+                            ));
+                        }
+                    }
+                }
+            }
         }
         if wanted == "array" && spec["items"]["type"] == "string" {
             for (index, item) in value.as_array().into_iter().flatten().enumerate() {
@@ -1474,6 +1526,11 @@ fn read(args: &Value) -> String {
             total_lines,
             snapshot.hash
         ));
+        if doc.encoding == "utf-8-lossy" {
+            header.push_str(
+                "… 警告：原文含无法解码的字节，正文里的 U+FFFD 是替换字符、不是原文；切勿据此 fs_write/fs_edit 写回，请先用 fs_file op=convert 转码或改按二进制处理\n",
+            );
+        }
         if let Some((focus, pattern)) = &focus_info {
             if focus.truncated {
                 header.push_str(&format!(
@@ -3472,6 +3529,55 @@ fn next_fn() {
             out.contains("fs_write") && out.contains("content="),
             "应给重建命令形状: {out}"
         );
+    }
+
+    #[test]
+    fn schema声明的约束在入口就被执行() {
+        // 宿主把 schema 当提示文本时，违反 required/enum/minimum/maxItems 的调用
+        // 会漏到深层才报错，甚至静默退回默认值；入口一次给可复制的修法。
+        let out = call("fs_grep", &json!({"pattern": "x", "output": "snippet"}));
+        assert!(out.starts_with("E_BAD_ARGS"), "{out}");
+        assert!(
+            out.contains("output") && out.contains("snippets"),
+            "应列出合法枚举值: {out}"
+        );
+
+        let out = call("fs_read", &json!({"path": "a", "start": 0}));
+        assert!(out.starts_with("E_BAD_ARGS"), "{out}");
+        assert!(
+            out.contains("start") && out.contains("1"),
+            "应给出下限: {out}"
+        );
+
+        let out = call("fs_grep", &json!({"limit": 1}));
+        assert!(out.starts_with("E_BAD_ARGS"), "{out}");
+        assert!(out.contains("pattern"), "应指出必填项: {out}");
+
+        let many: Vec<String> = (0..21).map(|i| format!("f{i}.txt")).collect();
+        let out = call("fs_read", &json!({"paths": many}));
+        assert!(out.starts_with("E_BAD_ARGS"), "{out}");
+        assert!(
+            out.contains("paths") && out.contains("20"),
+            "应给出上限: {out}"
+        );
+    }
+
+    #[test]
+    fn lossy解码时警告不可据此写回() {
+        // GBK/GB18030 都解不出时回落 utf-8-lossy，正文里的 U+FFFD 不是原文；
+        // 模型若据此 fs_write 写回，磁盘字节会被永久替换。
+        let dir = 临时目录("lossy-hint");
+        let path = dir.join("a.bin");
+        fs::write(&path, b"abc\xff\xfe\x80def\n").unwrap();
+        let posix = path.to_string_lossy().replace('\\', "/");
+        let out = read(&json!({"path": posix}));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(out.contains("utf-8-lossy"), "{out}");
+        assert!(
+            out.contains("警告") && out.contains("U+FFFD"),
+            "必须警告正文不可信: {out}"
+        );
+        assert!(out.contains("切勿"), "应给出写回禁令: {out}");
     }
 
     #[test]

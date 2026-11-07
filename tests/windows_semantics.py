@@ -801,7 +801,7 @@ for i in range(25):
     many_files.append(posix(fp))
 text, err = call("fs_read", paths=many_files)
 check("读 25 个文件时显式拒绝",
-      text.startswith("E_BAD_ARGS") and "20 个文件" in text and err is True, text)
+      text.startswith("E_BAD_ARGS") and "20" in text and "25" in text and err is True, text)
 text, err = call("fs_grep", path=posix(root), pattern="c1", context=9)
 check("context 超上限显式拒绝",
       text.startswith("E_BAD_ARGS") and "最大 5" in text and err is True, text)
