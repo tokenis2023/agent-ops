@@ -219,6 +219,7 @@ const TOOL_SPECS = [
       context: { type: 'integer', description: '上下文行数（最多 5）' },
       limit: { type: 'integer', description: '本页上限：files 按文件，其他按命中，默认 100' },
       max_per_file: { type: 'integer', description: '每个文件最多返回的命中数' },
+      max_line: { type: 'integer', description: '命中行最多显示字符数，默认 240；0 表示不截断，一次拿到完整长行' },
       offset: { type: 'integer', description: '跳过前 N 个结果，用于 next_offset 续取' },
       parallel: { type: 'boolean', description: '大仓库并行扫描；输出与串行一致' },
       budget: { type: 'integer', description: '响应最多字节数，默认 16384' },

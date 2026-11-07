@@ -160,6 +160,7 @@ pub fn tool_defs() -> Vec<Value> {
                     "context": {"type": "integer", "description": "上下文行数（最多 5）；matches 默认 0，snippets 默认 2"},
                     "limit": {"type": "integer", "description": "本页上限：files 按文件，matches/snippets 按命中，count 显式设置时按命中；默认 100（count 省略时完整统计），必须大于 0"},
                     "max_per_file": {"type": "integer", "description": "每个文件最多返回的命中数，默认不限制；省略部分会在尾注说明"},
+                    "max_line": {"type": "integer", "description": "命中行最多显示字符数，默认 240（与 fs_read 一致）；0 表示不截断，一次拿到完整长行，省掉再 fs_read 一轮"},
                     "offset": {"type": "integer", "description": "files 跳过前 N 个匹配文件，其他模式跳过前 N 个命中；用于 next_offset 续取"},
                     "parallel": {"type": "boolean", "description": "大仓库并行扫描；输出与串行一致，默认 false"},
                     "budget": {"type": "integer", "description": "最终响应最多字节数，默认 16384"},
@@ -3581,6 +3582,38 @@ fn next_fn() {
     }
 
     #[test]
+    fn grep_max_line_0一次拿到完整长行() {
+        // 硬裁 200 字符时模型看到半行，还得再 fs_read 一轮确认。
+        let dir = 临时目录("grep-max-line");
+        let long = format!("prefix{}suffix\n", "x".repeat(500));
+        fs::write(dir.join("a.txt"), &long).unwrap();
+        let path = dir.to_string_lossy().replace('\\', "/");
+        let out = grep_tool(&json!({
+            "pattern": "prefix", "path": path, "max_line": 0
+        }));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            out.contains("suffix") && out.contains(&"x".repeat(500)),
+            "max_line=0 应返回完整命中行，省掉再 fs_read 一轮: {out}"
+        );
+    }
+
+    #[test]
+    fn fs_grep_schema暴露max_line() {
+        let defs = tool_defs();
+        let grep = defs.iter().find(|d| d["name"] == "fs_grep").unwrap();
+        let props = &grep["inputSchema"]["properties"];
+        assert!(props["max_line"].is_object(), "grep 应暴露 max_line");
+        assert!(
+            props["max_line"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("0"),
+            "应说明 0 表示不截断"
+        );
+    }
+
+    #[test]
     fn fs_read描述包含模式互斥表() {
         // 模式互斥只能靠运行时错误教学的话，模型要付一轮试错；
         // description 里给一张组合表，让它在发出调用前就能拼出合法参数。
@@ -5013,16 +5046,19 @@ fn edit_tool(args: &Value) -> String {
     }
 
     // 按路径排序后统一加锁，避免两个批量任务以相反顺序互相等待。
-    let mut lock_order: Vec<usize> = (0..requests.len()).collect();
-    lock_order.sort_by_key(|&index| requests[index].fp.display());
+    // dry_run 只是预演、不会写入，不需要独占锁：否则会和真实写入互斥、白等 3 秒。
     let mut _locks = Vec::with_capacity(requests.len());
-    for index in lock_order {
-        match io::lock_path(&requests[index].fp, 3000) {
-            Ok(lock) => _locks.push(lock),
-            Err(e) if batch_mode => {
-                return format!("E_BATCH {}: {e}", requests[index].path);
+    if !dry_run {
+        let mut lock_order: Vec<usize> = (0..requests.len()).collect();
+        lock_order.sort_by_key(|&index| requests[index].fp.display());
+        for index in lock_order {
+            match io::lock_path(&requests[index].fp, 3000) {
+                Ok(lock) => _locks.push(lock),
+                Err(e) if batch_mode => {
+                    return format!("E_BATCH {}: {e}", requests[index].path);
+                }
+                Err(e) => return e,
             }
-            Err(e) => return e,
         }
     }
 
@@ -5163,9 +5199,14 @@ fn write(args: &Value) -> String {
         Ok(p) => p,
         Err(e) => return format!("E_BAD_PATH {e}"),
     };
-    let _write_lock = match io::lock_path(&fp, 3000) {
-        Ok(lock) => lock,
-        Err(e) => return e,
+    // dry_run 不落盘，不该抢占独占写锁。
+    let _write_lock = if arg_bool(args, "dry_run", false) {
+        None
+    } else {
+        match io::lock_path(&fp, 3000) {
+            Ok(lock) => Some(lock),
+            Err(e) => return e,
+        }
     };
 
     // DOCX 只支持整体重建，不做文本编辑；这避免把 Word 的复杂格式静默拍平。
@@ -5457,6 +5498,7 @@ fn grep_tool(args: &Value) -> String {
         limit,
         offset: arg_usize(args, "offset", 0),
         max_per_file: arg_usize(args, "max_per_file", usize::MAX),
+        max_line: arg_usize(args, "max_line", render::MAX_LINE_CHARS),
         budget,
         parallel: arg_bool(args, "parallel", false),
         time_budget_ms: arg_usize(args, "time_budget_ms", 5000) as u128,

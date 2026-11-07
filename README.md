@@ -155,7 +155,7 @@ node tests/dsh_plugin_smoke.mjs --exe target/debug/fsops.exe
 | `fs_edit` | 精确替换、正则替换、diff 自查、多文件批量、并发保护 | `edits`（`old/new` 或 `pattern/replacement`）、`files`、`diff`、`expect_hash`、`normalize_eol` |
 | `fs_write` | 新建或整体覆盖，原子写入，可生成 DOCX | `content`、`expect_hash`、`normalize_eol` |
 | `fs_glob` | 按 glob 找文件，尊重 `.gitignore`，带遍历时间预算，可输出 repo map | `pattern`、`path`、`dirs`、`detail`、`limit`、`offset`、`time_budget_ms`、`budget`、`map`、`focus` |
-| `fs_grep` | 正则搜索、四种输出、分页、并行，支持 DOCX/PDF 正文 | `pattern`、`output`、`context`、`max_per_file`、`max_file_size`、`offset`、`parallel` |
+| `fs_grep` | 正则搜索、四种输出、分页、并行，支持 DOCX/PDF 正文 | `pattern`、`output`、`context`、`max_per_file`、`max_line`、`max_file_size`、`offset`、`parallel` |
 | `fs_stat` | 元信息、编码、换行、hash；`detail=server` 一条调用自检服务端版本与工具数 | `path`/`paths`、`detail=meta/hash/full/server` |
 | `fs_exec` | 执行程序（argv 数组，不经过 shell），支持后台任务；替代 PowerShell 跑 cargo/git/npm | `program`、`args`、`cwd`、`timeout_ms`、`stdin`、`env`、`shell`、`check`、`background`、`job`、`list`、`wait_ms`、`kill`、`max_output` |
 | `fs_file` | 文件管理：copy/move/remove/mkdir/convert/archive/extract | `op`、`src`、`dst`、`path`、`confirm`、`recursive`、`overwrite`、`encoding`、`eol` |

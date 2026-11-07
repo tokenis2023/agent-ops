@@ -22,6 +22,8 @@ pub struct GrepOpts {
     pub offset: usize,
     /// 每个文件最多返回的命中数；只过滤展示流，不影响全局 offset
     pub max_per_file: usize,
+    /// 命中行最多显示字符数；0 表示不截断，与 fs_read 的 max_line 语义一致。
+    pub max_line: usize,
     pub budget: usize,
     pub max_file_size: u64,
     /// 并行扫描文件；保持与串行相同的稳定输出
@@ -43,6 +45,7 @@ impl Default for GrepOpts {
             limit: 100,
             offset: 0,
             max_per_file: usize::MAX,
+            max_line: crate::render::MAX_LINE_CHARS,
             budget: 8 * 1024,
             max_file_size: 8 * 1024 * 1024,
             parallel: false,
@@ -311,7 +314,11 @@ pub fn grep(root: &FsPath, opts: &GrepOpts) -> Result<GrepResult, String> {
                         path: e.path.clone(),
                         line: index + 1,
                         // 命中行按命中位置开窗；上下文行没有命中，从行首截断。
-                        text: trim_line_at(lines[index], is_match[index].then_some(&re)),
+                        text: trim_line_at(
+                            lines[index],
+                            is_match[index].then_some(&re),
+                            opts.max_line,
+                        ),
                         is_context: !is_match[index],
                     });
                 }
@@ -441,7 +448,7 @@ fn scan_parallel_file(
             if in_snippet[index] {
                 out.entries.push((
                     index + 1,
-                    trim_line_at(lines[index], is_match[index].then_some(re)),
+                    trim_line_at(lines[index], is_match[index].then_some(re), opts.max_line),
                     is_match[index],
                 ));
             }
@@ -738,12 +745,15 @@ fn grep_parallel(root: &FsPath, opts: &GrepOpts, re: &Regex) -> Result<GrepResul
     Ok(state.into_result(report.entries_visited, report.timed_out, report.stopped))
 }
 
-/// 把过长行裁到 200 字符；命中位置靠后时围绕命中开窗，否则模型看到的全是填充字符，
-/// 反而必须再读一次文件才能确认命中内容。
-fn trim_line_at(s: &str, needle: Option<&Regex>) -> String {
+/// 把过长行裁到 max 字符（max=0 不截断）；命中位置靠后时围绕命中开窗，
+/// 否则模型看到的全是填充字符，反而必须再读一次文件才能确认命中内容。
+fn trim_line_at(s: &str, needle: Option<&Regex>, max: usize) -> String {
     let t = s.trim_end();
+    if max == 0 {
+        return t.to_string();
+    }
     let chars: Vec<char> = t.chars().collect();
-    if chars.len() <= 200 {
+    if chars.len() <= max {
         return t.to_string();
     }
     // 找到命中在行内的字符位置，以它为中心取窗口。
@@ -754,8 +764,8 @@ fn trim_line_at(s: &str, needle: Option<&Regex>) -> String {
     const HALF: usize = 90;
     let start = center
         .saturating_sub(HALF)
-        .min(chars.len().saturating_sub(200));
-    let end = (start + 200).min(chars.len());
+        .min(chars.len().saturating_sub(max));
+    let end = (start + max).min(chars.len());
     let body: String = chars[start..end].iter().collect();
     match (start, end < chars.len()) {
         (0, true) => format!("{body}…"),
@@ -1049,8 +1059,8 @@ mod tests {
         assert!(text.ends_with('…'), "后方被截断应有省略号: {text}");
         // 长度仍受控
         assert!(
-            text.chars().count() <= 202,
-            "窗口不应超过 200 字符: {}",
+            text.chars().count() <= 242,
+            "窗口不应超过 240 字符: {}",
             text.chars().count()
         );
     }
