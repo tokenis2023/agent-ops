@@ -251,14 +251,38 @@ for (const [toolName, definition] of ctx.registered) {
     }
     const mcpKeys = Object.keys(def.inputSchema?.properties ?? {}).sort()
     const dshKeys = Object.keys(definition.parameters ?? {}).sort()
-    const same =
-      mcpKeys.length === dshKeys.length && mcpKeys.every((k, i) => k === dshKeys[i])
+    // DSH 每次调用都是新进程，长驻后台任务不可用，这 5 个参数刻意不暴露；
+    // 除此之外两侧参数集合必须完全一致，任何多出/缺失都是契约漂移。
+    const dshAbsent = new Set(['background', 'job', 'list', 'wait_ms', 'kill'])
+    const extra = dshKeys.filter((k) => !mcpKeys.includes(k))
+    const missing = mcpKeys.filter((k) => !dshKeys.includes(k) && !dshAbsent.has(k))
     check(
-      same,
-      'schema 一致：' + toolName + ' 参数集合相同',
-      'MCP: ' + mcpKeys.join(',') + ' / DSH: ' + dshKeys.join(','),
+      extra.length === 0 && missing.length === 0,
+      'schema 一致：' + toolName + ' 参数集合',
+      'DSH 多出: ' + extra.join(',') + ' / DSH 缺失(非后台参数): ' + missing.join(','),
     )
   }
+  // 关键能力词必须在两端 description 里都出现：MCP 端曾漏写「正则替换」，
+  // 害模型先 fs_read 抄原文再 old/new，白多一轮。
+  for (const [tool, words] of Object.entries({
+    fs_edit: ['正则替换'],
+    fs_read: ['四选一'],
+  })) {
+    const dshDesc = ctx.registered.get(tool)?.description ?? ''
+    const mcpDesc = defs.find((d) => d.name === tool)?.description ?? ''
+    for (const word of words) {
+      check(
+        dshDesc.includes(word) && mcpDesc.includes(word),
+        '描述能力一致：' + tool + ' 含 ' + word,
+        'MCP: ' + mcpDesc.slice(0, 80) + ' / DSH: ' + dshDesc.slice(0, 80),
+      )
+    }
+  }
+  const execParams = Object.keys(ctx.registered.get('fs_exec')?.parameters ?? {})
+  const forbidden = ['background', 'job', 'list', 'wait_ms', 'kill'].filter((k) =>
+    execParams.includes(k),
+  )
+  check(forbidden.length === 0, 'fs_exec 不暴露后台任务参数', forbidden.join(','))
 }
 
 // ---- 5. 真实调用 -----------------------------------------------------------
