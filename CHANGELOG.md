@@ -2,6 +2,15 @@
 
 本项目使用语义化版本。日期为发布日。
 
+## [0.5.0] - 2026-11-07
+
+- `fs_grep` 的 `parallel` 改为三态：省略即自动（小仓库串行，满一波候选后并行），`true`/`false` 强制。Auto 在满一波前逐个串行扫描，保留「满页即停」，不因并行多访问后续目录项。
+- 实测（release，5 次中位）：40 文件与串行持平（5.9ms vs 6.3ms），500 文件 52.6ms → 31.9ms（1.65×），3000 文件 330.3ms → 178.7ms（1.85×）；自动/强制并行/串行三种输出逐字节一致。
+- 修复 `fs_exec` 的 `cwd` 不经路径层：`/d/repo` 原样交给 `current_dir` 报 `os error 267`，还把目录问题误导成 PATH 问题。现与文件工具同一套解析（POSIX / 原生 / `~/` / 相对路径），不存在时返回 `E_BAD_ARGS` 并给出解析结果。
+- 修复一行安装命令在 Windows PowerShell 5.1 下因 BOM 解析失败：`irm` 把 BOM 解成 `ï»¿` 导致 `[CmdletBinding()]` 不再是首语句，改用 `Net.WebClient` 取原始字节 + 去 BOM + `scriptblock::Create`。
+- schema、DSH 插件描述、`工具参考`、`AGENTS.md` 同步自动并行语义与 cwd 路径形式。
+- 版本 0.5.0，新增 8 个单测（自动并行 6 + cwd 2），`check.ps1 full` 七项门禁全绿。
+
 ## [0.4.1] - 2026-11-07
 
 - 修复 `fs_read block=true` 在缩进语言（Python 等）上找不到花括号块时静默读到文件末尾：现在文件头明确提示已按 `start..end` 普通读取，并给出 `fs_grep` 定位后传 `ranges` 的替代路径。

@@ -162,7 +162,7 @@ pub fn tool_defs() -> Vec<Value> {
                     "max_per_file": {"type": "integer", "description": "每个文件最多返回的命中数，默认不限制；省略部分会在尾注说明"},
                     "max_line": {"type": "integer", "description": "命中行最多显示字符数，默认 240（与 fs_read 一致）；0 表示不截断，一次拿到完整长行，省掉再 fs_read 一轮"},
                     "offset": {"type": "integer", "description": "files 跳过前 N 个匹配文件，其他模式跳过前 N 个命中；用于 next_offset 续取"},
-                    "parallel": {"type": "boolean", "description": "大仓库并行扫描；输出与串行一致，默认 false"},
+                    "parallel": {"type": "boolean", "description": "并行扫描；省略时自动按仓库规模选择：小仓库串行，大仓库并行；true 强制并行，false 强制串行；输出与串行一致"},
                     "budget": {"type": "integer", "description": "最终响应最多字节数，默认 16384"},
                     "time_budget_ms": {"type": "integer", "description": "文件与目录遍历总时间预算，默认 5000 毫秒"},
                     "max_file_size": {"type": "integer", "description": "只搜索不超过该字节数的文件，默认 8388608（8 MiB）；0 表示不限制。被跳过的文件会在尾注报告"},
@@ -5559,7 +5559,11 @@ fn grep_tool(args: &Value) -> String {
         max_per_file: arg_usize(args, "max_per_file", usize::MAX),
         max_line: arg_usize(args, "max_line", render::MAX_LINE_CHARS),
         budget,
-        parallel: arg_bool(args, "parallel", false),
+        parallel: match args.get("parallel").and_then(Value::as_bool) {
+            None => search::ParallelMode::Auto,
+            Some(true) => search::ParallelMode::On,
+            Some(false) => search::ParallelMode::Off,
+        },
         time_budget_ms: arg_usize(args, "time_budget_ms", 5000) as u128,
         no_ignore: arg_bool(args, "no_ignore", false),
         ..Default::default()

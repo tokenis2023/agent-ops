@@ -46,7 +46,7 @@
 1. 大范围初筛用 `output=files` 或 `output=count`。
 2. 定位用 `output=snippets`。
 3. 截断时使用返回的 `next_offset`，不要自己猜测偏移。
-4. 大仓库可以设置 `parallel=true`。
+4. 搜索默认自动并行（小仓库串行），一般无需设置 `parallel`；调优时才显式 `true`/`false`。
 
 ### 大文件
 

@@ -216,7 +216,7 @@ const TOOL_SPECS = [
       max_per_file: { type: 'integer', description: '每个文件最多返回的命中数' },
       max_line: { type: 'integer', description: '命中行最多显示字符数，默认 240；0 表示不截断，一次拿到完整长行' },
       offset: { type: 'integer', description: '跳过前 N 个结果，用于 next_offset 续取' },
-      parallel: { type: 'boolean', description: '大仓库并行扫描；输出与串行一致' },
+      parallel: { type: 'boolean', description: '并行扫描；省略时自动按仓库规模选择：小仓库串行，大仓库并行；输出与串行一致' },
       budget: { type: 'integer', description: '响应最多字节数，默认 16384' },
       time_budget_ms: { type: 'integer', description: '遍历总时间预算，默认 5000 毫秒' },
       max_file_size: { type: 'integer', description: '只搜索不超过该字节数的文件，默认 8 MiB；0 表示不限制' },

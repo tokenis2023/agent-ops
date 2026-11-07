@@ -47,7 +47,16 @@ pub fn build_command(args: &Value) -> Result<(Command, String), String> {
         c
     };
     if let Some(dir) = crate::tools::arg_str(args, "cwd") {
-        command.current_dir(dir);
+        // 与文件工具同一套路径解析：/c/...、~/、相对路径都接受。
+        let cwd =
+            crate::paths::FsPath::parse(dir).map_err(|e| format!("E_BAD_ARGS cwd `{dir}`：{e}"))?;
+        if !cwd.is_dir() {
+            return Err(format!(
+                "E_BAD_ARGS cwd `{dir}` 不存在或不是目录（解析为 {}）",
+                cwd.display()
+            ));
+        }
+        command.current_dir(cwd.wide());
     }
     if let Some(env) = args.get("env").and_then(Value::as_object) {
         for (key, value) in env {
@@ -281,5 +290,46 @@ mod tests {
         let out = run(&json!({"program": "definitely-not-a-real-program-xyz"}));
         assert!(out.starts_with("E_NOT_FOUND"), "{out}");
         assert!(out.contains("PATH"), "{out}");
+    }
+
+    #[test]
+    fn cwd接受posix与原生两种形式() {
+        // 模型的路径习惯是 /c/...；cwd 不能只认原生形式，否则要白跑一轮。
+        let dir = std::env::temp_dir().join(format!("fsops-exec-cwd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let native = dir.to_string_lossy().to_string();
+        let mut chars = native.chars();
+        let drive = chars.next().unwrap().to_ascii_lowercase();
+        let rest = chars.as_str().trim_start_matches(':').replace('\\', "/");
+        let posix = format!("/{drive}{rest}");
+        let name = dir
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_ascii_lowercase();
+
+        for cwd in [posix, native] {
+            let out = run(&json!({"program": "cmd", "args": ["/c", "cd"], "cwd": cwd}));
+            assert!(out.starts_with("ok exit=0"), "cwd={cwd}: {out}");
+            assert!(
+                out.to_ascii_lowercase().contains(&name),
+                "cwd={cwd} 未进入目标目录: {out}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cwd不存在时给出清晰错误() {
+        let missing =
+            std::env::temp_dir().join(format!("fsops-exec-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing);
+        let out = run(&json!({
+            "program": "cmd",
+            "args": ["/c", "cd"],
+            "cwd": missing.to_string_lossy(),
+        }));
+        assert!(out.starts_with("E_BAD_ARGS"), "{out}");
+        assert!(out.contains("cwd"), "{out}");
     }
 }

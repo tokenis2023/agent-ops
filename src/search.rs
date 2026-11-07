@@ -10,6 +10,18 @@ use crate::text;
 use crate::walk::{self, VisitControl, WalkOpts};
 use regex::Regex;
 
+/// 并行策略：默认 Auto 按候选文件数自动选择；显式 On/Off 强制，供测试与调优。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ParallelMode {
+    /// 大仓库（攒满一波候选）并行，不足一波的小仓库串行
+    #[default]
+    Auto,
+    /// 强制并行
+    On,
+    /// 强制串行
+    Off,
+}
+
 pub struct GrepOpts {
     pub pattern: String,
     /// 输出模式进入执行层：files/count 不能复用逐命中截断语义。
@@ -27,7 +39,7 @@ pub struct GrepOpts {
     pub budget: usize,
     pub max_file_size: u64,
     /// 并行扫描文件；保持与串行相同的稳定输出
-    pub parallel: bool,
+    pub parallel: ParallelMode,
     /// 时间预算：超时后返回已找到的结果并标注，避免在 C:\ 这种根目录上卡死
     pub time_budget_ms: u128,
     /// 忽略 .gitignore 与 node_modules/target 等硬跳过目录；用于查依赖源码或构建产物
@@ -48,7 +60,7 @@ impl Default for GrepOpts {
             max_line: crate::render::MAX_LINE_CHARS,
             budget: 8 * 1024,
             max_file_size: 8 * 1024 * 1024,
-            parallel: false,
+            parallel: ParallelMode::Auto,
             time_budget_ms: 5000,
             no_ignore: false,
         }
@@ -114,6 +126,21 @@ pub(crate) fn matches_everywhere(re: &Regex) -> bool {
     SAMPLES.iter().all(|s| re.is_match(s))
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_PARALLEL_WAVES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn test_reset_parallel_waves() {
+    TEST_PARALLEL_WAVES.with(|c| c.set(0));
+}
+
+#[cfg(test)]
+fn test_parallel_waves() -> usize {
+    TEST_PARALLEL_WAVES.with(|c| c.get())
+}
+
 pub fn grep(root: &FsPath, opts: &GrepOpts) -> Result<GrepResult, String> {
     let mut pat = opts.pattern.clone();
     if opts.ignore_case {
@@ -144,8 +171,14 @@ pub fn grep(root: &FsPath, opts: &GrepOpts) -> Result<GrepResult, String> {
             opts.pattern
         ));
     }
-    if opts.parallel && root.is_dir() {
-        return grep_parallel(root, opts, &re);
+    // Auto 也走波次路径：满一波（最多 128 候选）前逐个串行扫描，保留满页即停；
+    // 攒满一波证明是大仓库后才切并行。避免预探测带来的双倍目录遍历。
+    let parallel = match opts.parallel {
+        ParallelMode::On | ParallelMode::Auto => root.is_dir(),
+        ParallelMode::Off => false,
+    };
+    if parallel {
+        return grep_parallel(root, opts, &re, opts.parallel == ParallelMode::Auto);
     }
 
     let mut hits = Vec::new();
@@ -610,6 +643,8 @@ fn scan_wave(
     deadline: std::time::Instant,
     chunk_size: usize,
 ) -> Vec<ParallelFileScan> {
+    #[cfg(test)]
+    TEST_PARALLEL_WAVES.with(|c| c.set(c.get() + 1));
     std::thread::scope(|scope| {
         let mut handles = Vec::new();
         for chunk in wave.chunks(chunk_size) {
@@ -630,9 +665,29 @@ fn scan_wave(
     })
 }
 
+/// 小仓库扫尾：同一扫描函数串行执行，不起线程。
+fn scan_wave_serial(
+    root: &FsPath,
+    wave: &[walk::Entry],
+    re: &Regex,
+    opts: &GrepOpts,
+    materialize_cap: usize,
+    deadline: std::time::Instant,
+) -> Vec<ParallelFileScan> {
+    wave.iter()
+        .map(|entry| scan_parallel_file(root, entry, re, opts, materialize_cap, deadline))
+        .collect()
+}
+
 /// 按路径顺序分波并行扫描：遍历回调攒满一波就立即扫描并按序合并，
 /// 满页或超时立刻停止遍历，内存上限是“一个波次”而不是全部候选文件。
-fn grep_parallel(root: &FsPath, opts: &GrepOpts, re: &Regex) -> Result<GrepResult, String> {
+/// `auto`：攒满一波前逐个串行扫描（保留满页即停、零线程开销）；满波后全程并行。
+fn grep_parallel(
+    root: &FsPath,
+    opts: &GrepOpts,
+    re: &Regex,
+    auto: bool,
+) -> Result<GrepResult, String> {
     let deadline = std::time::Instant::now()
         + std::time::Duration::from_millis(opts.time_budget_ms.min(u64::MAX as u128) as u64);
     if std::time::Instant::now() > deadline {
@@ -672,6 +727,8 @@ fn grep_parallel(root: &FsPath, opts: &GrepOpts, re: &Regex) -> Result<GrepResul
     // 满页后先不立刻停：还要看是否真有下一个可扫描文件，
     // 才能给出与“还有后续文件”一致的 truncated 标记。
     let mut peek_more = false;
+    let mut saw_full_wave = false;
+    let mut inline_seen = 0usize;
     let report = walk::visit(
         root,
         &opts.glob,
@@ -704,6 +761,19 @@ fn grep_parallel(root: &FsPath, opts: &GrepOpts, re: &Regex) -> Result<GrepResul
                 state.largest_skipped = state.largest_skipped.max(entry.size);
                 return VisitControl::Continue;
             }
+            // Auto 且未攒满一波：逐个串行扫描、立即合并，保留串行路径的
+            // “满页即停”语义；第 wave_files 个候选证明是大仓库，之后才切并行。
+            if auto && !saw_full_wave {
+                let scan = scan_parallel_file(root, &entry, re, opts, materialize_cap, deadline);
+                inline_seen += 1;
+                if inline_seen >= wave_files {
+                    saw_full_wave = true;
+                }
+                if !state.merge(vec![scan], opts) {
+                    return VisitControl::Stop;
+                }
+                return VisitControl::Continue;
+            }
             pending.push(entry);
             if pending.len() >= wave_files {
                 let scans = scan_wave(
@@ -727,17 +797,21 @@ fn grep_parallel(root: &FsPath, opts: &GrepOpts, re: &Regex) -> Result<GrepResul
         },
     )?;
 
-    // 收尾不足一波的条目。
+    // 收尾不足一波的条目：Auto 且从未满波（小仓库）时串行，不起线程。
     if !pending.is_empty() {
-        let scans = scan_wave(
-            root,
-            &pending,
-            re,
-            opts,
-            materialize_cap,
-            deadline,
-            chunk_size,
-        );
+        let scans = if !auto || saw_full_wave {
+            scan_wave(
+                root,
+                &pending,
+                re,
+                opts,
+                materialize_cap,
+                deadline,
+                chunk_size,
+            )
+        } else {
+            scan_wave_serial(root, &pending, re, opts, materialize_cap, deadline)
+        };
         pending.clear();
         state.merge(scans, opts);
     }
@@ -968,7 +1042,7 @@ mod tests {
         fs::write(dir.join("b.txt"), "needle\n").unwrap();
         let root = FsPath::parse(&dir.to_string_lossy()).unwrap();
 
-        for parallel in [false, true] {
+        for parallel in [ParallelMode::Off, ParallelMode::On] {
             let result = grep(
                 &root,
                 &GrepOpts {
@@ -983,7 +1057,7 @@ mod tests {
             assert_eq!(
                 result.file_counts,
                 vec![("a.txt".to_string(), 2), ("b.txt".to_string(), 1)],
-                "parallel={parallel}"
+                "parallel={parallel:?}"
             );
             assert!(
                 result.hits.is_empty(),
@@ -1193,7 +1267,7 @@ mod tests {
         let root = FsPath::parse(&dir.to_string_lossy()).unwrap();
 
         let mut rendered = Vec::new();
-        for parallel in [false, true] {
+        for parallel in [ParallelMode::Off, ParallelMode::On] {
             let r = grep(
                 &root,
                 &GrepOpts {
@@ -1222,9 +1296,9 @@ mod tests {
                     (39_999, "pad", true),
                     (40_000, "needle-39999", false),
                 ],
-                "parallel={parallel}"
+                "parallel={parallel:?}"
             );
-            assert_eq!(r.match_count, 3, "parallel={parallel}");
+            assert_eq!(r.match_count, 3, "parallel={parallel:?}");
             rendered.push(render(&r));
         }
         let _ = fs::remove_dir_all(&dir);
@@ -1247,7 +1321,7 @@ mod tests {
             &GrepOpts {
                 pattern: "needle".into(),
                 limit: 3,
-                parallel: true,
+                parallel: ParallelMode::On,
                 ..Default::default()
             },
         )
@@ -1332,8 +1406,8 @@ mod tests {
                         parallel,
                         ..Default::default()
                     };
-                    let serial = grep(&root, &make(false)).unwrap();
-                    let parallel = grep(&root, &make(true)).unwrap();
+                    let serial = grep(&root, &make(ParallelMode::Off)).unwrap();
+                    let parallel = grep(&root, &make(ParallelMode::On)).unwrap();
                     let case = format!(
                         "{output:?} limit={limit} offset={offset} \
                          max_per_file={max_per_file} context={context}"
@@ -1382,8 +1456,8 @@ mod tests {
                     parallel,
                     ..Default::default()
                 };
-                let serial = grep(&root, &make(false)).unwrap();
-                let parallel = grep(&root, &make(true)).unwrap();
+                let serial = grep(&root, &make(ParallelMode::Off)).unwrap();
+                let parallel = grep(&root, &make(ParallelMode::On)).unwrap();
                 let case =
                     format!("{output:?} limit={limit} offset={offset} max_per_file={max_per_file}");
                 assert_eq!(
@@ -1405,7 +1479,7 @@ mod tests {
                 output: GrepOutput::Count,
                 limit: usize::MAX,
                 max_per_file: 2,
-                parallel: true,
+                parallel: ParallelMode::On,
                 ..Default::default()
             },
         )
@@ -1441,7 +1515,7 @@ mod tests {
                 pattern: "needle".into(),
                 output: GrepOutput::Files,
                 limit: 1,
-                parallel: true,
+                parallel: ParallelMode::On,
                 ..Default::default()
             },
         )
@@ -1517,7 +1591,7 @@ mod tests {
             let parallel = grep(
                 &root,
                 &GrepOpts {
-                    parallel: true,
+                    parallel: ParallelMode::On,
                     ..base
                 },
             )
@@ -1563,7 +1637,7 @@ mod tests {
         let parallel = grep(
             &root,
             &GrepOpts {
-                parallel: true,
+                parallel: ParallelMode::On,
                 ..opts
             },
         )
@@ -1856,7 +1930,7 @@ mod tests {
         fs::write(dir.join("zzz_last.txt"), "needle\n").unwrap();
         let root = FsPath::parse(&dir.to_string_lossy()).unwrap();
 
-        for parallel in [false, true] {
+        for parallel in [ParallelMode::Off, ParallelMode::On] {
             let r = grep(
                 &root,
                 &GrepOpts {
@@ -1868,14 +1942,14 @@ mod tests {
                 },
             )
             .unwrap();
-            assert!(r.hits.is_empty(), "parallel={parallel}: 不应有命中");
+            assert!(r.hits.is_empty(), "parallel={parallel:?}: 不应有命中");
             assert!(
                 r.timed_out,
-                "parallel={parallel}: walk 超时被吞掉，报成了无命中"
+                "parallel={parallel:?}: walk 超时被吞掉，报成了无命中"
             );
             assert!(
                 r.truncated,
-                "parallel={parallel}: 遍历不完整必须标记 truncated"
+                "parallel={parallel:?}: 遍历不完整必须标记 truncated"
             );
         }
         let _ = fs::remove_dir_all(&dir);
@@ -1897,7 +1971,7 @@ mod tests {
                 pattern: "needle".into(),
                 output: GrepOutput::Count,
                 limit: usize::MAX,
-                parallel: true,
+                parallel: ParallelMode::On,
                 time_budget_ms: 30,
                 ..Default::default()
             },
@@ -1949,5 +2023,165 @@ mod tests {
             files_skipped_large: 0,
             largest_skipped: 0,
         }
+    }
+
+    // ---- 自动并行：默认 Auto，满一波并行、不足一波串行 ----
+
+    fn 自动并行夹具(label: &str, files: usize) -> (std::path::PathBuf, FsPath) {
+        let dir = std::env::temp_dir().join(format!(
+            "fsops-auto-parallel-{}-{label}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        for i in 0..files {
+            fs::write(dir.join(format!("f{i}.txt")), "needle\n").unwrap();
+        }
+        let root = FsPath::parse(&dir.to_string_lossy()).unwrap();
+        (dir, root)
+    }
+
+    #[test]
+    fn 自动模式_小仓库保持串行() {
+        let (dir, root) = 自动并行夹具("small", 3);
+        test_reset_parallel_waves();
+        let opts = GrepOpts {
+            pattern: "needle".into(),
+            ..Default::default()
+        };
+        assert_eq!(opts.parallel, ParallelMode::Auto, "默认必须是 Auto");
+        let r = grep(&root, &opts).unwrap();
+        assert_eq!(r.match_count, 3);
+        assert_eq!(test_parallel_waves(), 0, "不足一波的小仓库不应起并行线程");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 自动模式_小仓库满页即停() {
+        // 默认 Auto 在证明大仓库之前必须保留串行路径的“满页即停”：
+        // 命中在第 2 个文件凑满 limit，第 3 个文件不应被访问。
+        let (dir, root) = 自动并行夹具("early-stop", 0);
+        fs::write(dir.join("a.txt"), "pad\n").unwrap();
+        fs::write(dir.join("b.txt"), "needle\nneedle\n").unwrap();
+        fs::write(dir.join("c.txt"), "needle\n").unwrap();
+        let r = grep(
+            &root,
+            &GrepOpts {
+                pattern: "needle".into(),
+                limit: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(r.match_count, 1);
+        assert_eq!(r.files_scanned, 2);
+        assert_eq!(r.entries_visited, 2, "满页后仍访问了后续目录项");
+        assert!(r.truncated);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 自动模式_满一波的大仓库并行且输出一致() {
+        // 一波最多 8 线程 × 16 = 128 个候选；130 个保证任何机器都至少满一波。
+        // limit 必须大于文件数：否则 Auto 的满页即停在满波前就停扫（正确行为），
+        // 本用例要验证的是“扫完大仓库时走并行且输出一致”。
+        let (dir, root) = 自动并行夹具("large", 130);
+        let serial = grep(
+            &root,
+            &GrepOpts {
+                pattern: "needle".into(),
+                limit: 200,
+                parallel: ParallelMode::Off,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        test_reset_parallel_waves();
+        let auto = grep(
+            &root,
+            &GrepOpts {
+                pattern: "needle".into(),
+                limit: 200,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(test_parallel_waves() >= 1, "攒满一波必须并行");
+        assert_eq!(auto.match_count, serial.match_count);
+        assert_eq!(
+            render_mode(&auto, GrepOutput::Matches, 8192).text,
+            render_mode(&serial, GrepOutput::Matches, 8192).text,
+            "自动并行输出必须与串行一致"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 自动模式_空文件与超大文件不计入候选() {
+        let (dir, root) = 自动并行夹具("skip", 2);
+        for i in 0..130 {
+            fs::write(dir.join(format!("e{i}.txt")), "").unwrap();
+        }
+        fs::write(dir.join("huge.txt"), "x".repeat(1024)).unwrap();
+        test_reset_parallel_waves();
+        let r = grep(
+            &root,
+            &GrepOpts {
+                pattern: "needle".into(),
+                max_file_size: 100,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(r.match_count, 2);
+        assert_eq!(
+            test_parallel_waves(),
+            0,
+            "空文件与超大文件凑不成一波，仍串行"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 自动模式_glob外文件不计入候选() {
+        let (dir, root) = 自动并行夹具("glob", 2);
+        for i in 0..130 {
+            fs::write(dir.join(format!("g{i}.rs")), "needle\n").unwrap();
+        }
+        test_reset_parallel_waves();
+        let r = grep(
+            &root,
+            &GrepOpts {
+                pattern: "needle".into(),
+                glob: "**/*.txt".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(r.match_count, 2);
+        assert_eq!(test_parallel_waves(), 0, "glob 过滤后不足一波，仍串行");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 显式模式优先于自动() {
+        let (dir, root) = 自动并行夹具("explicit", 3);
+        test_reset_parallel_waves();
+        let off = GrepOpts {
+            pattern: "needle".into(),
+            parallel: ParallelMode::Off,
+            ..Default::default()
+        };
+        grep(&root, &off).unwrap();
+        assert_eq!(test_parallel_waves(), 0, "Off 强制串行");
+        test_reset_parallel_waves();
+        let on = GrepOpts {
+            pattern: "needle".into(),
+            parallel: ParallelMode::On,
+            ..Default::default()
+        };
+        grep(&root, &on).unwrap();
+        assert!(test_parallel_waves() >= 1, "On 强制并行，小仓库也起线程");
+        let _ = fs::remove_dir_all(&dir);
     }
 }
