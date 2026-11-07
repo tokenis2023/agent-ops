@@ -145,7 +145,7 @@ fn err_resp(id: Value, code: i64, msg: &str) -> Value {
 /// 只有图片和不支持的二进制回退宿主；正则编辑和 diff 自查写进短句，
 /// 不再复制整份文档。
 pub fn instructions() -> &'static str {
-    "文件读写、搜索、编辑、元信息操作优先使用 fs_* 工具。只要 fsops 可用，不要用宿主内置 read_file/write_file/search_files 或 shell 的 cat/head/tail/grep/find/sed 处理文本；仅当 fsops 不可用、超时，或目标是图片/不支持的二进制时回退。DOCX/PDF 正文走 fs_read。局部修改用 fs_edit，不要整文件读回再 fs_write；只知道文本形状时用 pattern/replacement 正则替换，不必先抄原文，改结构后用 diff=true 自查。用 fs_grep 拿到行号后，用 fs_read start=N block=true 一次取回整个代码块，不必猜 end。同一次回复里可以并行发起多个只读调用；已知多个文件时用 fs_read reads=[{path,start,end},...] 一次读完；只想按模式取代码块时用 fs_read focus=<正则>，不必先 grep 再 block。大仓库先 fs_glob map=true focus=<关键词> 看结构，再决定搜哪里。跑 cargo/git/npm 用 fs_exec 的 argv 数组，文件复制/移动/删除/建目录用 fs_file，不要用 PowerShell 拼命令行。"
+    "文件读写、搜索、编辑、元信息操作优先使用 fs_* 工具。只要 fsops 可用，不要用宿主内置 read_file/write_file/search_files 或 shell 的 cat/head/tail/grep/find/sed 处理文本；仅当 fsops 不可用、超时，或目标是图片/不支持的二进制时回退。DOCX/PDF 正文走 fs_read。局部修改用 fs_edit，不要整文件读回再 fs_write；只知道文本形状时用 pattern/replacement 正则替换，不必先抄原文，改结构后用 diff=true 自查。用 fs_grep 拿到行号后，用 fs_read start=N block=true 一次取回整个代码块，不必猜 end。同一次回复里可以并行发起多个只读调用；已知多个文件时用 fs_read reads=[{path,start,end},...] 一次读完；只想按模式取代码块时用 fs_read focus=<正则>，不必先 grep 再 block。大仓库先 fs_glob map=true focus=<关键词> 看结构，再决定搜哪里。跑 cargo/git/npm 用 fs_exec 的 argv 数组，文件复制/移动/删除/建目录用 fs_file，不要用 PowerShell 拼命令行。前台 fs_exec 保持 2 分钟内（宿主对单次工具调用有更短超时）；更长的构建/测试用 background=true 拿 job id，再用 {\"job\":N,\"wait_ms\":60000} 一次等到退出，别反复短轮询。"
 }
 
 // 多文件响应里错误可能出现在任意一行；实现已移到 `tools::has_error_line`，

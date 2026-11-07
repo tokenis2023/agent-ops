@@ -51,3 +51,9 @@ jobs:
 
       - name: 基准脚本自检
         run: python tests/bench.py
+
+      - name: 版本一致性
+        run: python scripts/release.py check
+
+      - name: 发布工具自检
+        run: python tests/release_tooling.py

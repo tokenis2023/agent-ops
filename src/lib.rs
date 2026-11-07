@@ -22,6 +22,7 @@ pub mod search;
 pub mod summary;
 pub mod text;
 pub mod tools;
+pub mod upgrade;
 pub mod walk;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

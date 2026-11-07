@@ -100,6 +100,8 @@ try {
         Invoke-Step 'cargo build' 'cargo build'
         Invoke-Step '真实 MCP e2e' 'python tests/windows_semantics.py'
         Invoke-Step '任务级基准' 'python tests/task_bench.py --exe target/debug/fsops.exe'
+        Invoke-Step '版本一致性' 'python scripts/release.py check'
+        Invoke-Step '发布工具自检' 'python tests/release_tooling.py'
         if (Get-Command node -ErrorAction SilentlyContinue) {
             Invoke-Step 'DSH 插件冒烟' 'node tests/dsh_plugin_smoke.mjs --exe target/debug/fsops.exe'
         }

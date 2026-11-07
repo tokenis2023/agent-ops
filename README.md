@@ -36,6 +36,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create
 - 加入用户 `PATH`
 - 自动注册检测到的 Claude Code、Hermes 和 Codex
 
+升级：`fsops upgrade`（查最新 Release → SHA-256 校验 → 就地替换），或重跑同一行安装脚本。
+
 装完后在项目根目录执行 `fsops integrate --rules`，让 Agent 优先选择 fsops。
 
 跳过宿主注册或 PATH 修改：

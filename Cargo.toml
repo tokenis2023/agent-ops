@@ -1,6 +1,6 @@
 [package]
 name = "fsops"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.88"
 description = "面向 AI Agent 的 Windows 原生文件操作层：POSIX 语义、紧凑输出、低 token"
@@ -26,6 +26,7 @@ ignore = "0.4"
 globset = "0.4"
 encoding_rs = "0.8"
 blake3 = "1"
+sha2 = "0.10"
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
 quick-xml = "0.31"
 pdf-extract = "0.12"

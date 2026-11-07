@@ -101,7 +101,14 @@ pub fn run(args: &Value) -> String {
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) => {
-            return format!("E_NOT_FOUND program={program}：{e}；检查 PATH 或写绝对路径");
+            // 相对/ POSIX 形式的 program 会被 CreateProcess 按宿主进程目录解析，
+            // 不随 cwd 走；直接点明，避免模型按 cwd 猜路径白跑一轮。
+            let hint = if program_is_relative(&program) {
+                "；program 需原生绝对路径（如 D:/repo/x.exe）或交给 PATH；相对路径不随 cwd 解析"
+            } else {
+                "；检查 PATH 或写绝对路径"
+            };
+            return format!("E_NOT_FOUND program={program}：{e}{hint}");
         }
     };
     if let Some(text) = stdin_text {
@@ -168,6 +175,15 @@ pub fn run(args: &Value) -> String {
         text.push_str("（无输出）\n");
     }
     text
+}
+
+/// 带路径分隔符但不是 Windows 原生绝对路径（相对路径、/d/... 形式）。
+fn program_is_relative(program: &str) -> bool {
+    let p = program.trim();
+    let has_separator = p.contains('/') || p.contains('\\');
+    let native_absolute = p.starts_with("\\\\")
+        || (p.len() >= 2 && p.as_bytes()[1] == b':' && p.as_bytes()[0].is_ascii_alphabetic());
+    has_separator && !native_absolute
 }
 
 fn push_stream(text: &mut String, name: &str, content: &str, kept: usize, total: usize) {
@@ -290,6 +306,17 @@ mod tests {
         let out = run(&json!({"program": "definitely-not-a-real-program-xyz"}));
         assert!(out.starts_with("E_NOT_FOUND"), "{out}");
         assert!(out.contains("PATH"), "{out}");
+    }
+
+    #[test]
+    fn 相对program路径提示不随cwd解析() {
+        let out = run(&json!({
+            "program": "no-such-dir/fsops.exe",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+        }));
+        assert!(out.starts_with("E_NOT_FOUND"), "{out}");
+        assert!(out.contains("不随 cwd"), "{out}");
+        assert!(out.contains("绝对路径"), "{out}");
     }
 
     #[test]

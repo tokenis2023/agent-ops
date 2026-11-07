@@ -36,6 +36,7 @@ pub fn run(args: &[String]) -> i32 {
         "doctor" => return crate::adopt::doctor(rest),
         "harden" => return crate::harden::run(rest),
         "hook" => return crate::harden::hook(rest),
+        "upgrade" => return crate::upgrade::run(rest),
         "version" | "--version" | "-V" => format!("fsops {}", crate::VERSION),
         "help" | "--help" | "-h" | "" => usage(),
         other => format!("E_UNKNOWN_CMD 未知命令 {other}（用 fsops help 查看）"),
@@ -64,6 +65,7 @@ fn usage() -> String {
   fsops integrate --rules [--target ...]     向项目写入 fsops 软规则
   fsops doctor [--json]                      检查规则与宿主接入状态
   fsops harden claude [--path DIR|--user]    安装 Claude Code PreToolUse 接管
+  fsops upgrade [--check] [--force]          自更新：查最新 Release、SHA-256 校验后替换
   fsops version
 
 路径写法: /d/repo/x  ~/x  D:\\repo\\x  相对路径",

@@ -2,6 +2,15 @@
 
 本项目使用语义化版本。日期为发布日。
 
+## [0.6.0] - 2026-11-07
+
+- 新增 `fsops upgrade [--check|--force]` 自更新：跟随 `releases/latest` 取最新 tag，下载二进制与 `.sha256` 并校验，SHA-256 不匹配时中止且不改动任何文件；替换采用「先改名再落新版」，失败自动回滚，旧文件保留为 `fsops.exe.old-*` 并在下次升级自动清理。网络瞬时失败重试 3 次。
+- `fs_exec` 的 `program` 用相对路径或 POSIX 形式且启动失败时，错误直接说明「相对路径不随 `cwd` 解析」，不再让模型按 cwd 猜路径。
+- `initialize.instructions`、`AGENTS.md`、使用指南补充：前台 `fs_exec` 控制在 2 分钟内（宿主超时会丢结果）；更长的构建/测试用 `background=true` + `job wait_ms=60000`。
+- 发布工具链：`scripts/release.py` 新增 `check`（版本一致性，接入 CI 与 `check.ps1 full`）、`prepare`（升版本 + 同步工具参考/使用指南引用 + CHANGELOG/发布正文骨架）、`fill`（用构建产物回填正文 SHA-256/大小）。
+- 新增 `tests/release_tooling.py`（临时仓库夹具，21 项断言）；CI 与 `check.ps1 full` 从 7 项门禁扩到 9 项。
+- 版本 0.6.0，新增 8 个 Rust 单测（自更新 7 + 相对 program 1）。
+
 ## [0.5.0] - 2026-11-07
 
 - `fs_grep` 的 `parallel` 改为三态：省略即自动（小仓库串行，满一波候选后并行），`true`/`false` 强制。Auto 在满一波前逐个串行扫描，保留「满页即停」，不因并行多访问后续目录项。

@@ -72,8 +72,14 @@ MCP 宿主会在下一次调用时重新启动服务。
 
 ## 发布
 
-1. 更新 `Cargo.toml` 版本和 `CHANGELOG.md`。
-2. 运行完整验证。
-3. 提交 `chore(release): X.Y.Z`。
-4. 创建注解标签 `vX.Y.Z` 并推送标签。
-5. 在 GitHub Release 上传 Windows 二进制和 SHA-256。
+```powershell
+python scripts/release.py prepare vX.Y.Z   # 升版本 + 同步文档引用 + CHANGELOG/发布正文骨架
+# 人工补写新 CHANGELOG 段与 docs/releases/vX.Y.Z.md 的正文
+.\scripts\check.ps1 full                    # 完整门禁（含版本一致性与发布工具自检）
+cargo build --release
+python scripts/release.py fill vX.Y.Z        # 用构建产物回填正文的 SHA-256 与大小
+```
+
+1. 提交 `chore(release): X.Y.Z`，创建注解标签 `vX.Y.Z` 并推送。
+2. `python scripts/release.py vX.Y.Z` 创建 GitHub Release 并上传二进制、SHA-256 与两个脚本。
+3. `python scripts/release.py check` 可随时校验版本一致性；CI 与 `check.ps1 full` 都会跑。

@@ -301,7 +301,7 @@ dependencies = [
 
 [[package]]
 name = "fsops"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "blake3",
  "encoding_rs",
@@ -312,6 +312,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "sha2",
  "zip",
 ]
 
