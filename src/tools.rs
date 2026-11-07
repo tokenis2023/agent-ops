@@ -133,7 +133,7 @@ pub fn tool_defs() -> Vec<Value> {
                     "offset": {"type": "integer", "description": "跳过前 N 个匹配条目，用于 next_offset 续页"},
                     "time_budget_ms": {"type": "integer", "description": "目录遍历时间预算，默认 5000 毫秒；超时返回已找到结果并标注"},
                     "no_ignore": {"type": "boolean", "description": "忽略 .gitignore 与 node_modules/target 等默认跳过项；只在明确要查依赖源码或构建产物时用"},
-                    "budget": {"type": "integer", "description": "最终响应最多字节数，默认 8192"},
+                    "budget": {"type": "integer", "description": "最终响应最多字节数，默认 16384"},
                     "map": {"type": "boolean", "description": "输出 repo map：按符号被引用程度、入口点和 focus 排序的文件与符号，一次调用回答先看哪些文件"},
                     "focus": {"type": "string", "description": "map=true 时的关注词，空格分隔；文件名或符号命中会加权"},
                     "max_files": {"type": "integer", "description": "map=true 时最多扫描的文件数，默认 2000"}
@@ -161,7 +161,7 @@ pub fn tool_defs() -> Vec<Value> {
                     "max_per_file": {"type": "integer", "description": "每个文件最多返回的命中数，默认不限制；省略部分会在尾注说明"},
                     "offset": {"type": "integer", "description": "files 跳过前 N 个匹配文件，其他模式跳过前 N 个命中；用于 next_offset 续取"},
                     "parallel": {"type": "boolean", "description": "大仓库并行扫描；输出与串行一致，默认 false"},
-                    "budget": {"type": "integer", "description": "最终响应最多字节数，默认 8192"},
+                    "budget": {"type": "integer", "description": "最终响应最多字节数，默认 16384"},
                     "time_budget_ms": {"type": "integer", "description": "文件与目录遍历总时间预算，默认 5000 毫秒"},
                     "max_file_size": {"type": "integer", "description": "只搜索不超过该字节数的文件，默认 8388608（8 MiB）；0 表示不限制。被跳过的文件会在尾注报告"},
                     "no_ignore": {"type": "boolean", "description": "忽略 .gitignore 与 node_modules/target 等默认跳过项；只在明确要搜依赖源码时用"}
@@ -4852,7 +4852,7 @@ fn write(args: &Value) -> String {
 }
 
 fn glob_tool(args: &Value) -> String {
-    let budget = arg_usize(args, "budget", 8 * 1024);
+    let budget = arg_usize(args, "budget", 16 * 1024);
     let root_s = arg_str(args, "path").unwrap_or(".");
     let root = match FsPath::parse(root_s) {
         Ok(p) => p,
@@ -4959,7 +4959,7 @@ fn glob_tool(args: &Value) -> String {
 }
 
 fn grep_tool(args: &Value) -> String {
-    let budget = arg_usize(args, "budget", 8 * 1024);
+    let budget = arg_usize(args, "budget", 16 * 1024);
     let pattern = match arg_str(args, "pattern") {
         Some(p) => p.to_string(),
         None => {

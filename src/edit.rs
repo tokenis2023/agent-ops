@@ -612,7 +612,7 @@ fn closest_lines<'a>(work: &'a str, needle: &str, limit: usize) -> Vec<(usize, &
         if n * 2 < width || n > width * 2 {
             continue;
         }
-        let d = levenshtein(needle, text);
+        let d = crate::text::levenshtein(needle, text);
         // 只保留「确实很像」的行：短行差 2 个字符、长行按比例放宽。
         // 否则整个文件的行都成了候选，提示本身变成噪声。
         if d <= 2 || d * 4 <= width {
@@ -625,29 +625,6 @@ fn closest_lines<'a>(work: &'a str, needle: &str, limit: usize) -> Vec<(usize, &
         .take(limit)
         .map(|(_, n, line)| (n, line))
         .collect()
-}
-
-/// 字符级 Levenshtein 距离，两行滚动数组。
-fn levenshtein(a: &str, b: &str) -> usize {
-    let a: Vec<char> = a.chars().collect();
-    let b: Vec<char> = b.chars().collect();
-    if a.is_empty() {
-        return b.len();
-    }
-    if b.is_empty() {
-        return a.len();
-    }
-    let mut prev: Vec<usize> = (0..=b.len()).collect();
-    let mut cur = vec![0usize; b.len() + 1];
-    for (i, ca) in a.iter().enumerate() {
-        cur[0] = i + 1;
-        for (j, cb) in b.iter().enumerate() {
-            let cost = usize::from(ca != cb);
-            cur[j + 1] = (prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1);
-        }
-        std::mem::swap(&mut prev, &mut cur);
-    }
-    prev[b.len()]
 }
 
 #[cfg(test)]

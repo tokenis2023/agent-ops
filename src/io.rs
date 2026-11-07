@@ -198,13 +198,42 @@ pub fn with_path(err: String, fp: &FsPath) -> String {
     }
 }
 
-/// 路径不存在时检查是否写错了格式（双重盘符、多余斜杠）。
-/// Windows 只说"找不到路径"，模型会误以为文件不存在而多跑一次 fs_glob。
+/// 路径不存在时检查是否写错了格式（双重盘符、多余斜杠），
+/// 或文件名拼错——同目录里最相似的几个条目直接列出来，省掉一次 fs_glob。
 fn with_hint(reason: &str, fp: &FsPath) -> String {
-    match crate::paths::double_prefix_hint(&fp.display()) {
-        Some(fixed) => format!("{reason}；路径疑似多了一层盘符，应为 {fixed}"),
+    if let Some(fixed) = crate::paths::double_prefix_hint(&fp.display()) {
+        return format!("{reason}；路径疑似多了一层盘符，应为 {fixed}");
+    }
+    let missing = reason.contains("找不到指定的文件")
+        || reason.contains("找不到指定路径")
+        || reason.contains("not found")
+        || reason.contains("NotFound");
+    if !missing {
+        return reason.to_string();
+    }
+    match similar_siblings(fp) {
+        Some(names) => format!("{reason}；同目录下有：{}", names.join(", ")),
         None => reason.to_string(),
     }
+}
+
+/// 同目录里名字最相似的 3 个条目；没有相近候选时返回 None。
+fn similar_siblings(fp: &FsPath) -> Option<Vec<String>> {
+    let path = fp.native();
+    let dir = path.parent()?;
+    let name = path.file_name()?.to_string_lossy().to_lowercase();
+    let width = name.chars().count();
+    let mut scored: Vec<(usize, String)> = Vec::new();
+    for entry in std::fs::read_dir(dir).ok()?.flatten().take(2000) {
+        let candidate = entry.file_name().to_string_lossy().to_string();
+        let d = crate::text::levenshtein(&name, &candidate.to_lowercase());
+        if d <= 2 || d * 4 <= width {
+            scored.push((d, candidate));
+        }
+    }
+    scored.sort_by_key(|(d, name)| (*d, name.clone()));
+    let out: Vec<String> = scored.into_iter().take(3).map(|(_, n)| n).collect();
+    (!out.is_empty()).then_some(out)
 }
 
 pub fn read_bytes(p: &Path) -> Result<Vec<u8>, String> {
@@ -653,6 +682,20 @@ pub fn human_size(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 文件不存在时提示同目录相似文件() {
+        let dir = std::env::temp_dir().join(format!("fsops-hint-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.yaml"), "a").unwrap();
+        std::fs::write(dir.join("other.txt"), "b").unwrap();
+        let fp = FsPath::parse(&dir.join("confg.yaml").to_string_lossy()).unwrap();
+        let msg = with_hint("系统找不到指定的文件。 (os error 2)", &fp);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(msg.contains("config.yaml"), "应给出候选文件名: {msg}");
+        assert!(!msg.contains("other.txt"), "不相似的文件不应出现: {msg}");
+    }
 
     #[test]
     fn 时间格式化正常() {
