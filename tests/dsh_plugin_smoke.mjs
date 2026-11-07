@@ -351,10 +351,11 @@ for (const [toolName, definition] of ctx.registered) {
     // 插件形态的描述必须与 schema 一致：不能再教模型用被剔除的后台任务参数。
     const generatedExec = generated.TOOL_SPECS.find((spec) => spec.name === 'fs_exec')
     const execDesc = generatedExec?.description ?? ''
+    // v0.9.2 语义反转：后台任务参数已放开，描述必须教模型怎么用（否则长命令必然占住回合）。
     check(
-      !execDesc.includes('job=') && !execDesc.includes('list=true'),
-      'fs_exec 描述不再宣传后台任务参数',
-      execDesc.slice(0, 160),
+      execDesc.includes('background') && execDesc.includes('wait_ms'),
+      'fs_exec 描述说明后台任务用法',
+      execDesc.slice(-160),
     )
     check(execDesc.includes('DSH 插件形态'), 'fs_exec 描述点明插件形态边界', execDesc.slice(-120))
     // 自由映射对象（fs_exec.env）必须投影成 json：空对象 + additionalProperties:false 会把任意键拒掉。
@@ -382,10 +383,10 @@ for (const [toolName, definition] of ctx.registered) {
     }
   }
   const execParams = Object.keys(ctx.registered.get('fs_exec')?.parameters ?? {})
-  const forbidden = ['background', 'job', 'list', 'wait_ms', 'kill'].filter((k) =>
-    execParams.includes(k),
-  )
-  check(forbidden.length === 0, 'fs_exec 不暴露后台任务参数', forbidden.join(','))
+  // v0.9.2：后台任务是长驻会话的天然优势，必须对模型可见。
+  const required = ['background', 'job', 'list', 'wait_ms', 'kill']
+  const missing = required.filter((k) => !execParams.includes(k))
+  check(missing.length === 0, 'fs_exec 暴露后台任务参数', '缺失: ' + missing.join(','))
 }
 
 // ---- 4.6 插件形态的参数裁剪：生成器、schema、运行时三方必须对齐 ----------
@@ -411,18 +412,27 @@ for (const [toolName, definition] of ctx.registered) {
       taught.join(','),
     )
   }
-  // 运行时必须真的拒绝：DSH 顶层校验不拦 schema 外字段，只靠 schema 是拦不住的
-  let rejected = ''
+  // 后台任务必须真的能跑通：起一个短任务，拿到 job id，再轮询到结束。
+  let jobStart = ''
   try {
-    await ctx.registered.get('fs_exec').execute({ program: 'cmd', args: ['/c', 'echo', 'x'], background: true }, { agent: {}, signal: undefined })
+    jobStart = await ctx.registered.get('fs_exec').execute(
+      { program: 'cmd', args: ['/c', 'ping', '127.0.0.1', '-n', '2', '-w', '300'], background: true },
+      { agent: {}, signal: undefined },
+    )
   } catch (error) {
-    rejected = String(error.message)
+    jobStart = 'ERR ' + String(error.message)
   }
-  check(
-    rejected.includes('不支持 background'),
-    '运行时拒绝 schema 外参数 background',
-    rejected.slice(0, 160),
-  )
+  const jobId = /job=(\d+)/.exec(jobStart)?.[1]
+  check(jobId !== undefined, 'fs_exec 能启动后台任务', jobStart.slice(0, 160))
+  if (jobId !== undefined) {
+    const waited = await ctx.registered.get('fs_exec').execute(
+      { job: Number(jobId), wait_ms: 10000 },
+      { agent: {}, signal: undefined },
+    )
+    check(String(waited).includes('exit='), 'fs_exec 能轮询后台任务到结束', String(waited).slice(0, 160))
+    const listed = await ctx.registered.get('fs_exec').execute({ list: true }, { agent: {}, signal: undefined })
+    check(String(listed).includes('jobs'), 'fs_exec list 能列出任务', String(listed).slice(0, 120))
+  }
   check(declared.length > 0, 'fs_exec 仍有可见参数')
 }
 
@@ -472,18 +482,18 @@ try {
   })
   check(envOut.includes('ok-from-env'), 'fs_exec env 注入生效（插件形态）', envOut.slice(0, 200))
 
-  // 后台任务参数：schema 不声明，传输层显式拒绝，避免"文档说没有、运行时却穿透"。
-  let backgroundRejected = ''
-  try {
-    await call('fs_exec', { program: 'cmd', args: ['/c', 'echo', 'x'], background: true })
-  } catch (error) {
-    backgroundRejected = String(error.message)
+  // 后台任务在插件形态可用：长命令不再占住整个回合。
+  const started = await call('fs_exec', {
+    program: 'cmd',
+    args: ['/c', 'ping', '127.0.0.1', '-n', '2', '-w', '300'],
+    background: true,
+  })
+  const startedId = /job=(\d+)/.exec(started)?.[1]
+  check(startedId !== undefined, '真实调用能启动后台任务', started.slice(0, 160))
+  if (startedId !== undefined) {
+    const done = await call('fs_exec', { job: Number(startedId), wait_ms: 10000 })
+    check(String(done).includes('exit='), '真实调用能等到后台任务结束', String(done).slice(0, 160))
   }
-  check(
-    backgroundRejected.includes('后台任务') && backgroundRejected.includes('MCP'),
-    'fs_exec 后台任务参数被显式拒绝',
-    backgroundRejected.slice(0, 200),
-  )
 
   const copied = await call('fs_file', { op: 'copy', src: file, dst: join(work, 'copy.rs') })
   check(copied.startsWith('ok copy'), 'fs_file copy 成功', copied.slice(0, 200))

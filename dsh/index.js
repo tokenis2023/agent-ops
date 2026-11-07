@@ -232,6 +232,25 @@ function startSession(ctx, executable, cwd) {
     isExited: () => exited,
     /** 未完成请求数：取消时只有在没有其他在途调用时才敢结束会话。 */
     pendingCount: () => pending.size,
+    /**
+     * 会话里是否还有后台任务在跑。
+     * 后台任务已是插件形态的公开能力，回收会话前必须先问一句，
+     * 否则会静默杀掉用户正在等的构建/测试。
+     */
+    async hasRunningJobs() {
+      if (exited) return false
+      try {
+        const response = await request('tools/call', {
+          name: 'fs_exec',
+          arguments: { list: true },
+        })
+        const text = response?.result?.content?.[0]?.text ?? ''
+        return /\brunning\b/.test(text)
+      } catch {
+        // 查不出来时不阻止回收，避免会话泄漏。
+        return false
+      }
+    },
     dispose() {
       exited = true
       failPending(sessionError('fsops mcp 会话已关闭'))
@@ -276,10 +295,15 @@ function createTransport(ctx, options) {
     }
     sessions.delete(cwd)
     if (sessions.size >= MAX_SESSIONS) {
-      const oldest = sessions.keys().next()
-      if (oldest.done !== true) {
-        sessions.get(oldest.value)?.dispose()
-        sessions.delete(oldest.value)
+      // 淘汰最久未用的会话，但跳过仍有后台任务在跑的：后台任务已经是对外能力，
+      // dispose 会连带杀掉进程里的所有 job，表现为「任务莫名消失」。
+      for (const key of sessions.keys()) {
+        const candidate = sessions.get(key)
+        if (candidate === undefined) continue
+        if (await candidate.hasRunningJobs()) continue
+        candidate.dispose()
+        sessions.delete(key)
+        break
       }
     }
     const fresh = startSession(ctx, executable, cwd)

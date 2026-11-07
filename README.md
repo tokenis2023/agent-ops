@@ -104,7 +104,7 @@ github:tokenis2023/agent-ops#v0.9.1
 安装后在会话里调用 `fs_stat`（`detail=server` 可免路径）自检：应返回与插件同版本的
 `fsops <版本> tools=9`；二进制版本不符时插件会报 `E_VERSION` 并点名实际版本。
 
-安装后默认启用，提供 9 个 `fs_*` 工具，与 MCP 形态同名、同错误码。插件**复用一条长驻 `fsops mcp` 会话**（换行分隔 JSON-RPC、按 id 匹配响应），不是每次调用新起进程：release 构建实测单次工具调用 **~34ms → 0.12–0.31ms**（`fs_stat` 0.12 / `fs_read` 0.31 / `fs_grep` 1.6，4 路并发一轮 0.23ms）。会话不可用（spawn 失败、进程退出、初始化失败）时自动退回一次性 `fsops call`，功能不降级；想强制走一次性调用可配 `mcp: false`。取消（abort）单个进行中的写/执行请求会结束长驻会话以阻止后台继续执行，下一次调用自动重建。参数集合与 MCP 形态基本一致；唯一差异是插件形态**不提供** `fs_exec` 的后台任务参数（`background`/`job`/`list`/`wait_ms`/`kill`）：schema 不声明，运行时也会显式拒绝并提示改用 MCP 形态——后台任务的 job id 绑在长驻会话上，插件重载/宿主重启后就会失效。
+安装后默认启用，提供 9 个 `fs_*` 工具，与 MCP 形态同名、同错误码。插件**复用一条长驻 `fsops mcp` 会话**（换行分隔 JSON-RPC、按 id 匹配响应），不是每次调用新起进程：release 构建实测单次工具调用 **~34ms → 0.12–0.31ms**（`fs_stat` 0.12 / `fs_read` 0.31 / `fs_grep` 1.6，4 路并发一轮 0.23ms）。会话不可用（spawn 失败、进程退出、初始化失败）时自动退回一次性 `fsops call`，功能不降级；想强制走一次性调用可配 `mcp: false`。取消（abort）单个进行中的写/执行请求会结束长驻会话以阻止后台继续执行，下一次调用自动重建。参数集合与 MCP 形态一致，**包括 `fs_exec` 的后台任务**（`background`/`job`/`list`/`wait_ms`/`kill`）：长驻会话本来就是承载后台任务的最佳位置，长命令用 `background=true` 拿 job 再 `wait_ms` 等结果，期间不阻塞其它调用。注意 job id 绑在当前工作目录的会话上，切目录或插件重载后失效。
 
 - **二进制来源**：优先用 `%LOCALAPPDATA%\fsops` 或 PATH 上已有的 `fsops.exe`；都没有时按本仓库版本
   从 GitHub Release 下载并校验 SHA-256（该版本还没发 Release 时回退到 latest），缓存在
@@ -171,7 +171,7 @@ node tests/dsh_plugin_smoke.mjs --exe target/debug/fsops.exe
 
 9 个工具，故意做窄。
 
-| 工具 | 用途 | 参数（MCP 形态；DSH 插件形态不含 fs_exec 的后台任务参数） |
+| 工具 | 用途 | 参数 |
 |---|---|---|
 | `fs_read` | 读文件、行区间、多文件、多文件异构区间、按模式取块、大文件窗口、结构摘要、DOCX/PDF 正文 | `block`、`budget`、`end`、`focus`、`force`、`max_line`、`path`、`paths`、`ranges`、`reads`、`scan`、`start`、`summary`、`tail` |
 | `fs_edit` | 精确替换、正则替换、diff 自查、多文件批量、并发保护 | `diff`、`dry_run`、`edits`、`expect_hash`、`files`、`normalize_eol`、`path` |

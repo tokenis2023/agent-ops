@@ -46,7 +46,7 @@ export function renderToolSection(defs) {
   lines.push('')
   lines.push(defs.length + ' 个工具，故意做窄。')
   lines.push('')
-  lines.push('| 工具 | 用途 | 参数（MCP 形态；DSH 插件形态不含 fs_exec 的后台任务参数） |')
+  lines.push('| 工具 | 用途 | 参数 |')
   lines.push('|---|---|---|')
   for (const def of defs) {
     const name = def.name

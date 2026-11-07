@@ -474,7 +474,7 @@ export const TOOL_SPECS = [
   },
   {
     "name": "fs_exec",
-    "description": "执行程序（argv 数组，不经过 shell）。替代 PowerShell 跑 cargo/git/npm/python：没有引号/插值、2>&1、ErrorRecord、$LASTEXITCODE 问题。非零退出不是错误（前缀写 exit=N 非零，要当失败使用 check=true）；超时会结束整个进程树。启动任务必须给 program。DSH 插件形态不提供后台任务参数（background/job/list/wait_ms/kill）；需要后台任务请用 MCP 形态 `fsops mcp`。",
+    "description": "执行程序（argv 数组，不经过 shell）。替代 PowerShell 跑 cargo/git/npm/python：没有引号/插值、2>&1、ErrorRecord、$LASTEXITCODE 问题。非零退出不是错误（前缀写 exit=N 非零，要当失败使用 check=true）；超时会结束整个进程树。启动任务必须给 program。DSH 插件形态支持后台任务（background/job/list/wait_ms/kill）：长命令用 background=true 立即拿 job，再用 job=<id> wait_ms=<毫秒> 一次等到退出，期间可以继续做别的调用。",
     "parameters": {
       "args": {
         "description": "参数数组，每个参数独立，不拼字符串",
@@ -482,6 +482,10 @@ export const TOOL_SPECS = [
         "items": {
           "type": "string"
         }
+      },
+      "background": {
+        "description": "会话内后台任务：立即返回 job id，用 job=<id> 轮询输出，list=true 列出全部；进程随 MCP 会话结束",
+        "type": "boolean"
       },
       "check": {
         "description": "非零退出按 E_EXIT 错误返回；默认 false，非零仍是 ok",
@@ -494,6 +498,18 @@ export const TOOL_SPECS = [
       "env": {
         "description": "追加/覆盖环境变量，如 {\"RUST_BACKTRACE\":\"1\"}",
         "type": "json"
+      },
+      "job": {
+        "description": "轮询/终止后台任务：传启动时返回的 job id",
+        "type": "integer"
+      },
+      "kill": {
+        "description": "配合 job 使用：结束该任务的整个进程树",
+        "type": "boolean"
+      },
+      "list": {
+        "description": "列出当前会话的全部后台任务（id/pid/状态/时长）",
+        "type": "boolean"
       },
       "max_output": {
         "description": "每条流最多保留字节，默认 32768",
@@ -513,6 +529,10 @@ export const TOOL_SPECS = [
       },
       "timeout_ms": {
         "description": "超时毫秒，默认 120000，最大 600000；超时结束进程树",
+        "type": "integer"
+      },
+      "wait_ms": {
+        "description": "配合 job：最多等待 N 毫秒直到任务退出再返回（上限 60000）；超时仍运行则返回增量输出",
         "type": "integer"
       }
     }
