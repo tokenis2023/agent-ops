@@ -124,6 +124,11 @@ cargo build
 node tests/dsh_plugin_smoke.mjs --exe target/debug/fsops.exe
 ```
 
+**工具定义只有 Rust 一份真源**：`node scripts/gen_dsh_specs.mjs` 把 `fsops schema` 投影成
+`dsh/tool-specs.generated.js`（DSH 的 value-schema DSL 与 MCP schema 不是同一套关键字，
+转换规则在生成器里）。改了 `src/tools.rs` 的工具定义或描述后要重新生成；冒烟测试会逐字比对，
+漂移直接红灯（手写三份时漂移过 11 处，评审时仍有 5/8 个工具描述不一致）。
+
 ## 能力声明
 
 | 能力 | 说明 |

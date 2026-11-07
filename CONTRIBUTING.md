@@ -35,6 +35,14 @@ python tests/task_bench.py --exe target/debug/fsops.exe
 node tests/dsh_plugin_smoke.mjs --exe target/debug/fsops.exe
 ```
 
+改了 `src/tools.rs` 的工具定义或描述后，重新生成 DSH 插件定义：
+
+```bash
+node scripts/gen_dsh_specs.mjs --exe target/release/fsops.exe
+```
+
+漏了会被 DSH 冒烟的漂移守卫拦下，红灯会直接给你这条命令。
+
 也可以运行：
 
 ```bash

@@ -292,6 +292,31 @@ for (const [toolName, definition] of ctx.registered) {
       'DSH 多出: ' + extra.join(',') + ' / DSH 缺失(非后台参数): ' + missing.join(','),
     )
   }
+  // 生成物必须与 `fsops schema` 逐字一致：手写三份 schema 曾漂移 11 处、
+  // 评审时仍有 5/8 个工具描述不一致。现在漂移在这里变红灯。
+  {
+    const generator = await import(
+      pathToFileURL(join(ROOT, 'scripts', 'gen_dsh_specs.mjs')).href
+    )
+    const generated = await import(
+      pathToFileURL(join(ROOT, 'dsh', 'tool-specs.generated.js')).href
+    )
+    const expected = JSON.stringify(generator.projectSpecs(defs))
+    const actual = JSON.stringify(generated.TOOL_SPECS)
+    const drifted = expected !== actual
+    check(
+      !drifted,
+      'dsh/tool-specs.generated.js 与 fsops schema 无漂移',
+      drifted ? '跑 node scripts/gen_dsh_specs.mjs 重新生成' : '',
+    )
+    const rendered = generator.renderSpecs(generator.projectSpecs(defs))
+    check(
+      rendered === (await readFile(join(ROOT, 'dsh', 'tool-specs.generated.js'), 'utf8')),
+      '生成物渲染结果稳定（可直接提交）',
+      '渲染不一致：检查生成器输出格式',
+    )
+  }
+
   // 关键能力词必须在两端 description 里都出现：MCP 端曾漏写「正则替换」，
   // 害模型先 fs_read 抄原文再 old/new，白多一轮。
   for (const [tool, words] of Object.entries({

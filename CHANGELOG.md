@@ -54,6 +54,18 @@
 - DSH 插件 `fs_exec` 描述里「每次调用都是新进程，不支持长驻后台任务」已过期（现复用长驻会话），改为说明为何仍不暴露后台参数；`check` 参数也不再写「非零仍是 ok」。
 - 三处手写 schema（Rust / DSH / 工具参考）同步；单测与冒烟断言从钉住「四选一」改为钉住「模式表/并集」，避免测试继续维护一个错误事实。
 
+### 工具定义单一真源
+
+- 新增 `scripts/gen_dsh_specs.mjs`：把 `fsops schema`（Rust 端 `tool_defs()`）投影成 DSH 的
+  value-schema DSL，生成 `dsh/tool-specs.generated.js`。`dsh/index.js` 不再手写 `TOOL_SPECS`，
+  描述与参数从 Rust 直接流出——手写三份时漂移过 11 处、评审时仍有 5/8 个工具描述不一致，
+  模型靠 description 拼参数，这等于直接制造拼错。
+- 投影规则覆盖两套 schema 的差异：丢弃 DSL 不支持的 `minimum`/`maxItems`/`minItems`，
+  把 MCP 的对象级 `required: [...]` 下推成属性级 `required: true`，插件刻意不暴露的
+  `fs_exec` 后台任务参数集中声明在 `EXCLUDED` 里（不再靠「手写时少写几个」）。
+- 冒烟测试新增两项漂移守卫：生成物必须与 `fsops schema` 逐字一致、渲染结果必须稳定可提交
+  （已用「合法篡改生成物 → 红灯」反向验证守卫真的会响）。冒烟 65 → 67 项。
+
 ### 测试
 
 - 新增 5 个 Rust 单测：`old`/`pattern` 互斥 3 个、多编辑中间态提示 1 个、
