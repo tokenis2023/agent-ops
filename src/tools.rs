@@ -1143,7 +1143,8 @@ fn read(args: &Value) -> String {
                     if line_cut {
                         let need = r.max_cut_line_bytes;
                         text.push_str(&format!(
-                            "… 有长行被截断；读全文用 max_line=0，并需 budget≈{}\n",
+                            "… 有长行被截断；最长截断行约 {} 字节，重读该行需 max_line=0 且 budget≈{}\n",
+                            need,
                             need + 200 + header_len
                         ));
                     }
@@ -1278,12 +1279,18 @@ fn read(args: &Value) -> String {
         // block=true：返回包含 start 行的整个代码块。
         // grep 给出的行号通常在函数内部，直接按 start 展开只能拿到那一行；
         // 这里先向外找到块起始行，再按括号配平确定结束行。
+        // block=true 没找到花括号块时（Python 等缩进语言、或起始行不是块开头）
+        // 必须显式说明已退回普通窗口读取，否则模型会以为拿到的是完整函数体。
+        let mut block_fallback = false;
         let per_file_ranges = if let Some((focus, _)) = &focus_info {
             focus.blocks.clone()
         } else if arg_bool(args, "block", false) && args.get("ranges").is_none() {
             match enclosing_block(index.lines(), start) {
                 Some((from, to)) => vec![(from, to)],
-                None => ranges.clone(),
+                None => {
+                    block_fallback = true;
+                    ranges.clone()
+                }
             }
         } else {
             ranges.clone()
@@ -1353,6 +1360,12 @@ fn read(args: &Value) -> String {
                 ));
             }
         }
+        if block_fallback {
+            let (from, to) = per_file_ranges.first().copied().unwrap_or((start, start));
+            header.push_str(&format!(
+                "… block=true 未定位到花括号块（缩进语言不支持）；已按 {from}-{to} 行读取，需要精确边界请用 fs_grep 定位后传 ranges\n"
+            ));
+        }
 
         let want = if targets.len() > 1 {
             (budget / targets.len().max(1)).saturating_sub(usize::from(i > 0))
@@ -1418,7 +1431,8 @@ fn read(args: &Value) -> String {
                 // 会让模型撞上 E_LINE_TOO_LONG。
                 let need = r.max_cut_line_bytes;
                 target.push_str(&format!(
-                    "… 有长行被截断；读全文用 max_line=0，并需 budget≈{}\n",
+                    "… 有长行被截断；最长截断行约 {} 字节，重读该行需 max_line=0 且 budget≈{}\n",
+                    need,
                     need + 200
                 ));
             }
@@ -2303,7 +2317,7 @@ mod tests {
     }
 
     #[test]
-    fn 长行截断时提示一次全文读法() {
+    fn 长行截断时提示单行读法() {
         let content = "x".repeat(5000);
         let path = 临时文本文件(&content);
         let posix_path = path.to_string_lossy().replace('\\', "/");
@@ -2324,6 +2338,11 @@ mod tests {
             "截断提示只应出现一次: {out}"
         );
         assert!(out.contains("有长行被截断"), "{out}");
+        assert!(
+            out.contains("重读该行"),
+            "成本是单行字节数，必须说清单行而不是全文: {out}"
+        );
+        assert!(!out.contains("读全文"), "不能把单行成本说成读全文: {out}");
         assert!(!full.contains("有长行被截断"), "未截断时不应提示: {full}");
     }
 
@@ -2536,6 +2555,32 @@ fn next_fn() {
         let nb: Vec<&str> = nested.lines().filter(|l| l.contains('|')).collect();
         assert_eq!(nb.len(), 3, "嵌套块内命中应扩展到最近的 if: {nested}");
         assert!(nb[0].starts_with("3|"), "应从 if 行开始: {nested}");
+    }
+
+    #[test]
+    fn block未定位到花括号块时提示已回退() {
+        // Python 等缩进语言没有花括号：block=true 必须明说“没定位到”，
+        // 否则模型会以为拿到的是函数体，实际是 start 到文件末尾。
+        let path = std::env::temp_dir().join(format!(
+            "fsops-block-python-{}-{}.py",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, "def alpha():\n    x = 1\n    return x\n").unwrap();
+        let posix_path = path.to_string_lossy().replace('\\', "/");
+        let out = read(&json!({
+            "path": posix_path,
+            "start": 1,
+            "block": true,
+            "budget": 4096,
+            "force": true
+        }));
+        let _ = fs::remove_file(path);
+        assert!(out.contains("未定位到花括号块"), "缺少回退提示: {out}");
+        assert!(out.contains("1-3"), "应说明实际读取区间: {out}");
     }
 
     #[test]
