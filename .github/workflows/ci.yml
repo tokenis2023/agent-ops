@@ -37,6 +37,13 @@ jobs:
       - name: 构建测试二进制
         run: cargo build
 
+      # 单独成步：漂移时先于冒烟失败，错误信息更直接（冒烟里也含这项断言）。
+      # 工具定义只有 Rust 一份真源，DSH 的 tool-specs 必须与 `fsops schema` 逐字一致。
+      - name: DSH 工具定义与 Rust 真源一致
+        run: node scripts/gen_dsh_specs.mjs --check --exe target/debug/fsops.exe
+
+      # 覆盖：包清单、DSH schema DSL、参数集合对齐、插件形态裁剪（schema/描述/运行时三方）、
+      # 真实调用链路、并发不串号、长驻会话复用与重建、取消语义、env 注入。
       - name: DSH 插件冒烟测试
         run: node tests/dsh_plugin_smoke.mjs --exe target/debug/fsops.exe
 
@@ -57,3 +64,11 @@ jobs:
 
       - name: 发布工具自检
         run: python tests/release_tooling.py
+
+      # 发布产物必须能过同一套冒烟：避免 `cargo build --release` 与 debug 行为分叉
+      # （优化后曾出现 instances of UB / 条件编译差异）。
+      - name: 构建 release 二进制
+        run: cargo build --release
+
+      - name: release 二进制过插件冒烟
+        run: node tests/dsh_plugin_smoke.mjs --exe target/release/fsops.exe

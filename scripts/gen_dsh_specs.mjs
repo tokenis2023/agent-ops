@@ -24,37 +24,13 @@ import { fileURLToPath } from 'node:url'
 
 import { pathToFileURL } from 'node:url'
 
+import { DESCRIPTION_PATCHES, EXCLUDED } from '../dsh/excluded.js'
+
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const OUT = join(ROOT, 'dsh', 'tool-specs.generated.js')
 
 /** 只读工具可以并行调用；与 Rust 侧语义无关，是 DSH 的并发提示。 */
 const READ_ONLY = new Set(['fs_read', 'fs_glob', 'fs_grep', 'fs_stat'])
-
-/**
- * 插件形态刻意不暴露的参数：后台任务的生命周期绑在长驻会话上，
- * 插件重载/宿主重启后就丢了，模型排障会踩空。需要后台任务请用 MCP 形态。
- * 这里集中声明，避免"手写少了几个参数"这种又一种漂移。
- */
-const EXCLUDED = {
-  fs_exec: ['background', 'job', 'list', 'wait_ms', 'kill'],
-}
-
-/**
- * 插件形态需要改写描述的条目：Rust 侧描述是 MCP/CLI 的完整能力，其中后台任务
- * 用法在插件形态不存在（schema 不声明，运行时也会显式拒绝，见 dsh/index.js 的
- * EXCLUDED_ARGS）。不在这里覆写，模型会按描述拼出拿不到的参数（评测 P2 漂移）。
- */
-const DESCRIPTION_PATCHES = {
-  fs_exec: (description) => {
-    const cut = description.indexOf('启动任务必须给 program')
-    const head = cut >= 0 ? description.slice(0, cut) : description
-    return (
-      head +
-      '启动任务必须给 program。DSH 插件形态不提供后台任务参数（background/job/list/wait_ms/kill）；' +
-      '需要后台任务请用 MCP 形态 `fsops mcp`。'
-    )
-  },
-}
 
 /** 把一个 JSON-Schema 节点投影成 DSH DSL 节点。 */
 function projectNode(node, inPropertyMap) {

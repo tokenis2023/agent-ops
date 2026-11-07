@@ -15,6 +15,7 @@
 import { spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { readdirSync } from 'node:fs'
 import { registerHooks } from 'node:module'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
@@ -71,6 +72,20 @@ for (const required of ['dsh', 'cordis.patch.yml', 'locale/*.json', 'icon.svg', 
 }
 check(existsSync(join(ROOT, 'dsh', 'index.js')), 'dsh/index.js 存在')
 check(existsSync(join(ROOT, 'dsh', 'binary.js')), 'dsh/binary.js 存在')
+// dsh/ 下的每个模块都必须是产物的一部分：漏一个就会让 npm pack 出来的包在运行时
+// import 失败（Excluded 曾差点只留在仓库里）。
+{
+  const modules = readdirSync(join(ROOT, 'dsh')).filter((name) => name.endsWith('.js'))
+  const declared = JSON.stringify(pkg.files ?? [])
+  check(
+    declared.includes('"dsh"') || pkg.files.some((entry) => entry === 'dsh' || entry.startsWith('dsh/')),
+    'package.json files 收录 dsh/ 目录',
+    '当前 files=' + declared,
+  )
+  for (const module of modules) {
+    check(existsSync(join(ROOT, 'dsh', module)), 'dsh/' + module + ' 存在')
+  }
+}
 
 const patchText = await readFile(join(ROOT, 'cordis.patch.yml'), 'utf8')
 check(patchText.includes("name: '@tokenis2023/fsops'"), 'patch 用包名解析 Host 插件')
@@ -368,6 +383,44 @@ for (const [toolName, definition] of ctx.registered) {
     execParams.includes(k),
   )
   check(forbidden.length === 0, 'fs_exec 不暴露后台任务参数', forbidden.join(','))
+}
+
+// ---- 4.6 插件形态的参数裁剪：生成器、schema、运行时三方必须对齐 ----------
+{
+  const excluded = await import(pathToFileURL(join(ROOT, 'dsh', 'excluded.js')).href)
+  const execSpec = ctx.registered.get('fs_exec')
+  const declared = Object.keys(execSpec?.parameters ?? {})
+  for (const [tool, names] of Object.entries(excluded.EXCLUDED)) {
+    const params = Object.keys(ctx.registered.get(tool)?.parameters ?? {})
+    for (const name of names) {
+      check(
+        !params.includes(name),
+        '插件 schema 不声明 ' + tool + '.' + name,
+        params.join(','),
+      )
+    }
+    // 描述里也不能再教模型用这些参数（否则模型按描述拼参数一定撞墙）
+    const description = ctx.registered.get(tool)?.description ?? ''
+    const taught = names.filter((name) => description.includes(name + '='))
+    check(
+      taught.length === 0,
+      tool + ' 描述不教已剔除的参数',
+      taught.join(','),
+    )
+  }
+  // 运行时必须真的拒绝：DSH 顶层校验不拦 schema 外字段，只靠 schema 是拦不住的
+  let rejected = ''
+  try {
+    await ctx.registered.get('fs_exec').execute({ program: 'cmd', args: ['/c', 'echo', 'x'], background: true }, { agent: {}, signal: undefined })
+  } catch (error) {
+    rejected = String(error.message)
+  }
+  check(
+    rejected.includes('不支持 background'),
+    '运行时拒绝 schema 外参数 background',
+    rejected.slice(0, 160),
+  )
+  check(declared.length > 0, 'fs_exec 仍有可见参数')
 }
 
 // ---- 5. 真实调用 -----------------------------------------------------------

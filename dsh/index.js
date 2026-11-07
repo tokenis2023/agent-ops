@@ -36,19 +36,18 @@ const MCP_PROTOCOL_VERSION = '2025-06-18'
  * 8 个工具的定义由 scripts/gen_dsh_specs.mjs 从 `fsops schema` 生成，
  * 保证描述与参数只有 Rust 一份真源（手写三份时漂移过 11 处）。
  */
+import { EXCLUDED } from './excluded.js'
 import { TOOL_SPECS } from './tool-specs.generated.js'
 
 /** 只读工具：取消时不必杀会话（没有副作用），也允许并发调用。 */
 const READ_ONLY_TOOLS = new Set(TOOL_SPECS.filter((spec) => spec.readOnly === true).map((spec) => spec.name))
 
 /**
- * 插件形态刻意不声明、也不接受的后台任务参数（与 scripts/gen_dsh_specs.mjs 的
- * EXCLUDED 对齐）。DSH 的顶层参数校验放行 schema 外的键，如果不在传输层显式拒绝，
- * 就会出现“schema 说没有、文档说没有、运行时却能穿透”的第三种行为。
+ * 插件形态不接受的参数：与生成器共用 dsh/excluded.js，避免两处清单各写一份。
+ * DSH 的顶层参数校验放行 schema 外的键，如果不在传输层显式拒绝，就会出现
+ * 「schema 说没有、文档说没有、运行时却能穿透」的第三种行为。
  */
-const EXCLUDED_ARGS = {
-  fs_exec: ['background', 'job', 'list', 'wait_ms', 'kill'],
-}
+const EXCLUDED_ARGS = EXCLUDED
 
 /** 收集模式：有界尾部 + 同额 spill。 */
 function collect(maxBytes) {
