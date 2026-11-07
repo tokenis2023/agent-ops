@@ -104,7 +104,7 @@ github:tokenis2023/agent-ops#v0.9.0
 安装后在会话里调用 `fs_stat`（`detail=server` 可免路径）自检：应返回与插件同版本的
 `fsops x.y.z tools=8`；二进制版本不符时插件会报 `E_VERSION` 并点名实际版本。
 
-安装后默认启用，提供 8 个 `fs_*` 工具，与 MCP 形态同名、同错误码。插件**复用一条长驻 `fsops mcp` 会话**（换行分隔 JSON-RPC、按 id 匹配响应），不是每次调用新起进程：release 构建实测单次工具调用 **~33ms → 0.3–0.6ms**（本机 debug 构建复跑约 0.5–0.8ms）。会话不可用（spawn 失败、进程退出、初始化失败）时自动退回一次性 `fsops call`，功能不降级；想强制走一次性调用可配 `mcp: false`。取消（abort）单个进行中的写/执行请求会结束长驻会话以阻止后台继续执行，下一次调用自动重建。参数集合与 MCP 形态基本一致；唯一差异是插件形态**不提供** `fs_exec` 的后台任务参数（`background`/`job`/`list`/`wait_ms`/`kill`）：schema 不声明，运行时也会显式拒绝并提示改用 MCP 形态——后台任务的 job id 绑在长驻会话上，插件重载/宿主重启后就会失效。
+安装后默认启用，提供 9 个 `fs_*` 工具，与 MCP 形态同名、同错误码。插件**复用一条长驻 `fsops mcp` 会话**（换行分隔 JSON-RPC、按 id 匹配响应），不是每次调用新起进程：release 构建实测单次工具调用 **~34ms → 0.12–0.31ms**（`fs_stat` 0.12 / `fs_read` 0.31 / `fs_grep` 1.6，4 路并发一轮 0.23ms）。会话不可用（spawn 失败、进程退出、初始化失败）时自动退回一次性 `fsops call`，功能不降级；想强制走一次性调用可配 `mcp: false`。取消（abort）单个进行中的写/执行请求会结束长驻会话以阻止后台继续执行，下一次调用自动重建。参数集合与 MCP 形态基本一致；唯一差异是插件形态**不提供** `fs_exec` 的后台任务参数（`background`/`job`/`list`/`wait_ms`/`kill`）：schema 不声明，运行时也会显式拒绝并提示改用 MCP 形态——后台任务的 job id 绑在长驻会话上，插件重载/宿主重启后就会失效。
 
 - **二进制来源**：优先用 `%LOCALAPPDATA%\fsops` 或 PATH 上已有的 `fsops.exe`；都没有时按本仓库版本
   从 GitHub Release 下载并校验 SHA-256（该版本还没发 Release 时回退到 latest），缓存在
@@ -142,7 +142,7 @@ node tests/dsh_plugin_smoke.mjs --exe target/debug/fsops.exe
 |---|---|
 | 双形态 | MCP stdio 服务 + Unix 风格 CLI |
 | DSH 插件 | 仓库根即标准 DSH bundle；插件管理里粘贴仓库地址即可安装 |
-| 插件延迟 | 复用长驻 `fsops mcp` 会话，单次工具调用 0.3–0.6ms；一次性 spawn 约 33ms（含隐藏 console 分配 ~17ms） |
+| 插件延迟 | 复用长驻 `fsops mcp` 会话，单次工具调用 **0.12–0.31ms**（`fs_stat` 0.12 / `fs_read` 0.31 / `fs_grep` 1.6）；一次性 spawn 约 34ms。IPC 地板 `ping` 约 44µs |
 | 单文件分发 | Rust 编译的独立 Windows 可执行文件，无 Node/Python 运行时依赖 |
 | 文本编码 | UTF-8 / BOM / GBK / GB18030 / UTF-16 自动识别并原编码写回 |
 | 换行保持 | 匹配层归一 LF，写入层还原原文件 CRLF/LF/CR |
@@ -167,15 +167,16 @@ node tests/dsh_plugin_smoke.mjs --exe target/debug/fsops.exe
 
 ## 工具面
 
-8 个工具，故意做窄。
+9 个工具，故意做窄。
 
 | 工具 | 用途 | 关键参数 |
 |---|---|---|
 | `fs_read` | 读文件、行区间、多文件、多文件异构区间、按模式取块、大文件窗口、结构摘要、DOCX/PDF 正文 | `path`/`paths`/`reads`、`start`、`end`、`ranges`、`focus`、`scan`、`summary`、`max_line`、`budget` |
 | `fs_edit` | 精确替换、正则替换、diff 自查、多文件批量、并发保护 | `edits`（`old/new` 或 `pattern/replacement`）、`files`、`diff`、`expect_hash`、`normalize_eol` |
-| `fs_write` | 新建或整体覆盖，原子写入，可生成 DOCX | `content`、`expect_hash`、`normalize_eol` |
+| `fs_write` | 新建或整体覆盖，原子写入，可生成 DOCX；多文件用 `files` 一次提交 | `path`/`content` 或 `files`、`expect_hash`、`normalize_eol` |
 | `fs_glob` | 按 glob 找文件，尊重 `.gitignore`，带遍历时间预算，可输出 repo map | `pattern`、`path`、`dirs`、`detail`、`limit`、`offset`、`time_budget_ms`、`budget`、`map`、`focus` |
-| `fs_grep` | 正则搜索、四种输出、分页、并行，支持 DOCX/PDF 正文 | `pattern`、`output`、`context`、`max_per_file`、`max_line`、`max_file_size`、`offset`、`parallel` |
+| `fs_inspect` | 一次看清目录：文件规模分布 + 可选正则的命中分布与样例，替代「glob → stat → grep」多轮探索 | `path`、`pattern`、`focus`、`limit`、`budget` |
+| `fs_grep` | 正则搜索、四种输出、分页、并行，支持 DOCX/PDF 正文；首行带命中分布摘要 | `pattern`、`output`、`context`、`expand`、`max_per_file`、`max_line`、`max_file_size`、`offset`、`parallel` |
 | `fs_stat` | 元信息、编码、换行、hash；`detail=server` 一条调用自检服务端版本与工具数 | `path`/`paths`、`detail=meta/hash/full/server` |
 | `fs_exec` | 执行程序（argv 数组，不经过 shell），支持后台任务；替代 PowerShell 跑 cargo/git/npm | `program`、`args`、`cwd`、`timeout_ms`、`stdin`、`env`、`shell`、`check`、`background`、`job`、`list`、`wait_ms`、`kill`、`max_output` |
 | `fs_file` | 文件管理：copy/move/remove/mkdir/convert/archive/extract | `op`、`src`、`dst`、`path`、`confirm`、`recursive`、`overwrite`、`encoding`、`eol` |
@@ -349,7 +350,7 @@ node tests/bench_dsh_latency.mjs       # 插件调用延迟：一次性 spawn vs
 
 - [使用指南](docs/使用指南.md)：安装、宿主接入、工作流、错误码、升级卸载
 - [工具参考](docs/工具参考.md)：全部参数、输出和协议
-- [轮次实测](docs/轮次实测.md)：工具改造对 Agent 调用次数的影响（真实对照数据）
+- [轮次实测](docs/轮次实测.md)：工具改造对调用次数的影响（真实对照）+ 延迟逐层分解（Rust 层压到哪一步）
 - [Agent 规则](AGENTS.md)：给编码 Agent 的路由与安全规则
 - [安全声明](SECURITY.md)：权限模型、写入安全、漏洞报告
 - [变更记录](CHANGELOG.md)：版本历史
