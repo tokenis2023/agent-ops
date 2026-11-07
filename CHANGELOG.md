@@ -24,6 +24,15 @@
 - `E_AMBIGUOUS` 的列标记从正文内移到行尾（`← 列 N`）：原实现把 `^` 插在命中列，会直接吞掉该列字符（`x();` 显示成 `^();`）。
 - 多文件读取的续读尾注带各自路径（`续读: fs_read path=… start=N`），不再是一串无法对应的「同 path」。
 - 版本 0.4.1，新增 14 个单测。
+- 输出与错误全面自带「可重放下一步」：`reads` 续读带各自路径、长行尾注给被截行号与重读命令、分页 `next_offset` 给完整命令并标注单位、`E_STALE`/`E_BATCH_PARTIAL`/`E_ENCODING_LOSS`/`E_DOCX` 都给出可直接照做的下一步，repo map 截断尾注给调法。
+- `fs_read` 正文逐行原样输出（不再折叠连续空行），可直接当 `fs_edit` 的 `old`；主路径与超大文件分支的 `utf-8-lossy` 都显式警告 U+FFFD 不是原文、切勿据此写回。
+- `validate_args` 在入口执行 schema 声明的 `required`/`enum`/`minimum`/`maxItems` 与数组项必填；schema 生成不再覆盖显式 `minimum`。
+- `fs_grep` 新增 `max_line`（默认 240 与 `fs_read` 一致，`0` 不截断），命中长行一次拿全；移除硬编码 200 字符窗口。
+- `dry_run` 不再抢占独占写锁；`E_LOCKED` 说明已等待时长、本次未写入、参数不变直接重试。
+- schema 可见性：`fs_edit` 描述补正则替换，`force`/`reads`/`detail` 描述与实际行为对齐；`install.ps1` 升级后提示 `/reload-mcp` 与清 schema 缓存。
+- DSH 插件不再暴露 5 个不可用后台参数；冒烟测试改为参数超集比对并新增 description 能力词比对；DSH 包补齐 `docs/` 与根目录文档。
+- `fs_stat` 路径统一用双引号包裹，含空格路径可稳定切分；`E_MIXED_EOL` 归一到原文件主换行风格（多数行风格，平局取 LF），不再一律改成 LF。
+- 本批 8 轮修复全程 TDD，`check.ps1 full` 七项门禁（含 185 项真实 MCP e2e、任务基准、DSH 冒烟）保持全绿。
 
 ## [0.4.0] - 2026-11-07
 

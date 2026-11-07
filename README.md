@@ -99,7 +99,7 @@ patch 插入 `dsh/index.js` 这个 Host 插件。在 Harness 的 **插件 → �
 https://github.com/tokenis2023/agent-ops
 ```
 
-安装后默认启用，提供 8 个 `fs_*` 工具——与 MCP 形态同名、同契约、同错误码。
+安装后默认启用，提供 8 个 `fs_*` 工具，与 MCP 形态同名、同错误码；参数集合基本一致，唯一差异是插件形态每次调用都是新进程，不暴露 `fs_exec` 的 `background`/`job`/`list`/`wait_ms`/`kill` 五个后台任务参数（需要后台任务请用 MCP 形态）。
 
 - **二进制来源**：优先用 `%LOCALAPPDATA%\fsops` 或 PATH 上已有的 `fsops.exe`；都没有时按本仓库版本
   从 GitHub Release 下载并校验 SHA-256（该版本还没发 Release 时回退到 latest），缓存在
