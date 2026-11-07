@@ -51,7 +51,15 @@ bash scripts/build.sh all
 
 ## 约束
 
-- 不增加不必要的工具数量。新能力优先并入现有工具；新增工具必须同时更新工具参考、DSH 插件与冒烟测试的工具清单（`tests/dsh_plugin_smoke.mjs` 的 `EXPECTED_TOOLS`）。
+- 不增加不必要的工具数量。新能力优先并入现有工具。
+- 新增工具的固定动作（漏一步 CI 会红灯，别再靠人肉记）：
+  1. `src/tools.rs` 的 `build_tool_defs()` 里加 schema，`call()` 里加分发；
+  2. `scripts/gen_docs_tools.mjs` 的 `TOOL_SUMMARY` 补一句话用途（缺了脚本直接报错）；
+  3. `scripts/gen_dsh_specs.mjs` 与 `scripts/gen_docs_tools.mjs` 各跑一次重新生成；
+  4. `tests/dsh_plugin_smoke.mjs` 的 `EXPECTED_TOOLS` 加工具名；
+  5. `docs/工具参考.md` 补 `## <工具名>` 章节（有单测守住）；
+  6. `python scripts/release.py check` 与 `scripts/check.ps1 full`。
+  文档里的数量与参数表**由生成器同步**，不需要手改 README / 使用指南。
 - 修改编码、换行、原子写入、并发或分页逻辑时，必须先写失败测试。
 - 文件语义测试比较真实字节，不只比较解码后的字符串。
 - 输出必须受预算约束，并保证 UTF-8 字符不被截断。

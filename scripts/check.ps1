@@ -103,6 +103,8 @@ try {
         Invoke-Step '版本一致性' 'python scripts/release.py check'
         Invoke-Step '发布工具自检' 'python tests/release_tooling.py'
         if (Get-Command node -ErrorAction SilentlyContinue) {
+            Invoke-Step 'DSH 工具定义不漂移' 'node scripts/gen_dsh_specs.mjs --check --exe target/debug/fsops.exe'
+            Invoke-Step '文档工具清单不漂移' 'node scripts/gen_docs_tools.mjs --check --exe target/debug/fsops.exe'
             Invoke-Step 'DSH 插件冒烟' 'node tests/dsh_plugin_smoke.mjs --exe target/debug/fsops.exe'
         }
         else {

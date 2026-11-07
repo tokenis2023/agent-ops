@@ -167,19 +167,23 @@ node tests/dsh_plugin_smoke.mjs --exe target/debug/fsops.exe
 
 ## 工具面
 
+<!-- tools:begin -->
+
 9 个工具，故意做窄。
 
-| 工具 | 用途 | 关键参数 |
+| 工具 | 用途 | 参数（MCP 形态；DSH 插件形态不含 fs_exec 的后台任务参数） |
 |---|---|---|
-| `fs_read` | 读文件、行区间、多文件、多文件异构区间、按模式取块、大文件窗口、结构摘要、DOCX/PDF 正文 | `path`/`paths`/`reads`、`start`、`end`、`ranges`、`focus`、`scan`、`summary`、`max_line`、`budget` |
-| `fs_edit` | 精确替换、正则替换、diff 自查、多文件批量、并发保护 | `edits`（`old/new` 或 `pattern/replacement`）、`files`、`diff`、`expect_hash`、`normalize_eol` |
-| `fs_write` | 新建或整体覆盖，原子写入，可生成 DOCX；多文件用 `files` 一次提交 | `path`/`content` 或 `files`、`expect_hash`、`normalize_eol` |
-| `fs_glob` | 按 glob 找文件，尊重 `.gitignore`，带遍历时间预算，可输出 repo map | `pattern`、`path`、`dirs`、`detail`、`limit`、`offset`、`time_budget_ms`、`budget`、`map`、`focus` |
-| `fs_inspect` | 一次看清目录：文件规模分布 + 可选正则的命中分布与样例，替代「glob → stat → grep」多轮探索 | `path`、`pattern`、`focus`、`limit`、`budget` |
-| `fs_grep` | 正则搜索、四种输出、分页、并行，支持 DOCX/PDF 正文；首行带命中分布摘要 | `pattern`、`output`、`context`、`expand`、`max_per_file`、`max_line`、`max_file_size`、`offset`、`parallel` |
-| `fs_stat` | 元信息、编码、换行、hash；`detail=server` 一条调用自检服务端版本与工具数 | `path`/`paths`、`detail=meta/hash/full/server` |
-| `fs_exec` | 执行程序（argv 数组，不经过 shell），支持后台任务；替代 PowerShell 跑 cargo/git/npm | `program`、`args`、`cwd`、`timeout_ms`、`stdin`、`env`、`shell`、`check`、`background`、`job`、`list`、`wait_ms`、`kill`、`max_output` |
-| `fs_file` | 文件管理：copy/move/remove/mkdir/convert/archive/extract | `op`、`src`、`dst`、`path`、`confirm`、`recursive`、`overwrite`、`encoding`、`eol` |
+| `fs_read` | 读文件、行区间、多文件、多文件异构区间、按模式取块、大文件窗口、结构摘要、DOCX/PDF 正文 | `block`、`budget`、`end`、`focus`、`force`、`max_line`、`path`、`paths`、`ranges`、`reads`、`scan`、`start`、`summary`、`tail` |
+| `fs_edit` | 精确替换、正则替换、diff 自查、多文件批量、并发保护 | `diff`、`dry_run`、`edits`、`expect_hash`、`files`、`normalize_eol`、`path` |
+| `fs_write` | 新建或整体覆盖，原子写入，可生成 DOCX；多文件用 files 一次提交 | `content`、`dry_run`、`expect_hash`、`files`、`normalize_eol`、`path` |
+| `fs_glob` | 按 glob 找文件，尊重 .gitignore，带遍历时间预算，可输出 repo map | `budget`、`detail`、`dirs`、`focus`、`limit`、`map`、`max_files`、`no_ignore`、`offset`、`path`、`pattern`、`time_budget_ms` |
+| `fs_inspect` | 一次看清目录：文件规模分布 + 可选正则的命中分布与样例，替代「glob → stat → grep」多轮探索 | `budget`、`focus`、`limit`、`path`、`pattern` |
+| `fs_grep` | 正则搜索、四种输出、分页、并行，支持 DOCX/PDF 正文；首行带命中分布摘要 | `budget`、`context`、`expand`、`glob`、`ignore_case`、`limit`、`max_file_size`、`max_line`、`max_per_file`、`no_ignore`、`offset`、`output`、`parallel`、`path`、`pattern`、`time_budget_ms` |
+| `fs_stat` | 元信息、编码、换行、hash；detail=server 一条调用自检服务端版本与工具数 | `detail`、`path`、`paths` |
+| `fs_exec` | 执行程序（argv 数组，不经过 shell），支持后台任务；替代 PowerShell 跑 cargo/git/npm | `args`、`background`、`check`、`cwd`、`env`、`job`、`kill`、`list`、`max_output`、`program`、`shell`、`stdin`、`timeout_ms`、`wait_ms` |
+| `fs_file` | 文件管理：copy/move/remove/mkdir/convert/archive/extract | `confirm`、`dry_run`、`dst`、`encoding`、`eol`、`op`、`overwrite`、`path`、`recursive`、`src` |
+
+<!-- tools:end -->
 
 完整参数、输出和错误码见 **[工具参考](docs/工具参考.md)**。
 

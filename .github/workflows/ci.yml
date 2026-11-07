@@ -42,6 +42,11 @@ jobs:
       - name: DSH 工具定义与 Rust 真源一致
         run: node scripts/gen_dsh_specs.mjs --check --exe target/debug/fsops.exe
 
+      # 文档里的工具清单与数量也来自 fsops schema：加工具时漏改 README/工具参考/package.json
+      # 会在这里红灯（v0.9.0 加 fs_inspect 时就有 4 处漏改）。
+      - name: 文档工具清单与 Rust 真源一致
+        run: node scripts/gen_docs_tools.mjs --check --exe target/debug/fsops.exe
+
       # 覆盖：包清单、DSH schema DSL、参数集合对齐、插件形态裁剪（schema/描述/运行时三方）、
       # 真实调用链路、并发不串号、长驻会话复用与重建、取消语义、env 注入。
       - name: DSH 插件冒烟测试
