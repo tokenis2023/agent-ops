@@ -64,7 +64,7 @@ pub fn tool_defs() -> Vec<Value> {
                         "description": "仅对 >32MB 文件生效：window（默认）只读到请求区间末尾并探测是否还有内容，毫秒级返回，但不给全文 hash/总行数；full 全文件扫描，给精确 hash 与总行数"
                     },
                     "summary": {"type": "boolean", "description": "只输出结构摘要：声明行 + 行号，不展开函数体；行号可直接接 block=true 读实现。与 ranges/block/end 互斥，数据文件与超大文件不支持"},
-                    "focus": {"type": "string", "description": "只返回匹配该正则的完整代码块（含上下文），替代「先 fs_grep 再 block=true」两步。仅单文件，与 paths/reads/ranges/start/end/block/summary 互斥。JSON 字符串里反斜杠需双写"},
+                    "focus": {"type": "string", "description": "只返回匹配该正则的完整代码块（含上下文），替代「先 fs_grep 再 block=true」两步。数据文件（JSON/YAML/Markdown 等）没有代码块，只给命中行 ±2 行。仅单文件，与 paths/reads/ranges/start/end/block/summary 互斥。JSON 字符串里反斜杠需双写"},
                     "force": {"type": "boolean", "description": "绕过未变更短路，强制返回正文。默认情况下，同一 MCP 会话里同文件同 hash 同区间再读只回一行摘要"}
                 },
                 "required": []
@@ -784,14 +784,26 @@ struct FocusBlocks {
 }
 
 /// 把命中行扩成完整代码块并合并重叠/相邻区间。
-fn focus_blocks(index: &render::LineIndex<'_>, pattern: &str) -> Result<FocusBlocks, String> {
+///
+/// `data_file`（JSON/YAML/Markdown 等）没有函数边界：花括号是数据结构，
+/// 按它扩展会把 focus 变成「读整个文件」，因此只给命中行 ±2 行。
+fn focus_blocks(
+    index: &render::LineIndex<'_>,
+    pattern: &str,
+    data_file: bool,
+) -> Result<FocusBlocks, String> {
     let regex = regex::Regex::new(pattern)
         .map_err(|e| format!("E_BAD_REGEX 正则非法: {e}；检查转义，或先用 fs_grep 确认形状"))?;
     let mut blocks: Vec<(usize, usize)> = Vec::new();
     for (offset, line) in index.lines().iter().enumerate() {
         if regex.is_match(line) {
             let line_no = offset + 1;
-            blocks.push(enclosing_block(index.lines(), line_no).unwrap_or((line_no, line_no)));
+            let block = if data_file {
+                (line_no.saturating_sub(2).max(1), line_no + 2)
+            } else {
+                enclosing_block(index.lines(), line_no).unwrap_or((line_no, line_no))
+            };
+            blocks.push(block);
         }
     }
     if blocks.is_empty() {
@@ -1232,7 +1244,11 @@ fn read(args: &Value) -> String {
         let total_lines = index.total_lines();
         // focus：命中行扩成完整代码块；与 block 类似，但范围由正则决定。
         let focus_info = match arg_str(args, "focus") {
-            Some(pattern) => match focus_blocks(&index, pattern) {
+            Some(pattern) => match focus_blocks(
+                &index,
+                pattern,
+                crate::summary::is_data(crate::summary::language_of(&fp.display())),
+            ) {
                 Ok(info) => {
                     if info.blocks.is_empty() {
                         out.push_str(&format!(
@@ -1374,14 +1390,11 @@ fn read(args: &Value) -> String {
         if let Some((focus, pattern)) = &focus_info {
             if focus.truncated {
                 header.push_str(&format!(
-                    "… focus={pattern} 命中 {} 个代码块，仅显示前 {MAX_FOCUS_BLOCKS} 块；用 fs_grep 缩小范围\n",
+                    "… focus={pattern} 命中 {} 处，仅显示前 {MAX_FOCUS_BLOCKS} 处；用 fs_grep 缩小范围\n",
                     focus.total
                 ));
             } else {
-                header.push_str(&format!(
-                    "… focus={pattern} 命中 {} 个代码块\n",
-                    focus.total
-                ));
+                header.push_str(&format!("… focus={pattern} 命中 {} 处\n", focus.total));
             }
         }
         if block_fallback {
@@ -1614,6 +1627,17 @@ mod tests {
             merge_ranges(vec![(10, 14), (1, 6), (12, 20)]),
             vec![(1, 6), (10, 20)]
         );
+    }
+
+    #[test]
+    fn stat多文件部分失败时首行给成败计数() {
+        let path = 临时文本文件("x\n");
+        let posix = path.to_string_lossy().replace('\\', "/");
+        let missing = format!("{posix}.missing");
+        let out = stat(&json!({"paths": [posix, missing]}));
+        let _ = fs::remove_file(path);
+        assert!(out.starts_with("ok stat 2 项：1 成功，1 失败"), "{out}");
+        assert!(out.contains("E_NOT_FOUND"), "{out}");
     }
 
     #[test]
@@ -2668,6 +2692,25 @@ fn next_fn() {
         let _ = fs::remove_file(path);
         assert!(out.contains("未定位到花括号块"), "缺少回退提示: {out}");
         assert!(out.contains("1-3"), "应说明实际读取区间: {out}");
+    }
+
+    #[test]
+    fn focus在数据文件上只给命中行附近() {
+        // JSON/YAML 的花括号是数据结构，不是函数边界；
+        // 按花括号扩展会把 focus 变成「读整个文件」。
+        let path = 临时文本文件(
+            "{\n  \"a\": 1,\n  \"b\": 2,\n  \"c\": 3,\n  \"d\": 4,\n  \"target\": 5,\n  \"e\": 6,\n  \"f\": 7,\n  \"g\": 8\n}\n",
+        );
+        let posix_path = path.to_string_lossy().replace('\\', "/");
+        let out = read(&json!({
+            "path": posix_path,
+            "focus": "target",
+            "budget": 2000,
+            "force": true
+        }));
+        let _ = fs::remove_file(path);
+        assert!(out.contains("6|"), "应包含命中行: {out}");
+        assert!(!out.contains("1|{"), "数据文件不应扩展成整个文件: {out}");
     }
 
     #[test]
@@ -5233,6 +5276,22 @@ fn stat(args: &Value) -> String {
             }
         }
     }
+    let failed = out
+        .lines()
+        .filter(|line| line.trim_start().starts_with("E_"))
+        .count();
+    if targets.len() > 1 && failed > 0 {
+        // 一个路径失败不该淹没其余结果：首行先给成败计数，
+        // 调用方即使只看到 isError=true，也知道还有多少内容可用。
+        let ok = targets.len() - failed.min(targets.len());
+        return format!(
+            "ok stat {} 项：{} 成功，{} 失败\n{}",
+            targets.len(),
+            ok,
+            failed,
+            out.trim_end()
+        );
+    }
     out.trim_end().to_string()
 }
 
@@ -5481,8 +5540,8 @@ mod roundtrip_tests {
             &json!({"path": path.to_string_lossy().replace('\\', "/"), "focus": "hit", "budget": 60000}),
         );
         let _ = fs::remove_dir_all(&dir);
-        assert!(out.contains("仅显示前 12 块"), "{out}");
-        assert!(out.contains("命中 20 个代码块"), "{out}");
+        assert!(out.contains("仅显示前 12 处"), "{out}");
+        assert!(out.contains("命中 20 处"), "{out}");
     }
     #[test]
     fn 第二次同区间读返回未变更摘要() {

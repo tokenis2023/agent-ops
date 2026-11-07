@@ -6,6 +6,14 @@
 
 - 修复 `fs_read block=true` 在缩进语言（Python 等）上找不到花括号块时静默读到文件末尾：现在文件头明确提示已按 `start..end` 普通读取，并给出 `fs_grep` 定位后传 `ranges` 的替代路径。
 - 修复长行截断尾注把单行成本说成全文成本：改为「最长截断行约 N 字节，重读该行需 max_line=0 且 budget≈M」。
+- 修复 `fs_read ranges` 乱序输入丢行：先全局排序再合并，`[[10,14],[1,6],[12,20]]` 不再把 `[1,6]` 吞进 `[10,14]`。
+- 修复 `fs_read summary` 在预算紧张时尾注被硬切成「或调大 bud」：按实际尾注长度预留，连文件头都放不下时返 `E_BUDGET` 并给出所需字节数。
+- 修复极小 `budget` 误报 `E_LINE_TOO_LONG`：那是文件头加续读尾注的成本，现在报 `E_BUDGET`。
+- `summary` 的 Rust 测试模块识别改为字符串感知的括号计数，并覆盖 `mod *_tests` 命名；`tools.rs` 符号数 133 → 39（22 个正式声明 + 17 个测试后 item）。
+- `fs_glob map=true` 把 `tests/`、`benches/`、`*_test` 文件排到实现文件之后；「还有 N 个符号」处提示用 `fs_read summary=true` 看完整结构。
+- `fs_read focus` 在数据文件（JSON/YAML/Markdown 等）上只给命中行 ±2 行，不再按花括号扩成整个文件；提示文案从「命中 N 个代码块」改为「命中 N 处」。
+- `fs_stat` 多文件部分失败时首行给出 `ok stat N 项：X 成功，Y 失败`，不再让一项失败淹没其余结果。
+- 版本 0.4.1，新增 9 个单测。
 
 ## [0.4.0] - 2026-11-07
 
