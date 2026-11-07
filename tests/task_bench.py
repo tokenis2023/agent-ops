@@ -493,19 +493,19 @@ def scenario_multi_file_reads(c: Ctx, fx: dict) -> None:
 
 
 def scenario_repeat_read(c: Ctx, fx: dict) -> None:
-    """重复读同一区间：第二次只回未变更摘要，force 才返回正文。"""
+    """重复读同一区间：默认返回正文。
+
+    stub 只省单次响应，却让模型多花一轮 force=true；多一轮等于整个上下文
+    重发，按总成本算返回正文更便宜。短路逻辑本身由 Rust 单测覆盖。
+    """
     path = c.p("repeat", "loop.txt")
     first, err = c.call("fs_read", path=path, start=1, end=400)
     c.check(not err, "repeat: 首次读不应报错", first[:200])
     second, err = c.call("fs_read", path=path, start=1, end=400)
     c.check(not err, "repeat: 二次读不应报错", second[:200])
-    c.check("未变更" in second, "repeat: 二次读应短路", second[:200])
-    c.check(len(second) * 10 < len(first), "repeat: 摘要应小于正文的 10%",
+    c.check("未变更" not in second, "repeat: 默认不应短路成摘要", second[:200])
+    c.check(len(second) > len(first) * 0.9, "repeat: 默认应返回正文",
             f"{len(second)} vs {len(first)}")
-    c.check("force=true" in second, "repeat: 摘要应给出 force 出口", second[:200])
-    forced, err = c.call("fs_read", path=path, start=1, end=400, force=True)
-    c.check(not err and "1|" in forced and "未变更" not in forced,
-            "repeat: force 应返回正文", forced[:200])
 
 def scenario_repo_map(c: Ctx, fx: dict) -> None:
     """repo map：一次调用给出「先看哪些文件」。"""
@@ -546,7 +546,7 @@ SCENARIOS = [
     ("正则编辑 dry_run+diff", scenario_regex_edit),
     ("count 高密度", scenario_count_density),
     ("多文件异构 reads", scenario_multi_file_reads),
-    ("重复读短路", scenario_repeat_read),
+    ("重复读不短路", scenario_repeat_read),
     ("repo map 排序", scenario_repo_map),
     ("后台任务轮询", scenario_background_job),
 ]
