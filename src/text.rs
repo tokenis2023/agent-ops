@@ -234,6 +234,36 @@ pub fn detect_eol(text: &str) -> Eol {
     }
 }
 
+/// 混合换行时取多数行使用的风格；平局退回 LF。
+/// 归一到主风格（而非一律 LF）能避免把 CRLF 仓库整文件改成 LF、产生巨大 diff。
+pub fn dominant_eol(text: &str) -> Eol {
+    let mut crlf = 0usize;
+    let mut lf = 0usize;
+    let mut cr = 0usize;
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\r' => {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
+                    crlf += 1;
+                    i += 2;
+                    continue;
+                }
+                cr += 1;
+            }
+            b'\n' => lf += 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    if crlf > lf + cr {
+        Eol::CrLf
+    } else {
+        Eol::Lf
+    }
+}
+
 /// 编码回字节；保留 BOM。目标编码无法表示文本时拒绝写入。
 pub fn encode(doc: &Doc, text: &str) -> Result<Vec<u8>, String> {
     let enc: &'static Encoding = match doc.encoding {
@@ -347,6 +377,15 @@ mod tests {
             err.contains("fs_file op=convert") && err.contains("encoding=utf-8"),
             "应点名已有的转码命令: {err}"
         );
+    }
+
+    #[test]
+    fn 混合换行取多数风格() {
+        assert_eq!(dominant_eol("a\r\nb\nc\r\n"), Eol::CrLf);
+        assert_eq!(dominant_eol("a\nb\r\nc\n"), Eol::Lf);
+        assert_eq!(dominant_eol("a\r\nb\n"), Eol::Lf, "平局取 LF");
+        assert_eq!(dominant_eol("a\nb"), Eol::Lf);
+        assert_eq!(dominant_eol("a\r\nb\r\n"), Eol::CrLf);
     }
 
     #[test]

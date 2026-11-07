@@ -51,7 +51,7 @@ check(
   'bundle 仅声明 win32 平台',
 )
 check(pkg.version === cargoVersion, 'package.json 版本与 Cargo.toml 一致', pkg.version + ' vs ' + cargoVersion)
-for (const required of ['dsh', 'cordis.patch.yml', 'locale/*.json', 'icon.svg']) {
+for (const required of ['dsh', 'cordis.patch.yml', 'locale/*.json', 'icon.svg', 'docs']) {
   check(Array.isArray(pkg.files) && pkg.files.includes(required), 'files 包含 ' + required)
 }
 check(existsSync(join(ROOT, 'dsh', 'index.js')), 'dsh/index.js 存在')

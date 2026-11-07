@@ -87,8 +87,8 @@ check("混合换行默认拒绝编辑",
       text)
 text, _ = call("fs_edit", path=posix(mixed), normalize_eol=True,
                edits=[{"old": "beta", "new": "changed"}])
-check("显式允许后混合换行归一为 LF",
-      text.startswith("ok") and open(mixed, "rb").read() == b"alpha\nchanged\ngamma\n",
+check("显式允许后混合换行归一为主风格 CRLF",
+      text.startswith("ok") and open(mixed, "rb").read() == b"alpha\r\nchanged\r\ngamma\r\n",
       text)
 
 mixed_write = os.path.join(root, "mixed-write.txt")
@@ -100,7 +100,7 @@ check("混合换行默认拒绝覆盖",
       text)
 text, _ = call("fs_write", path=posix(mixed_write), content="one\r\nchanged\n",
                normalize_eol=True)
-check("显式允许后覆盖归一为 LF",
+check("显式允许后覆盖归一为主风格",
       text.startswith("ok") and open(mixed_write, "rb").read() == b"one\nchanged\n",
       text)
 
@@ -113,7 +113,7 @@ check("新建文件混合换行默认拒绝",
 new_mixed_normalize = os.path.join(root, "new-mixed-normalize.txt")
 text, _ = call("fs_write", path=posix(new_mixed_normalize), content="one\r\nchanged\n",
                normalize_eol=True)
-check("新建文件混合换行显式归一 LF",
+check("新建文件混合换行显式归一为主风格",
       text.startswith("ok") and open(new_mixed_normalize, "rb").read() == b"one\nchanged\n",
       text)
 

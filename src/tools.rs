@@ -92,14 +92,14 @@ pub fn tool_defs() -> Vec<Value> {
                                 "path": {"type": "string"},
                                 "edits": {"type": "array", "items": edit_item_schema()},
                                 "expect_hash": {"type": "string", "description": "该文件的并发保护指纹"},
-                                "normalize_eol": {"type": "boolean", "description": "该文件含混合换行时，显式允许归一为 LF"}
+                                "normalize_eol": {"type": "boolean", "description": "该文件含混合换行时，显式允许归一为主换行风格（多数行使用的风格，平局取 LF）"}
                             },
                             "required": ["path", "edits"]
                         }
                     },
                     "dry_run": {"type": "boolean", "description": "只校验不落盘"},
                     "diff": {"type": "boolean", "description": "附带被替换的原文/新文片段（`@@ 行号` + `-原文` / `+新文`）；默认关闭，改结构后想自查时打开，可省一次 fs_read"},
-                    "normalize_eol": {"type": "boolean", "description": "混合换行时显式归一为 LF"},
+                    "normalize_eol": {"type": "boolean", "description": "混合换行时显式归一为主换行风格（多数行使用的风格，平局取 LF）"},
                     "expect_hash": {"type": "string", "description": "单文件并发保护：文件已变则拒绝写入"}
                 },
                 "required": []
@@ -113,7 +113,7 @@ pub fn tool_defs() -> Vec<Value> {
                 "properties": {
                     "path": {"type": "string"},
                     "content": {"type": "string"},
-                    "normalize_eol": {"type": "boolean", "description": "新文件或原文件为混合换行时，显式归一为 LF；已有稳定文件始终沿用原换行"},
+                    "normalize_eol": {"type": "boolean", "description": "新文件或原文件为混合换行时，显式归一为主换行风格（多数行使用的风格，平局取 LF）；已有稳定文件始终沿用原换行"},
                     "expect_hash": {"type": "string", "description": "并发保护：文件已变则拒绝覆盖"},
                     "dry_run": {"type": "boolean", "description": "只做路径/编码/换行/hash 预检，不创建也不覆盖文件"}
                 },
@@ -3641,6 +3641,30 @@ fn next_fn() {
     }
 
     #[test]
+    fn 混合换行归一时沿用原文件主风格() {
+        // 一律归一为 LF 会把 CRLF 仓库整文件改成 LF，产生巨大 diff。
+        let dir = 临时目录("eol-dominant");
+        let path = dir.join("a.txt");
+        fs::write(&path, b"alpha\r\nbeta\ngamma\r\n").unwrap();
+        let posix = path.to_string_lossy().replace('\\', "/");
+        let out = call(
+            "fs_edit",
+            &json!({
+                "path": posix,
+                "edits": [{"old": "beta", "new": "changed"}],
+                "normalize_eol": true
+            }),
+        );
+        let raw = fs::read(&path).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(out.starts_with("ok"), "{out}");
+        assert_eq!(
+            raw, b"alpha\r\nchanged\r\ngamma\r\n",
+            "CRLF 为主的文件不应被改成 LF: {out}"
+        );
+    }
+
+    #[test]
     fn fs_read描述包含模式互斥表() {
         // 模式互斥只能靠运行时错误教学的话，模型要付一轮试错；
         // description 里给一张组合表，让它在发出调用前就能拼出合法参数。
@@ -4964,12 +4988,14 @@ fn prepare_edit(
     }
     let io::Snapshot { doc, hash, .. } = io::read_snapshot(fp)?;
     let eol = if doc.eol == crate::text::Eol::Mixed {
+        let target = crate::text::dominant_eol(&doc.text);
         if normalize_eol {
-            crate::text::Eol::Lf
+            target
         } else {
-            return Err(
-                "E_MIXED_EOL 文件包含混合换行；请显式设置 normalize_eol=true 归一为 LF".into(),
-            );
+            return Err(format!(
+                "E_MIXED_EOL 文件包含混合换行；请显式设置 normalize_eol=true 归一为主风格 {}（将把整文件统一为该风格）",
+                target.as_str()
+            ));
         }
     } else {
         doc.eol
@@ -5285,19 +5311,25 @@ fn write(args: &Value) -> String {
     let content_eol = crate::text::detect_eol(content);
     let target_eol = match &existing {
         Some(snapshot) if snapshot.doc.eol == crate::text::Eol::Mixed => {
+            let target = crate::text::dominant_eol(&snapshot.doc.text);
             if !arg_bool(args, "normalize_eol", false) {
-                return "E_MIXED_EOL 原文件包含混合换行；请显式设置 normalize_eol=true 归一为 LF"
-                    .into();
+                return format!(
+                    "E_MIXED_EOL 原文件包含混合换行；请显式设置 normalize_eol=true 归一为主风格 {}（将把整文件统一为该风格）",
+                    target.as_str()
+                );
             }
-            crate::text::Eol::Lf
+            target
         }
         Some(snapshot) => snapshot.doc.eol,
         None if content_eol == crate::text::Eol::Mixed => {
+            let target = crate::text::dominant_eol(content);
             if !arg_bool(args, "normalize_eol", false) {
-                return "E_MIXED_EOL 待写内容包含混合换行；请显式设置 normalize_eol=true 归一为 LF"
-                    .into();
+                return format!(
+                    "E_MIXED_EOL 待写内容包含混合换行；请显式设置 normalize_eol=true 归一为主风格 {}（将把整文件统一为该风格）",
+                    target.as_str()
+                );
             }
-            crate::text::Eol::Lf
+            target
         }
         None => content_eol,
     };
