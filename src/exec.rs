@@ -90,7 +90,15 @@ pub fn run(args: &Value) -> String {
     let check = crate::tools::arg_bool(args, "check", false);
     let timeout_ms =
         crate::tools::arg_usize(args, "timeout_ms", DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
-    let max_output = crate::tools::arg_usize(args, "max_output", DEFAULT_MAX_OUTPUT).max(1024);
+    let requested_max_output = crate::tools::arg_usize(args, "max_output", DEFAULT_MAX_OUTPUT);
+    // 钳制到 1024 是为了别把输出切成不可用的碎片；但不能静默——回显实际生效值。
+    const MIN_MAX_OUTPUT: usize = 1024;
+    let max_output = requested_max_output.max(MIN_MAX_OUTPUT);
+    let clamp_note = if max_output == requested_max_output {
+        String::new()
+    } else {
+        format!(" max_output={max_output}B（请求 {requested_max_output}B，已按最小值执行）")
+    };
     let stdin_text = crate::tools::arg_str(args, "stdin").map(str::to_string);
     let (mut command, program) = match build_command(args) {
         Ok(pair) => pair,
@@ -165,13 +173,17 @@ pub fn run(args: &Value) -> String {
     // check=true：非零退出按错误返回；默认保持 ok，测试失败不是工具错误。
     let exit = exit_code.unwrap_or(-1);
     let mut text = if check && exit != 0 {
-        format!("E_EXIT code={exit} {elapsed}ms stdout={out_total}B stderr={err_total}B\n")
+        format!(
+            "E_EXIT code={exit} {elapsed}ms stdout={out_total}B stderr={err_total}B{clamp_note}\n"
+        )
     } else if exit != 0 {
         // check=false 时非零退出不算失败，但前缀绝不能是 ok：
         // 模型扫到 ok 会把编译/测试失败当成功。
-        format!("exit={exit} 非零 {elapsed}ms stdout={out_total}B stderr={err_total}B\n")
+        format!(
+            "exit={exit} 非零 {elapsed}ms stdout={out_total}B stderr={err_total}B{clamp_note}\n"
+        )
     } else {
-        format!("ok exit=0 {elapsed}ms stdout={out_total}B stderr={err_total}B\n")
+        format!("ok exit=0 {elapsed}ms stdout={out_total}B stderr={err_total}B{clamp_note}\n")
     };
     push_stream(&mut text, "stdout", &out_text, out_bytes.len(), out_total);
     push_stream(&mut text, "stderr", &err_text, err_bytes.len(), err_total);
@@ -267,6 +279,21 @@ mod tests {
         // 模型扫到 ok 会把编译失败当成功。
         assert!(out.starts_with("exit=3"), "{out}");
         assert!(!out.contains("ok exit=3"), "{out}");
+    }
+
+    #[test]
+    fn max_output被钳制时回显实际值() {
+        // 静默抬高参数会让模型以为自己的 200B 生效了，看到的却是 1024B。
+        let out = run(&json!({"program": "cmd", "args": ["/c", "echo hi"], "max_output": 200}));
+        assert!(out.starts_with("ok"), "{out}");
+        assert!(out.contains("max_output=1024B"), "应回显实际生效值: {out}");
+        assert!(out.contains("请求 200B"), "应说明请求值: {out}");
+    }
+
+    #[test]
+    fn max_output未钳制时不加噪音() {
+        let out = run(&json!({"program": "cmd", "args": ["/c", "echo hi"]}));
+        assert!(!out.contains("max_output="), "默认值不该回显: {out}");
     }
 
     #[test]

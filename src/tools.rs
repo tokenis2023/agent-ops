@@ -3714,6 +3714,51 @@ fn next_fn() {
     }
 
     #[test]
+    fn 陈旧与混合换行同时成立时先报陈旧并一次说清() {
+        // 外部追加是最常见的场景：它同时造成「hash 变了」和「换行混合了」。
+        // 旧实现先报 E_MIXED_EOL，模型归一完再来一轮才被告知 hash 也变了。
+        let dir = 临时目录("eol-and-stale");
+        let path = dir.join("a.txt");
+        fs::write(&path, b"alpha\nbeta\n").unwrap();
+        let posix = path.to_string_lossy().replace('\\', "/");
+        let read = call("fs_read", &json!({"path": posix}));
+        assert!(read.contains("hash="), "{read}");
+
+        fs::write(&path, b"alpha\r\nbeta\r\nadded\n").unwrap();
+        let out = call(
+            "fs_edit",
+            &json!({
+                "path": posix,
+                "expect_hash": "0000000000000000",
+                "edits": [{"old": "beta", "new": "BETA"}]
+            }),
+        );
+        let raw = fs::read(&path).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(out.starts_with("E_STALE"), "陈旧应优先: {out}");
+        assert!(out.contains("混合换行"), "应同时告知换行事实: {out}");
+        assert!(raw.starts_with(b"alpha\r\n"), "被拒绝时磁盘不应变化: {out}");
+    }
+
+    #[test]
+    fn 全量覆盖不受源文件混合换行影响() {
+        // 覆盖写是全量替换，源文件的混合换行已无意义；只要待写内容风格稳定，
+        // 就不该再要求 normalize_eol（旧行为会多拦一轮）。
+        let dir = 临时目录("write-over-mixed");
+        let path = dir.join("a.txt");
+        fs::write(&path, b"old\r\nmixed\n").unwrap();
+        let posix = path.to_string_lossy().replace('\\', "/");
+        let out = call(
+            "fs_write",
+            &json!({"path": posix, "content": "new\nstable\n"}),
+        );
+        let raw = fs::read(&path).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(out.starts_with("ok"), "稳定的新内容不应被源文件拦截: {out}");
+        assert_eq!(raw, b"new\nstable\n", "应按内容自身的稳定风格写: {out}");
+    }
+
+    #[test]
     fn fs_read描述包含模式表() {
         // 模式互斥只能靠运行时错误教学的话，模型要付一轮试错；
         // description 里给一张组合表，让它在发出调用前就能拼出合法参数。
@@ -5038,24 +5083,33 @@ fn prepare_edit(
         ));
     }
     let io::Snapshot { doc, hash, .. } = io::read_snapshot(fp)?;
-    let eol = if doc.eol == crate::text::Eol::Mixed {
-        let target = crate::text::dominant_eol(&doc.text);
-        if normalize_eol {
-            target
-        } else {
+    let mixed = doc.eol == crate::text::Eol::Mixed;
+    let dominant = mixed.then(|| crate::text::dominant_eol(&doc.text));
+    // 陈旧优先于换行：文件变了是更根本的事实。两者同时成立时一次说清，
+    // 否则模型要跑两轮（先被 E_MIXED_EOL 拦、再被 E_STALE 拦）——
+    // 而「外部追加」恰好是同时制造陈旧与混合换行的常见路径。
+    if let Some(expect) = expect_hash {
+        if hash != expect {
+            let extra = match dominant {
+                Some(target) => format!(
+                    "；另：该文件当前含混合换行，解决陈旧后可能还需 normalize_eol=true（主风格 {}）",
+                    target.as_str()
+                ),
+                None => String::new(),
+            };
+            return Err(format!("{}{extra}", stale_changed(&hash)));
+        }
+    }
+    let eol = match dominant {
+        Some(target) if normalize_eol => target,
+        Some(target) => {
             return Err(format!(
                 "E_MIXED_EOL 文件包含混合换行；请显式设置 normalize_eol=true 归一为主风格 {}（将把整文件统一为该风格）",
                 target.as_str()
             ));
         }
-    } else {
-        doc.eol
+        None => doc.eol,
     };
-    if let Some(expect) = expect_hash {
-        if hash != expect {
-            return Err(stale_changed(&hash));
-        }
-    }
     let (new_text, result) = edit::apply(&doc.text, eol, edits)?;
     // dry_run 也要完成编码预检，不能绕过不可表示字符校验。
     let bytes = crate::text::encode(&doc, &new_text)?;
@@ -5362,14 +5416,20 @@ fn write(args: &Value) -> String {
     let content_eol = crate::text::detect_eol(content);
     let target_eol = match &existing {
         Some(snapshot) if snapshot.doc.eol == crate::text::Eol::Mixed => {
-            let target = crate::text::dominant_eol(&snapshot.doc.text);
-            if !arg_bool(args, "normalize_eol", false) {
-                return format!(
-                    "E_MIXED_EOL 原文件包含混合换行；请显式设置 normalize_eol=true 归一为主风格 {}（将把整文件统一为该风格）",
-                    target.as_str()
-                );
+            // 全量覆盖时源文件的混合换行已无意义：只要待写内容本身风格稳定，
+            // 直接按内容风格写，不再要求 normalize_eol（旧行为会多拦一轮）。
+            if content_eol != crate::text::Eol::Mixed {
+                content_eol
+            } else {
+                let target = crate::text::dominant_eol(content);
+                if !arg_bool(args, "normalize_eol", false) {
+                    return format!(
+                        "E_MIXED_EOL 待写内容包含混合换行；请显式设置 normalize_eol=true 归一为主风格 {}（将把整文件统一为该风格）",
+                        target.as_str()
+                    );
+                }
+                target
             }
-            target
         }
         Some(snapshot) => snapshot.doc.eol,
         None if content_eol == crate::text::Eol::Mixed => {
