@@ -177,7 +177,7 @@ node tests/dsh_plugin_smoke.mjs --exe target/debug/fsops.exe
 | `fs_edit` | 精确替换、正则替换、diff 自查、多文件批量、并发保护 | `diff`、`dry_run`、`edits`、`expect_hash`、`files`、`normalize_eol`、`path` |
 | `fs_write` | 新建或整体覆盖，原子写入，可生成 DOCX；多文件用 files 一次提交 | `content`、`dry_run`、`expect_hash`、`files`、`normalize_eol`、`path` |
 | `fs_glob` | 按 glob 找文件，尊重 .gitignore，带遍历时间预算，可输出 repo map | `budget`、`detail`、`dirs`、`focus`、`limit`、`map`、`max_files`、`no_ignore`、`offset`、`path`、`pattern`、`time_budget_ms` |
-| `fs_inspect` | 一次看清目录：文件规模分布 + 可选正则的命中分布与样例，替代「glob → stat → grep」多轮探索 | `budget`、`focus`、`limit`、`path`、`pattern` |
+| `fs_inspect` | 一次看清目录：文件规模分布 + 可选正则的命中分布与样例，替代「glob → stat → grep」多轮探索 | `budget`、`focus`、`limit`、`no_ignore`、`path`、`pattern`、`time_budget_ms` |
 | `fs_grep` | 正则搜索、四种输出、分页、并行，支持 DOCX/PDF 正文；首行带命中分布摘要 | `budget`、`context`、`expand`、`glob`、`ignore_case`、`limit`、`max_file_size`、`max_line`、`max_per_file`、`no_ignore`、`offset`、`output`、`parallel`、`path`、`pattern`、`time_budget_ms` |
 | `fs_stat` | 元信息、编码、换行、hash；detail=server 一条调用自检服务端版本与工具数 | `detail`、`path`、`paths` |
 | `fs_exec` | 执行程序（argv 数组，不经过 shell），支持后台任务；替代 PowerShell 跑 cargo/git/npm | `args`、`background`、`check`、`cwd`、`env`、`job`、`kill`、`list`、`max_output`、`program`、`shell`、`stdin`、`timeout_ms`、`wait_ms` |

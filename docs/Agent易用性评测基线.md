@@ -91,6 +91,17 @@ P2 的分工边界（已写成测试）：
 
 两条防回退断言：`引导不复制工具描述里的参数枚举`（instructions 不得再出现 `reads=[`/`focus=`/`map=true`/`block=true`）、`规则正文不重复参数枚举`（RULE_BODY 不得出现上述枚举与 `默认完整统计`）。
 
+## 2.3 P4 后的数字（2026-11-10）
+
+| 命令 | P2a 后 | P4 后 | 变化 |
+|---|---|---|---|
+| `cargo test` | 391 | **401** | +10（F-6 2、F-7 3、F-9 1、P3 遗留 4） |
+| e2e | 213 | 213 | — |
+| 10 个基准场景 | 全 PASS | 全 PASS | 无回归 |
+| `fs_inspect` 声明参数 | 5 | **7** | +`time_budget_ms`、`no_ignore` |
+| 全部 inputSchema | 14,225 B | **14,527 B** | +302 B（inspect 声明了两个真实存在的参数） |
+| 描述 + schema | 17,420 B | **17,722 B** | +302 B |
+
 ## 3. 体积口径
 
 ### 3.1 MCP 常驻成本
@@ -102,7 +113,7 @@ P2 的分工边界（已写成测试）：
 | └ description 合计 | 3,164 | 平均 352 B |
 | └ inputSchema 合计 | 14,225 | 含类型、枚举、描述与 `additionalProperties:false` |
 
-> 本节数字是 P0 口径；P2a 后的最新值见 2.2 节。
+> 本节数字是 P0 口径；最新值见 2.2、2.3 节。
 
 逐工具（description / inputSchema / 参数个数）：
 
@@ -185,10 +196,10 @@ src/adopt.rs::RULE_BODY         ──integrate──►  AGENTS.md / CLAUDE.md 
 | `tail` + `start`/`end`/`ranges`/`block`/`summary`/`focus`/`paths` | `E_BAD_ARGS tail 与 … 互斥` |
 | `summary` + `ranges`/`block`/`end` | `E_BAD_ARGS … summary=true 不能与 … 同时使用` |
 | `focus` + `paths`/`ranges`/`start`/`end`/`block`/`summary` | `E_BAD_ARGS focus 只能用于单文件 path…` |
-| `reads` + `tail` / `max_line` / `scan` | **静默忽略**（exit 0，按 reads 读，顶层参数无效果） |
-| `block` + `ranges` | **静默按 ranges 处理**（exit 0，返回区间内容） |
+| `reads` + `tail` / `max_line` / `scan` | P0 时：静默忽略；**P4 后**：`max_line`/`scan` 传播到每项，`tail` 报 `E_BAD_ARGS` |
+| `block` + `ranges` | P0 时：静默按 ranges；**P4 后**：`E_BAD_ARGS block 与 ranges 互斥` |
 
-后两行是本次盘点的**新发现**：它们是「无效调用但不报错」，属于 P4 的审计输入，不是 P0 要改的行为。
+后两行是本次盘点的**新发现**：它们是「无效调用但不报错」，已在 P4 消除（见第 7 节 F-7）。
 
 ### 5.2 预算与截断
 
@@ -268,10 +279,10 @@ E_NO_MATCH 第1处未找到目标文本；最接近的行（共 N 条相似，�
 | F-3 | ~~工具数注释写「8 个」而实际 9 个~~ **P2a 已处理**：6 处文案已去数量，新增 `非生成器维护的文案不报错工具数` 钉住残留 | 单测 | 完成 |
 | F-4 | ~~`E_STALE` 先建议「改传新 hash 重试」，`E_AMBIGUOUS` 先建议 `all=true`~~ **P3 已处理**：两者恢复顺序已调，并有位置断言 | 6.1 节 | 完成 |
 | F-5 | ~~锁持续占用无升级路径~~ **P3 已处理**：`E_LOCKED` 增加「连续两次仍被占就停止并报告」；等待仍为 3000 ms | 6.1 节 | 完成 |
-| F-6 | `fs_inspect` 实现读取 `time_budget_ms`/`no_ignore`，但 schema 与文档都没有；传了会被 `additionalProperties:false` 拒绝 | 实测 `E_BAD_ARGS fs_inspect.time_budget_ms 是未知字段` | P4（契约一致性） |
-| F-7 | `reads` + `tail`/`max_line`/`scan`、`block` + `ranges` 静默忽略 | 第 5.1 节实测 | P4 |
-| F-8 | `docs/工具参考.md` 的 `E_LOCKED` 仍写「稍后重试」，与实际文案「参数不变直接重试」不一致 | 工具参考第 577 行 vs `src/io.rs:757` | P5（文档） |
-| F-9 | offset 不是快照、count 精确/部分口径没有任何成文契约 | 第 5.3 节 | P4 |
+| F-6 | ~~`fs_inspect` 实现读取 `time_budget_ms`/`no_ignore`，schema 未声明~~ **P4 已处理**：两者已进 schema 与工具参考，传了不再报未知字段 | `inspect声明的预算参数与实现一致` | 完成 |
+| F-7 | ~~`reads` + `tail`/`max_line`/`scan`、`block` + `ranges` 静默忽略~~ **P4 已处理**：`max_line`/`scan` 传播到子项；`tail` 与 `block`+`ranges` 改为 `E_BAD_ARGS` | 第 5.1 节与新增单测 | 完成 |
+| F-8 | ~~`docs/工具参考.md` 的 `E_LOCKED` 与实现不一致~~ **P3 已处理**：错误表已同步，并补上恢复顺序 | 工具参考错误表 | 完成 |
+| F-9 | ~~offset 不是快照、count 精确/部分口径没有成文契约~~ **P4 已处理**：工具参考新增「四种截断」表与 offset 非快照声明，并有 `截断与空结果区分及续读参数可直接重放` 验证 | 工具参考「输出预算与截断」 | 完成 |
 
 ## 8. 覆盖矩阵（计划第 5 节 T01–T16）
 
@@ -385,5 +396,20 @@ E_NO_MATCH 第1处未找到目标文本；最接近的行（共 N 条相似，�
 - ⚠️ **未验证模型行为**：「模型不因提示自动放弃保护」「恢复调用中位数减 1」需要 P1b 的真实模型数据，本轮只有文案与确定性断言。
 
 本轮未做的事（有意保留）：将结构化 MCP 结果代替文本契约——计划 P3-6 把它列为单独决策，当前无宿主消费方证据，未实施。
+
+### P4 验收（预算、截断与续读）
+
+计划 P4 的验收是「续读拼接后与预期全集一致；预算边界、UTF-8 中文边界与超大文件窗口有针对性验证」。
+
+- ✅ F-6：`fs_inspect` 的 `time_budget_ms`/`no_ignore` 已进 schema 与工具参考，传了不再报未知字段（`inspect声明的预算参数与实现一致`、`inspect接受声明的预算参数`）；
+- ✅ F-7：`reads` 顶层 `max_line`/`scan` 传播到每项（项内值优先），`reads`+`tail` 与 `block`+`ranges` 改为显式 `E_BAD_ARGS`，不再静默丢弃；
+- ✅ F-9：工具参考新增「输出预算与截断」四种信号的区分表与「offset 不是快照」声明；
+- ✅ 新增断言 `截断与空结果区分及续读参数可直接重放`：未见顶的 count 不标「本页可见」、显式 limit 必标；`next_offset` 必须等于本页实际条目数；
+- ✅ 既有完整性断言继续全绿：`files 高密度分页`（20 页拼出 60 个文件）、`glob 预算分页`（120 条目）、`grep→block→续读`（按 ranges 拼出完整代码块）、`>32MB 窗口续读`；
+- ✅ 门禁 11 步全绿（401 单测 / 213 e2e / 10 基准场景）。
+
+未改的部分（有意保留）：offset 在并发变化目录上仍不承诺无遗漏——这是如实声明的边界，不是缺陷；本轮只把它写成契约，不引入快照机制（那会改变性能特性）。
+
+下一步：P5（综合验收、文档与发布准备）需要组合 P2–P4 并与基线逐任务对比；真实 Agent 对比（P1b/P2b）仍待授权。
 
 下一步：P4（预算、截断与续读完整性）的输入已在 P0 备好（F-6、F-7、F-9）；P1b 与 P2b 需真实模型授权；P5 未开始。

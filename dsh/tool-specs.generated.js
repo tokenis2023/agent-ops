@@ -356,6 +356,10 @@ export const TOOL_SPECS = [
         "description": "列出的文件数，默认 15",
         "type": "integer"
       },
+      "no_ignore": {
+        "description": "忽略 .gitignore 与 node_modules/target 等默认跳过项；只在明确要统计依赖源码时用",
+        "type": "boolean"
+      },
       "path": {
         "description": "根目录，默认当前目录",
         "type": "string"
@@ -363,6 +367,10 @@ export const TOOL_SPECS = [
       "pattern": {
         "description": "可选 Rust 正则：给了就附带命中分布与前几条命中样例",
         "type": "string"
+      },
+      "time_budget_ms": {
+        "description": "目录遍历时间预算，默认 3000 毫秒；超时返回已扫到的部分并标注",
+        "type": "integer"
       }
     }
   },

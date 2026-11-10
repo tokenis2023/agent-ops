@@ -179,7 +179,9 @@ fn build_tool_defs() -> Vec<Value> {
                     "pattern": {"type": "string", "description": "可选 Rust 正则：给了就附带命中分布与前几条命中样例"},
                     "focus": {"type": "string", "description": "可选关键词（空格分隔）：影响「最相关文件」的排序，命中文件名或路径的优先"},
                     "limit": {"type": "integer", "description": "列出的文件数，默认 15"},
-                    "budget": {"type": "integer", "description": "响应字节上限，默认 16384"}
+                    "budget": {"type": "integer", "description": "响应字节上限，默认 16384"},
+                    "time_budget_ms": {"type": "integer", "description": "目录遍历时间预算，默认 3000 毫秒；超时返回已扫到的部分并标注"},
+                    "no_ignore": {"type": "boolean", "description": "忽略 .gitignore 与 node_modules/target 等默认跳过项；只在明确要统计依赖源码时用"}
                 },
                 "required": []
             }
@@ -908,6 +910,12 @@ fn read_items(args: &Value) -> String {
     let Some(items) = args.get("reads").and_then(Value::as_array) else {
         return "E_BAD_ARGS reads 必须是数组".into();
     };
+    // tail 没有「每项一个尾部」的合理语义；静默忽略会让模型以为读到了末尾。
+    // max_line / scan / block 则对每一项都成立，像 budget 一样传播。
+    if args.get("tail").is_some() {
+        return "E_BAD_ARGS reads 不能与 tail 同时使用；要读末尾请对单个文件用 fs_read tail=N"
+            .into();
+    }
     for key in [
         "path", "paths", "ranges", "start", "end", "block", "summary", "focus",
     ] {
@@ -968,6 +976,15 @@ fn read_items(args: &Value) -> String {
         // 项内 budget 优先：大文件可以多要一点，小文件把额度让出来。
         if obj.get("budget").is_none() {
             single.insert("budget".to_string(), json!(per_item));
+        }
+        // 顶层 max_line / scan 对每一项都成立，传播而不是静默丢弃；
+        // 项内显式值优先（允许单个超长行文件单独设 max_line=0）。
+        for key in ["max_line", "scan"] {
+            if single.get(key).is_none() {
+                if let Some(value) = args.get(key) {
+                    single.insert(key.to_string(), value.clone());
+                }
+            }
         }
         if force {
             single.insert("force".to_string(), json!(true));
@@ -1080,6 +1097,11 @@ fn read(args: &Value) -> String {
     {
         return "E_BAD_ARGS focus 只能用于单文件 path，且不能与 paths/ranges/start/end/block/summary 同时使用"
             .into();
+    }
+    // block 按 start 行探测块边界，ranges 直接给区间：对“读哪些行”回答不同。
+    // 旧行为静默按 ranges 处理，模型会以为自己拿到了整个函数。
+    if arg_bool(args, "block", false) && args.get("ranges").is_some() {
+        return "E_BAD_ARGS block 与 ranges 互斥：block 会按 start 行向外展开成完整代码块，ranges 已显式指出区间；按需求二选一（续读 block 结果时传 block=true 与 start 即可）".into();
     }
     // tail：只读最后 N 行。区间由总行数决定，因此与任何“指定区间”的参数互斥。
     let tail = arg_usize(args, "tail", 0);
@@ -4043,6 +4065,51 @@ fn next_fn() {
         assert!(
             !edited.starts_with("E_"),
             "按原文构造 old 应能直接命中: {edited}"
+        );
+    }
+
+    #[test]
+    fn 截断与空结果区分及续读参数可直接重放() {
+        // P4 F-9：四种“不完整”不能混为一谈。这里钉住两个最容易混的：
+        // ① count 未截断时不能标“本页可见”，截断时必须标；
+        // ② 续读提示里的 offset 必须等于真实返回的下一个偏移，而不是猜一个值。
+        let dir = 临时目录("p4-paging-contract");
+        for i in 0..7 {
+            fs::write(dir.join(format!("f{i}.txt")), "needle\n").unwrap();
+        }
+        let path = dir.to_string_lossy().replace('\\', "/");
+        let exact = grep_tool(&json!({
+            "pattern": "needle", "path": path, "output": "count"
+        }));
+        let limited = grep_tool(&json!({
+            "pattern": "needle", "path": path, "output": "count", "limit": 2
+        }));
+        let paged = grep_tool(&json!({
+            "pattern": "needle", "path": path, "output": "files", "limit": 2
+        }));
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(exact.contains(":1"), "精确统计应给每文件数字: {exact}");
+        assert!(
+            !exact.contains("本页可见"),
+            "未截断的 count 不应标本页可见: {exact}"
+        );
+        assert!(
+            limited.contains("本页可见"),
+            "显式 limit 截断的 count 必须标本页可见: {limited}"
+        );
+        let m = regex::Regex::new(r"next_offset=(\d+)")
+            .unwrap()
+            .captures(&paged)
+            .expect("分页应给 next_offset");
+        let next: usize = m[1].parse().unwrap();
+        let shown = paged
+            .lines()
+            .filter(|l| l.ends_with(".txt") && !l.starts_with('…'))
+            .count();
+        assert_eq!(
+            next, shown,
+            "next_offset 必须等于本页实际条目数（续读直接重放）: {paged}"
         );
     }
 
@@ -7044,6 +7111,92 @@ mod summary_tests {
         assert!(out.contains("pub fn tail"), "{out}");
         assert!(!out.contains("fn t1"), "测试模块里的函数不应出现: {out}");
         assert!(out.contains("block=true"), "必须给出继续读的入口: {out}");
+    }
+
+    #[test]
+    fn reads顶层_max_line_传给每项() {
+        // P4 F-7：reads 与 path/paths 的互斥已报错，但 max_line/scan 被静默忽略。
+        // 写了 max_line=0 却拿到截断行，模型会以为文件本来如此。
+        // 它们与 budget 一样对每一项都适用，应该传播而不是丢弃。
+        let dir = 临时目录("reads-top-maxline");
+        let path = dir.join("a.txt");
+        let long = "x".repeat(300);
+        fs::write(&path, format!("{long}\nshort\n")).unwrap();
+        let posix = path.to_string_lossy().replace('\\', "/");
+        let out = call(
+            "fs_read",
+            &json!({"reads": [{"path": posix}], "max_line": 0}),
+        );
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            !out.contains("(+60字符)") && !out.contains("…(+"),
+            "顶层 max_line=0 应传到子项，不应出现行内截断标记: {out}"
+        );
+        assert!(!out.contains("E_BAD_ARGS"), "不应把合法参数当错误: {out}");
+    }
+
+    #[test]
+    fn reads与tail同时给时报错而不是静默忽略() {
+        // tail 没有「每项一个尾部」的合理语义；静默忽略等于让模型以为读到了末尾。
+        let dir = 临时目录("reads-tail");
+        let path = dir.join("a.txt");
+        fs::write(&path, "1\n2\n3\n").unwrap();
+        let posix = path.to_string_lossy().replace('\\', "/");
+        let out = call("fs_read", &json!({"reads": [{"path": posix}], "tail": 1}));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(out.starts_with("E_BAD_ARGS"), "{out}");
+        assert!(out.contains("tail"), "应点名冲突参数: {out}");
+    }
+
+    #[test]
+    fn block与ranges同时给时报错() {
+        // block 按 start 行探测块边界，ranges 直接给区间：两者对“读哪些行”
+        // 回答不同。旧行为静默按 ranges 处理，模型会以为自己拿到了整个函数。
+        let dir = 临时目录("block-ranges");
+        let path = dir.join("a.rs");
+        fs::write(&path, "fn a() {\n    one();\n    two();\n}\n").unwrap();
+        let posix = path.to_string_lossy().replace('\\', "/");
+        let out = call(
+            "fs_read",
+            &json!({"path": posix, "start": 2, "block": true, "ranges": [[2, 3]]}),
+        );
+        let _ = fs::remove_dir_all(&dir);
+        assert!(out.starts_with("E_BAD_ARGS"), "{out}");
+        assert!(out.contains("block"), "应点名冲突参数: {out}");
+    }
+
+    #[test]
+    fn inspect声明的预算参数与实现一致() {
+        // P0 F-6：实现早就读 time_budget_ms/no_ignore，schema 却没声明，
+        // 传了直接撞 additionalProperties:false，等于这两个能力不可达。
+        let defs = tool_defs();
+        let inspect = defs
+            .iter()
+            .find(|d| d["name"] == "fs_inspect")
+            .expect("缺少 fs_inspect");
+        let props = &inspect["inputSchema"]["properties"];
+        for key in ["time_budget_ms", "no_ignore", "budget", "limit"] {
+            assert!(
+                props.get(key).is_some(),
+                "fs_inspect 缺少声明参数 {key}（实现读了它）"
+            );
+        }
+        assert!(props["no_ignore"]["type"] == "boolean");
+        assert!(props["time_budget_ms"]["type"] == "integer");
+    }
+
+    #[test]
+    fn inspect接受声明的预算参数() {
+        let dir = 临时目录("inspect-budget-args");
+        fs::write(dir.join("a.txt"), "needle\n").unwrap();
+        let posix = dir.to_string_lossy().replace('\\', "/");
+        let out = call(
+            "fs_inspect",
+            &json!({"path": posix, "time_budget_ms": 2000, "no_ignore": true}),
+        );
+        let _ = fs::remove_dir_all(&dir);
+        assert!(!out.starts_with("E_BAD_ARGS"), "声明的参数不应被拒: {out}");
+        assert!(out.contains("个文件"), "应给出目录规模: {out}");
     }
 
     #[test]
