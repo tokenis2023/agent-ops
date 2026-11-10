@@ -1212,10 +1212,12 @@ if sys.platform == "win32":
     finally:
         held.close()
     check("fs_write 中途失败报告已写入数量",
-          werr is True and "已写入 1/2" in wtext, wtext[:300])
+          werr is True and wtext.startswith("E_BATCH_PARTIAL") and "已写入 1/2" in wtext,
+          wtext[:300])
     check("fs_write 中途失败时磁盘与报告一致",
           open(wpart_a, encoding="utf-8").read() == "new-a\n"
-          and open(wpart_b, encoding="utf-8").read() == "old-b\n",
+          and open(wpart_b, encoding="utf-8").read() == "old-b\n"
+          and "wpartial-a.txt" in wtext,
           wtext[:300])
 else:
     print("SKIP T13（非 Windows：故障注入依赖共享模式语义）")
@@ -1261,6 +1263,38 @@ check("长任务仍在运行且状态可查",
 long_proc.stdin.close()
 long_proc.terminate()
 long_proc.wait(timeout=15)
+
+# 33. P3：三类写入状态的措辞必须各自准确（磁盘事实不同）
+# ① 单文件内存中间态：多 edit 中途失败，磁盘一个字未写
+# ② 多文件预检失败：一个都不写（上面已验）
+# ③ 多文件提交中途失败：已写清单与磁盘一致（上面已验）
+midfile = os.path.join(root, "p3-midstate.txt")
+open(midfile, "w", encoding="utf-8", newline="\n").write("aaa\nbbb\n")
+text, err = call("fs_edit", path=posix(midfile), edits=[
+    {"old": "aaa", "new": "AAA"},
+    {"old": "zzz", "new": "ZZZ"},
+])
+check("单文件内存中间态声明未写入",
+      err is True and text.startswith("E_NO_MATCH")
+      and "未写入任何文件" in text and "中间态" in text,
+      text[:300])
+check("单文件内存中间态磁盘未变",
+      open(midfile, encoding="utf-8").read() == "aaa\nbbb\n",
+      repr(open(midfile, encoding="utf-8").read()))
+
+# E_STALE 的恢复顺序（先核对内容、再给新 hash）在 Rust 单测里钉住；
+# 这里只验真实调用下的可观察事实：拒绝、未写入、且指向重读。
+stale3 = os.path.join(root, "p3-stale.txt")
+open(stale3, "w", encoding="utf-8", newline="\n").write("alpha\n")
+st3, _ = call("fs_stat", path=posix(stale3), detail="hash")
+old3 = st3.split("hash=")[-1].strip()
+open(stale3, "w", encoding="utf-8", newline="\n").write("alpha\nexternal\n")
+text, err = call("fs_edit", path=posix(stale3), expect_hash=old3,
+                 edits=[{"old": "alpha", "new": "mine"}])
+check("E_STALE 明确未写入并指向核对",
+      err is True and text.startswith("E_STALE")
+      and "未写入" in text and "fs_read" in text,
+      text[:300])
 
 passed = sum(1 for _, c, _ in results if c)
 print(f"\n{passed}/{len(results)} 通过   目录={root}")

@@ -62,6 +62,14 @@ const MAX_LOCI: usize = 64;
 /// diff 展示的改动块上限，避免大文件批量替换把响应撑爆。
 const MAX_HUNKS: usize = 32;
 
+/// 歧义/未命中错误里展开的候选项上限。
+///
+/// 错误提示也是要进上下文的一轮回复：命中处很多、每行又长时，
+/// 把全部候选片段拼进去会让「报错」比正常输出还贵。
+const AMBIGUOUS_SNIPPET_HITS: usize = 3;
+const AMBIGUOUS_SNIPPET_BUDGET: usize = 1200;
+const NOMATCH_CANDIDATES: usize = 5;
+
 /// 多编辑中途失败时，错误里展示的文件片段是「前几处已在内存应用」的中间态，
 /// 磁盘一个字都没写。不声明这一点，模型会以为已经部分写入，进而重试已生效的修改。
 fn with_partial_note(err: String, applied_before: usize) -> String {
@@ -176,13 +184,17 @@ pub fn apply(original: &str, eol: Eol, edits: &[EditSpec]) -> Result<(String, Ed
                 .map(|p| col_of(&work, *p).to_string())
                 .collect();
             // 前几处附上下文片段：模型不必再 fs_read 就能构造出唯一的 old。
+            // 命中数/行号已说明「有几处、在哪」，片段只为构造唯一 old；
+            // 按字节预算截断：12 处长行 × 5 行会把错误本身变成一整轮上下文。
             let rows: Vec<&str> = work.split('\n').collect();
             let mut snippets = String::new();
-            for p in positions.iter().take(3) {
+            let mut expanded = 0usize;
+            for p in positions.iter().take(AMBIGUOUS_SNIPPET_HITS) {
                 let hit = line_of(&work, *p);
                 let col = col_of(&work, *p);
                 let from = hit.saturating_sub(2).max(1);
                 let to = (hit + 2).min(rows.len());
+                let mut block = String::new();
                 for n in from..=to {
                     let text = rows.get(n - 1).copied().unwrap_or("");
                     let text = if n == hit {
@@ -190,13 +202,33 @@ pub fn apply(original: &str, eol: Eol, edits: &[EditSpec]) -> Result<(String, Ed
                     } else {
                         snippet_line(text)
                     };
-                    snippets.push_str(&format!("\n  {n}|{}", text));
+                    block.push_str(&format!("\n  {n}|{}", text));
                 }
-                snippets.push('\n');
+                block.push('\n');
+                if snippets.len() + block.len() > AMBIGUOUS_SNIPPET_BUDGET {
+                    break;
+                }
+                snippets.push_str(&block);
+                expanded += 1;
             }
+            if expanded < positions.len() {
+                let shown_lines: Vec<String> = positions
+                    .iter()
+                    .skip(expanded)
+                    .take(8)
+                    .map(|p| line_of(&work, *p).to_string())
+                    .collect();
+                snippets.push_str(&format!(
+                    "\n  … 另有 {} 处未展开（行 {}）；用 start/end 限定范围后只会返回范围内的命中\n",
+                    positions.len() - expanded,
+                    shown_lines.join(",")
+                ));
+            }
+            // 恢复顺序：先加上下文让 old 唯一 → 再限定行范围（局部、可验证）
+            // → 最后才是 all=true（明确要改全部）。all 排在前面会被当成默认答案。
             return Err(with_partial_note(
                 format!(
-                    "E_AMBIGUOUS 第{}处匹配到 {} 个位置（行 {} 列 {}）；加更多上下文，或用 \"all\": true 全部替换，或用 \"start\"/\"end\" 限定行范围（单条修改时这些字段可直接放顶层，也可放进 edits[] 项里）{}",
+                    "E_AMBIGUOUS 第{}处匹配到 {} 个位置（行 {} 列 {}）；先加更多上下文让 old 唯一，或用 \"start\"/\"end\" 限定行范围（单条修改时这些字段可直接放顶层，也可放进 edits[] 项里）；确认要改全部时才用 \"all\": true{}",
                     i + 1,
                     positions.len(),
                     line_list.join(","),
@@ -622,14 +654,17 @@ fn line_of(s: &str, pos: usize) -> usize {
 fn no_match_error(work: &str, needle: &str, idx: usize) -> String {
     let first = needle.lines().next().unwrap_or("").trim();
     let mut candidates: Vec<(usize, &str)> = Vec::new();
+    // 先扫全部相似行，再取前 N 条展开：只列 5 条而不说总数，
+    // 模型会以为全文只有 5 处相似行，然后反复试错。
+    let mut total_similar = 0usize;
     if !first.is_empty() {
         let key: String = first.chars().take(24).collect();
         for (i, line) in work.lines().enumerate() {
             let t = line.trim();
             if t.contains(&key) || (key.len() > 6 && key.contains(t) && t.len() > 6) {
-                candidates.push((i + 1, line));
-                if candidates.len() >= 5 {
-                    break;
+                total_similar += 1;
+                if candidates.len() < NOMATCH_CANDIDATES {
+                    candidates.push((i + 1, line));
                 }
             }
         }
@@ -644,9 +679,9 @@ fn no_match_error(work: &str, needle: &str, idx: usize) -> String {
         if short.len() >= 4 {
             for (i, line) in work.lines().enumerate() {
                 if line.replace(' ', "").contains(&short) {
-                    candidates.push((i + 1, line));
-                    if candidates.len() >= 5 {
-                        break;
+                    total_similar += 1;
+                    if candidates.len() < NOMATCH_CANDIDATES {
+                        candidates.push((i + 1, line));
                     }
                 }
             }
@@ -656,6 +691,7 @@ fn no_match_error(work: &str, needle: &str, idx: usize) -> String {
         // 再退一步：拼错一两个字母时前缀全落空，按编辑距离找最相似的行。
         // 让模型直接看到正确原文，比让它再读一次文件便宜得多。
         candidates = closest_lines(work, first, 3);
+        total_similar = candidates.len();
     }
     let mut msg = format!("E_NO_MATCH 第{}处未找到目标文本", idx);
     if candidates.is_empty() {
@@ -675,7 +711,10 @@ fn no_match_error(work: &str, needle: &str, idx: usize) -> String {
             "\n以上不是目标文本；确认没拿错文件后，用 fs_grep 定位关键词或 fs_read 取回正文",
         );
     } else {
-        msg.push_str("；最接近的行：");
+        msg.push_str(&format!(
+            "；最接近的行（共 {total_similar} 条相似，仅列前 {} 条）：",
+            candidates.len()
+        ));
         for (n, l) in candidates {
             let t = if l.chars().count() > 80 {
                 format!("{}…", l.chars().take(80).collect::<String>())
@@ -858,6 +897,65 @@ mod tests {
         assert_eq!(out, "fn a() {\r\n    2\r\n}\r\n");
         assert_eq!(res.applied, 1);
         assert_eq!(res.loci, vec!["2"]);
+    }
+
+    #[test]
+    fn 歧义提示先限定范围再考虑全部替换() {
+        // P3：all=true 是“确认要改全部”的显式选择，不能排在限定范围之前，
+        // 否则模型会把全文件替换当成默认答案。
+        let err = apply("x();\nx();\n", Eol::Lf, &[spec("x();", "y();")]).unwrap_err();
+        let range = err
+            .find("start")
+            .or_else(|| err.find("限定"))
+            .unwrap_or_else(|| panic!("应给限定范围建议: {err}"));
+        let all = err
+            .find("\"all\"")
+            .unwrap_or_else(|| panic!("应提到 all: {err}"));
+        assert!(range < all, "应先建议限定范围、再提 all: {err}");
+        assert!(err.contains("确认"), "all 必须写成有条件的显式选择: {err}");
+    }
+
+    #[test]
+    fn 歧义候选展开受预算限制() {
+        // 12 处命中、每行很长时，不能把 12×5 行全塞进错误消息：
+        // 错误提示本身也会变成一整轮上下文。
+        let src = (1..=12)
+            .map(|i| format!("    let v{i} = compute({}); x();", "a".repeat(70)))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let err = apply(&src, Eol::Lf, &[spec("x();", "y();")]).unwrap_err();
+        assert!(err.starts_with("E_AMBIGUOUS"), "{err}");
+        assert!(
+            err.len() < 2000,
+            "歧义候选应受预算限制，实际 {} 字节: {err}",
+            err.len()
+        );
+        assert!(
+            err.contains("未展开"),
+            "省略的候选必须写明，不能让模型以为只有这几处: {err}"
+        );
+    }
+
+    #[test]
+    fn 未命中候选超过五条时标注总数() {
+        // 只列前 5 条而不说还有多少，模型会以为全文只有 5 处相似行。
+        let src = (1..=10)
+            .map(|i| format!("let total = {i};"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let err = apply(&src, Eol::Lf, &[spec("let total = 0;", "let total = 1;")]).unwrap_err();
+        assert!(err.starts_with("E_NO_MATCH"), "{err}");
+        assert_eq!(
+            err.matches("let total = ").count(),
+            5,
+            "候选行应只展开前 5 条: {err}"
+        );
+        assert!(
+            err.contains("共") && err.contains("仅列"),
+            "应标注相似行总数与省略: {err}"
+        );
     }
 
     #[test]

@@ -1991,6 +1991,32 @@ mod tests {
     }
 
     #[test]
+    fn stale错误先要求核对内容再给重试参数() {
+        // P3：外部修改可能已改掉同一段文本，先劝「改传新 hash 重试」会把外部改动覆盖。
+        // 恢复顺序必须是：fs_read 核对 → 内容仍适用才带新 hash 重试。
+        let dir = 临时目录("stale-order");
+        let path = dir.join("a.txt");
+        fs::write(&path, "alpha\n").unwrap();
+        let posix = path.to_string_lossy().replace('\\', "/");
+        let out = call(
+            "fs_write",
+            &json!({"path": posix, "content": "beta\n", "expect_hash": "0000000000000000"}),
+        );
+        let body = fs::read_to_string(&path).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(out.starts_with("E_STALE"), "{out}");
+        let verify = out.find("fs_read").expect("应要求先核对正文");
+        let retry = out.find("expect_hash").expect("应给重试参数");
+        assert!(
+            verify < retry,
+            "必须先核对内容再给重试参数（当前顺序颠倒）: {out}"
+        );
+        assert!(out.contains("未写入"), "应声明本次未写入: {out}");
+        assert_eq!(body, "alpha\n", "拒绝时磁盘不应变化");
+    }
+
+    #[test]
     fn stale错误给出可直接复制的重试指令() {
         // 并发冲突时若只报「文件已变化」，模型会整轮 fs_read 重来；
         // 其实 old 仍匹配时带新 hash 原样重试即可，错误应把这条路写清楚。
@@ -5665,10 +5691,13 @@ fn doc_rebuild_hint(code: &str, path: &str) -> String {
     )
 }
 
-/// 并发冲突把「下一步」写成可直接复制的指令，省掉整轮 fs_read。
+/// 并发冲突：把「先核对内容」写在前面，再给两个可执行的下一步。
+///
+/// 旧文案先劝「原样重试并改传新 hash」，等于告诉模型跳过内容核对直接放行；
+/// 而外部修改可能已经改掉了同一段文本，重试会把外部改动覆盖掉。
 fn stale_changed(hash: &str) -> String {
     format!(
-        "E_STALE 文件已变化（当前 hash={hash}）；若改动仍适用，原样重试并改传 expect_hash={hash}；否则 fs_read 重新取正文"
+        "E_STALE 文件已被其他进程改过（当前 hash={hash}），本次未写入。先 fs_read 核对目标文本是否仍适用且未被外部改动：仍适用则带 expect_hash={hash} 重试，内容已变则按新内容修正 old 后再改"
     )
 }
 
@@ -6118,20 +6147,23 @@ fn write(args: &Value) -> String {
         }
     }
     let mut lines = Vec::with_capacity(items.len());
-    let mut written = 0usize;
+    let mut written_paths: Vec<String> = Vec::new();
     for (path, single) in &items {
         let out = write_one(&Value::Object(single.clone()));
         if !out.starts_with("ok") {
-            // 预检已通过，这里失败通常是并发改动/IO 故障；如实报告已写入数量。
-            return format!(
-                "E_BATCH {path}: {out}（已写入 {written}/{} 个文件，其余未动）",
-                items.len()
-            );
+            // 预检已通过，这里失败通常是并发改动/IO 故障。
+            // 报告形状与 fs_edit files 统一（E_BATCH_PARTIAL + 已写清单），
+            // 否则同一个“提交中途失败”在两个工具里要说两遍才能看懂。
+            return batch_partial_error(&written_paths, path, &out, items.len());
         }
-        written += 1;
+        written_paths.push(path.clone());
         lines.push(out);
     }
-    format!("ok {} 个文件已写入\n{}", written, lines.join("\n"))
+    format!(
+        "ok {} 个文件已写入\n{}",
+        written_paths.len(),
+        lines.join("\n")
+    )
 }
 
 fn write_one(args: &Value) -> String {

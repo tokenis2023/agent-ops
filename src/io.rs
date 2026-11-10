@@ -751,10 +751,13 @@ pub fn human_size(n: u64) -> String {
     }
 }
 
-/// 锁超时时把「已经等过」和「参数不变直接重试」写清，避免模型整轮重发后还白等。
+/// 锁超时时把「已经等过」「本次没写」「下一步」写清，并给出停止条件。
+///
+/// 单纯说「直接重试」会让模型在文件被长期占用时无限重试；
+/// 这里给它一个明确的停止条件：连续两次仍被占就报告，不再重试。
 pub fn locked_error(path: &str, waited_ms: u32) -> String {
     format!(
-        "E_LOCKED {path} 正被其他进程修改；已自动等待 {waited_ms}ms，本次未写入任何内容，参数不变直接重试即可"
+        "E_LOCKED {path} 正被其他进程占用；已自动等待 {waited_ms}ms，本次未写入任何内容。短时占用可直接重试；若连续两次仍被占（释放无望）就不要再试，报告哪个进程在占用该文件"
     )
 }
 
@@ -763,13 +766,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn 锁错误给出无需重读的重试指令() {
+    fn 锁错误给重试与停止条件() {
+        // 只说「直接重试」会让模型在文件被长期占用时无限重试；
+        // 必须同时给出「连续两次仍被占就报告」的停止条件。
         let msg = locked_error("a.txt", 3000);
         assert!(msg.starts_with("E_LOCKED"), "{msg}");
         assert!(msg.contains("3000ms"), "应说明已等多久: {msg}");
+        assert!(msg.contains("未写入"), "应声明本次未写入: {msg}");
+        assert!(msg.contains("重试"), "应给可重试的下一步: {msg}");
         assert!(
-            msg.contains("参数不变直接重试"),
-            "应给可直接照做的下一步: {msg}"
+            msg.contains("连续两次") && (msg.contains("不要再试") || msg.contains("报告")),
+            "持续占用必须有停止条件: {msg}"
         );
     }
 
