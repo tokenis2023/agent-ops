@@ -1101,7 +1101,7 @@ fn read(args: &Value) -> String {
     // block 按 start 行探测块边界，ranges 直接给区间：对“读哪些行”回答不同。
     // 旧行为静默按 ranges 处理，模型会以为自己拿到了整个函数。
     if arg_bool(args, "block", false) && args.get("ranges").is_some() {
-        return "E_BAD_ARGS block 与 ranges 互斥：block 会按 start 行向外展开成完整代码块，ranges 已显式指出区间；按需求二选一（续读 block 结果时传 block=true 与 start 即可）".into();
+        return "E_BAD_ARGS block 与 ranges 互斥：block 会按 start 行向外展开成完整代码块，ranges 已显式指出区间；按需求二选一（续读 block 截断结果时，移除 block，按返回的 ranges 续读；重新传 block 会重新定位代码块）".into();
     }
     // tail：只读最后 N 行。区间由总行数决定，因此与任何“指定区间”的参数互斥。
     let tail = arg_usize(args, "tail", 0);
@@ -7163,6 +7163,56 @@ mod summary_tests {
         let _ = fs::remove_dir_all(&dir);
         assert!(out.starts_with("E_BAD_ARGS"), "{out}");
         assert!(out.contains("block"), "应点名冲突参数: {out}");
+    }
+
+    #[test]
+    fn 嵌套块截断后按范围续读不遗漏() {
+        let dir = 临时目录("nested-block-resume");
+        let path = dir.join("a.rs");
+        let mut body = String::from("fn outer() {\n    if ready {\n");
+        for n in 0..60 {
+            body.push_str(&format!("        step_{n:02}();\n"));
+        }
+        body.push_str("    }\n    after_inner();\n}\n");
+        fs::write(&path, &body).unwrap();
+        let posix = path.to_string_lossy().replace('\\', "/");
+        let mut args = json!({"path": posix, "start": 1, "block": true, "budget": 800});
+        let mut seen = Vec::new();
+        let continuation = regex::Regex::new(r"ranges=(\[\[.*\]\])").unwrap();
+        let mut recovery = String::new();
+        for _ in 0..20 {
+            let out = call("fs_read", &args);
+            assert!(!out.starts_with("E_"), "{out}");
+            for line in out.lines() {
+                if let Some((number, _)) = line.split_once('|') {
+                    if let Ok(number) = number.parse::<usize>() {
+                        seen.push(number);
+                    }
+                }
+            }
+            let Some(capture) = continuation.captures(&out) else {
+                break;
+            };
+            let ranges: Value = serde_json::from_str(&capture[1]).unwrap();
+            if recovery.is_empty() {
+                recovery = call(
+                    "fs_read",
+                    &json!({
+                        "path": posix, "block": true, "ranges": ranges
+                    }),
+                );
+            }
+            // 保留原块的剩余范围，不能用 block 重新定位内层块。
+            args = json!({"path": posix, "ranges": ranges, "budget": 800});
+        }
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(seen, (1..=body.lines().count()).collect::<Vec<_>>());
+        assert!(recovery.starts_with("E_BAD_ARGS"), "{recovery}");
+        assert!(
+            recovery.contains("移除 block") && recovery.contains("ranges"),
+            "{recovery}"
+        );
+        assert!(!recovery.contains("传 block=true 与 start"), "{recovery}");
     }
 
     #[test]

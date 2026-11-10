@@ -78,11 +78,11 @@ T13 的故障注入不是 sleep 猜时序：用 `open(path, 'rb')` 持有句柄�
 | instructions ↔ RULE_BODY 字符重合 | 47.1% | **19.6%** | −27.5 pp |
 | 工具 description 合计 | 3,164 B | **3,195 B** | +31 B |
 | inputSchema 合计 | 14,225 B | 14,225 B | 0 |
-| 描述+引导常驻合计 | 17,389 B | **17,420 B** | +31 B |
+| 工具 description + inputSchema 合计（不含引导） | 17,389 B | **17,420 B** | +31 B |
 | `cargo test` | 383 | **391** | +8（含描述契约 3 项） |
 | `check.ps1 full` | 11 步 | 11 步全绿，34 s | — |
 
-如实说明：**计划 P2 验收写的「公共说明字节量减少约 25%」只对 `instructions` 单份成立（−21%，接近但未达 25%）；两份引导合计从 4,112 B 降到 2,975 B（−27.7%）。而把参数事实搬进工具描述后，描述从 3,164 涨到 3,195 B，所以“引导+描述”总常驻只减了 241 B。真正的收益是重复率下降，不是总量。**
+口径说明：instructions 单份减少 265 B（21.0%，未达 25% 目标）；两份引导合计为 instructions + RULE_BODY，从 4,112 B 降到 2,975 B（减少 1,137 B，27.7%）。工具 description + inputSchema 从 17,389 B 增至 17,420 B。若只合计 instructions + description + inputSchema，则从 18,651 B 降至 18,417 B，减少 234 B；不含 RULE_BODY、JSON 包装和宿主额外说明。这些是文本字节统计，实际上下文加载、token 与费用取决于宿主和模型，尚未测量。
 
 P2 的分工边界（已写成测试）：
 
@@ -430,14 +430,14 @@ E_NO_MATCH 第1处未找到目标文本；最接近的行（共 N 条相似，�
 | dsh 生成物 | 23,169 B | **23,560 B** | 退步 +391 B | 随 schema 同步 |
 | `docs/工具参考.md` | 36,931 B | **38,534 B** | 预期内 +1,603 B | 新增截断契约表与恢复说明 |
 
-结论：**没有任何一项在正确性上退步**；体积上工具面涨了 333 B，换取 `fs_inspect` 两个参数可用 + `E_AMBIGUOUS` 候选有预算。引导方面净减 1,137 B（instructions −265、规则块 −872）。
+结论：在当时已覆盖的回归场景中，未发现正确性退步；这不代表未覆盖行为均正确。后续审查发现 block 续读恢复建议会重新定位内层块，已修正建议并补嵌套块续读回归测试。工具 description + inputSchema 增加 333 B，来自描述调整及 inspect 参数声明；歧义候选预算是运行时行为，不计入此 schema 增量。instructions + RULE_BODY 减少 1,137 B。若合计 instructions + description + inputSchema，P0 为 18,651 B，P4 为 18,719 B，增加 68 B；若宿主还加载 RULE_BODY，以上四项合计从 21,501 B 降至 20,697 B，减少 804 B。上述均不含包装和宿主注入，不能直接推导 token 或费用收益。
 
 ### 11.2 与基线相比的功能变化（用户可见）
 
 | 变化 | 类型 | 是否需要适配 |
 |---|---|---|
 | `reads` + `tail` 报错 | 行为变严格 | 若旧调用依赖静默忽略，需改参数（无真实用户依赖证据） |
-| `block` + `ranges` 报错 | 行为变严格 | 同上；续读只传 `block` + `start` |
+| `block` + `ranges` 报错 | 行为变严格 | 同上；移除 `block`，使用返回的 `ranges` 续读，避免重新定位内层块 |
 | `reads` 顶层 `max_line`/`scan` 生效 | 行为变宽松 | 旧调用会得到新效果（之前被丢弃） |
 | `fs_inspect` 接受 `time_budget_ms`/`no_ignore` | 能力新增 | 无 |
 | `E_STALE`/`E_AMBIGUOUS`/`E_LOCKED` 文案 | 文案变 | 有解析错误文案的下游需同步（仓库内无） |
