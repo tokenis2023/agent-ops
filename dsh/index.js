@@ -1,5 +1,5 @@
 /**
- * fsops 的 DSH Host 插件：把 8 个 fs_* 工具注册到当前 profile。
+ * fsops 的 DSH Host 插件：把 fs_* 工具注册到当前 profile。
  *
  * 不重复实现文件语义——通过一条长驻的 `fsops mcp` 子进程（换行分隔 JSON-RPC）
  * 把调用交给同一份 Rust 内核，因此错误码、预算、续读提示和输出格式与 fsops 的
@@ -33,7 +33,7 @@ const MAX_SESSIONS = 8
 const MCP_PROTOCOL_VERSION = '2025-06-18'
 
 /**
- * 8 个工具的定义由 scripts/gen_dsh_specs.mjs 从 `fsops schema` 生成，
+ * 工具定义由 scripts/gen_dsh_specs.mjs 从 `fsops schema` 生成，
  * 保证描述与参数只有 Rust 一份真源（手写三份时漂移过 11 处）。
  */
 import { EXCLUDED } from './excluded.js'

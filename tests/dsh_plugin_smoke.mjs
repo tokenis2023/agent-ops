@@ -5,7 +5,7 @@
  * 再用一个最小 ctx 复刻 `tools.register` / `subprocess.spawn` / `workingDirectory.ensure`。
  *
  * 校验三件事：
- *   1. 8 个工具的 parameters 符合 DSH value-schema DSL（类型、必填、additionalProperties）；
+ *   1. 每个工具的 parameters 符合 DSH value-schema DSL（类型、必填、additionalProperties）；
  *   2. 包清单（package.json / cordis.patch.yml / locale / icon）满足 bundle 契约；
  *   3. 用真实 fsops.exe 跑通 fs_write → fs_read → fs_edit → fs_grep → fs_glob → fs_stat → fs_exec → fs_file，
  *      并确认 E_ 错误会变成工具错误。

@@ -60,7 +60,7 @@ fn usage() -> String {
   fsops glob [pattern] [--path DIR] [--dirs] [--limit N]
   fsops stat <path...>
   fsops call <tool> '<json 参数>'
-  fsops schema                              输出 8 个工具的 MCP schema（JSON）
+  fsops schema                              输出全部工具的 MCP schema（JSON）
   fsops install <claude|hermes|codex|json>  生成或写入 MCP 配置
   fsops integrate --rules [--target ...]     向项目写入 fsops 软规则
   fsops doctor [--json]                      检查规则与宿主接入状态

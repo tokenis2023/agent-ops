@@ -1,4 +1,4 @@
-//! 工具层：8 个工具的定义与执行。
+//! 工具层：9 个工具的定义与执行。
 //!
 //! 设计原则：工具面窄（少而准），返回短（带续读提示），错误直给（带候选行）。
 //! 所有工具名以 `fs_` 开头，避免和宿主自带文件工具撞名。
@@ -30,7 +30,7 @@ fn build_tool_defs() -> Vec<Value> {
     let mut defs = vec![
         json!({
             "name": "fs_read",
-            "description": "读取文件。优先用本工具替代宿主 read_file/cat/head/tail/Get-Content。默认最多返回 32KB 并给出续读方式；支持行范围、多文件、DOCX/PDF 正文、自动识别 GBK/UTF-16/BOM 与 CRLF。模式表：path 与 paths 可同时给（并集，一次读多个文件）；reads 是异构区间数组（与 path/paths 互斥）；focus 按正则取整块（可与 path 同用，与 reads/paths/ranges/start/end/block/summary 互斥）；tail=N 读末尾（与 start/end/ranges/block/summary/focus/paths 互斥）；summary 只给声明行号（仅单文件，不能与 ranges/block/end 同用）。reads 每项可带 focus 与 budget。",
+            "description": "读取文件，优先替代宿主 read_file/cat/head/tail/Get-Content。常用：单文件 `path`；多文件异构 `reads=[{path,start,end}]`（一次读完，勿一文件一轮）；按正则取整块 `focus=<正则>`（省 grep→block 两步）；日志尾 `tail=N`。模式表：`path` 与 `paths` 是并集（共用 start/end）；`focus`/`summary` 仅单文件，`reads`/`focus`/`tail`/`summary` 各有互斥范围（读对应参数说明，区间写在 reads 项内）；默认 32KB 并给续读参数；支持 DOCX/PDF、GBK/UTF-16/BOM/CRLF；>32MB 用 scan=window（默认）/full。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -86,7 +86,7 @@ fn build_tool_defs() -> Vec<Value> {
         }),
         json!({
             "name": "fs_edit",
-            "description": "精确替换文本（old→new）或正则替换（pattern→replacement）：不知道确切原文时用 pattern，省掉为抄原文而做的一次 fs_read。两套参数必须二选一：old+new 或 pattern+replacement；同时给会报 E_BAD_EDIT（旧版本会静默只执行 pattern）。优先替代 patch/Edit/apply_patch。同文件多处用 edits，多文件用 files；全部预检通过才写入。自动处理 CRLF/LF 差异并保留原编码；DOCX 不支持精确替换，请用 fs_write 整体重建。",
+            "description": "精确替换文本（old→new）或正则替换（pattern→replacement）：不知道确切原文时用 pattern，省掉为抄原文而做的一次 fs_read。两套参数必须二选一：old+new 或 pattern+replacement；同时给会报 E_BAD_EDIT。优先替代 patch/Edit/apply_patch。同文件多处用 edits，多文件用 files；全部预检通过才写入。结构调整后用 diff=true 自查改动片段，省一次全文回读。自动处理 CRLF/LF 并保留原编码；DOCX 不支持精确替换，请用 fs_write 整体重建。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -186,7 +186,7 @@ fn build_tool_defs() -> Vec<Value> {
         }),
         json!({
             "name": "fs_grep",
-            "description": "正则流式搜索。优先替代 grep/rg/Select-String。按文件稳定分组，支持文本和 DOCX/PDF 正文，output 可选 files/count/matches/snippets；截断时返回 next_offset。",
+            "description": "正则流式搜索，优先替代 grep/rg/Select-String。按文件分组，支持 DOCX/PDF，output=files/count/matches/snippets；截断返回 next_offset。count 默认完整统计；显式给 limit 时按命中截断并标“本页可见”，不是总数。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2009,6 +2009,80 @@ mod tests {
             "应给可直接复制的重试参数: {out}"
         );
         assert!(out.contains("fs_read"), "应给出重读分支: {out}");
+    }
+
+    #[test]
+    fn 非生成器维护的文案不报错工具数() {
+        // P0 F-3：生成器只同步 README/工具参考/使用指南/package.json，
+        // 注释与 CLI 帮助里的「8 个工具」无人负责，v0.9.0 加 fs_inspect 后就漂了。
+        // 这里把其余手写位置钉住：写数量就必须等于实际工具数。
+        let expected = tool_defs().len().to_string();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let files = ["src/cli.rs", "dsh/index.js", "cordis.patch.yml"];
+        let pattern = regex::Regex::new(r"(\d+) 个(?: fs_\*)?工具").unwrap();
+        let mut found = 0usize;
+        for file in files {
+            let path = root.join(file);
+            let text = fs::read_to_string(&path).unwrap();
+            for caps in pattern.captures_iter(&text) {
+                let number = &caps[1];
+                found += 1;
+                assert_eq!(
+                    number, expected,
+                    "{file} 里的工具数已漂移（实际 {}）: {}",
+                    expected, &caps[0]
+                );
+            }
+        }
+        // 一个都不写也合法（本轮已改为不提数量）；写了就必须对。
+        let _ = found;
+    }
+
+    #[test]
+    fn fs_read描述把常用路径放在前面() {
+        // P2：模型没时间读完描述，常用四种用法必须在开头就出现，
+        // 且顺序就是建议的选择顺序（单文件 → 批量 → 按模式 → 日志末尾）。
+        // 常用路径前移不能删掉互斥与限制：它们是防止盲试的保护性约束。
+        let defs = tool_defs();
+        let read = defs.iter().find(|d| d["name"] == "fs_read").unwrap();
+        let desc = read["description"].as_str().unwrap();
+        let head = &desc[..desc.find("模式表").expect("缺少模式表")];
+        let at = |needle: &str| {
+            head.find(needle)
+                .unwrap_or_else(|| panic!("开头缺 {needle}: {head}"))
+        };
+        let (path, reads, focus, tail) = (at("`path`"), at("`reads="), at("focus="), at("tail=N"));
+        assert!(
+            path < reads && reads < focus && focus < tail,
+            "常用路径顺序不对: {head}"
+        );
+        for needle in ["互斥", "仅单文件", "32KB", "scan=window"] {
+            assert!(desc.contains(needle), "描述漏了 {needle}: {desc}");
+        }
+    }
+
+    #[test]
+    fn 描述带上无法从参数名推断的约束() {
+        // 这三条都是“不说就猜不到”的：diff 自查能省一轮回读；
+        // count 的精确/本页可见口径直接决定模型敢不敢拿它当总数。
+        let defs = tool_defs();
+        let desc = |name: &str| {
+            defs.iter()
+                .find(|d| d["name"] == name)
+                .and_then(|d| d["description"].as_str())
+                .unwrap_or("")
+        };
+        assert!(desc("fs_edit").contains("diff=true"), "{}", desc("fs_edit"));
+        assert!(
+            desc("fs_grep").contains("本页可见"),
+            "count 口径缺失: {}",
+            desc("fs_grep")
+        );
+        assert!(
+            desc("fs_grep").contains("完整统计"),
+            "count 默认口径缺失: {}",
+            desc("fs_grep")
+        );
     }
 
     #[test]

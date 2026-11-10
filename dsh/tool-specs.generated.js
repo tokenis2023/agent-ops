@@ -6,7 +6,7 @@ export const TOOL_SPECS = [
   {
     "name": "fs_read",
     "readOnly": true,
-    "description": "读取文件。优先用本工具替代宿主 read_file/cat/head/tail/Get-Content。默认最多返回 32KB 并给出续读方式；支持行范围、多文件、DOCX/PDF 正文、自动识别 GBK/UTF-16/BOM 与 CRLF。模式表：path 与 paths 可同时给（并集，一次读多个文件）；reads 是异构区间数组（与 path/paths 互斥）；focus 按正则取整块（可与 path 同用，与 reads/paths/ranges/start/end/block/summary 互斥）；tail=N 读末尾（与 start/end/ranges/block/summary/focus/paths 互斥）；summary 只给声明行号（仅单文件，不能与 ranges/block/end 同用）。reads 每项可带 focus 与 budget。",
+    "description": "读取文件，优先替代宿主 read_file/cat/head/tail/Get-Content。常用：单文件 `path`；多文件异构 `reads=[{path,start,end}]`（一次读完，勿一文件一轮）；按正则取整块 `focus=<正则>`（省 grep→block 两步）；日志尾 `tail=N`。模式表：`path` 与 `paths` 是并集（共用 start/end）；`focus`/`summary` 仅单文件，`reads`/`focus`/`tail`/`summary` 各有互斥范围（读对应参数说明，区间写在 reads 项内）；默认 32KB 并给续读参数；支持 DOCX/PDF、GBK/UTF-16/BOM/CRLF；>32MB 用 scan=window（默认）/full。",
     "parameters": {
       "block": {
         "description": "返回包含 start 行的整个代码块（自动向前找块起始、向后配平结束）；配合 fs_grep 的行号用，命中行在函数内部也能展开",
@@ -126,7 +126,7 @@ export const TOOL_SPECS = [
   },
   {
     "name": "fs_edit",
-    "description": "精确替换文本（old→new）或正则替换（pattern→replacement）：不知道确切原文时用 pattern，省掉为抄原文而做的一次 fs_read。两套参数必须二选一：old+new 或 pattern+replacement；同时给会报 E_BAD_EDIT（旧版本会静默只执行 pattern）。优先替代 patch/Edit/apply_patch。同文件多处用 edits，多文件用 files；全部预检通过才写入。自动处理 CRLF/LF 差异并保留原编码；DOCX 不支持精确替换，请用 fs_write 整体重建。",
+    "description": "精确替换文本（old→new）或正则替换（pattern→replacement）：不知道确切原文时用 pattern，省掉为抄原文而做的一次 fs_read。两套参数必须二选一：old+new 或 pattern+replacement；同时给会报 E_BAD_EDIT。优先替代 patch/Edit/apply_patch。同文件多处用 edits，多文件用 files；全部预检通过才写入。结构调整后用 diff=true 自查改动片段，省一次全文回读。自动处理 CRLF/LF 并保留原编码；DOCX 不支持精确替换，请用 fs_write 整体重建。",
     "parameters": {
       "diff": {
         "description": "附带被替换的原文/新文片段（`@@ 行号` + `-原文` / `+新文`）；默认关闭，改结构后想自查时打开，可省一次 fs_read",
@@ -369,7 +369,7 @@ export const TOOL_SPECS = [
   {
     "name": "fs_grep",
     "readOnly": true,
-    "description": "正则流式搜索。优先替代 grep/rg/Select-String。按文件稳定分组，支持文本和 DOCX/PDF 正文，output 可选 files/count/matches/snippets；截断时返回 next_offset。",
+    "description": "正则流式搜索，优先替代 grep/rg/Select-String。按文件分组，支持 DOCX/PDF，output=files/count/matches/snippets；截断返回 next_offset。count 默认完整统计；显式给 limit 时按命中截断并标“本页可见”，不是总数。",
     "parameters": {
       "budget": {
         "description": "最终响应最多字节数，默认 16384",

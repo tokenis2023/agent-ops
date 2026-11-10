@@ -250,11 +250,12 @@ fn err_resp(id: Value, code: i64, msg: &str) -> Value {
 
 /// initialize 返回的系统级引导。
 ///
-/// 与 `adopt::RULE_BODY` 保持同一套路由：DOCX/PDF 正文都走 `fs_read`，
-/// 只有图片和不支持的二进制回退宿主；正则编辑和 diff 自查写进短句，
-/// 不再复制整份文档。
+/// 只负责「该用 fsops、什么时候回退、哪些是跨工具策略」三件事；
+/// 参数级事实（参数名、互斥、默认预算、统计口径）写在 `tools.rs` 的工具描述里，
+/// 宿主忽略本字段时也能靠 tools/list 拼出合法调用。
+/// 与 `adopt::RULE_BODY` 分工相同：本字段是短路由，RULE_BODY 是项目规则文件。
 pub fn instructions() -> &'static str {
-    "文件读写、搜索、编辑、元信息操作优先使用 fs_* 工具。只要 fsops 可用，不要用宿主内置 read_file/write_file/search_files 或 shell 的 cat/head/tail/grep/find/sed 处理文本；仅当 fsops 不可用、超时，或目标是图片/不支持的二进制时回退。DOCX/PDF 正文走 fs_read。局部修改用 fs_edit，不要整文件读回再 fs_write；只知道文本形状时用 pattern/replacement 正则替换，不必先抄原文，改结构后用 diff=true 自查。用 fs_grep 拿到行号后，用 fs_read start=N block=true 一次取回整个代码块，不必猜 end。同一次回复里可以并行发起多个只读调用；已知多个文件时用 fs_read reads=[{path,start,end},...] 一次读完；只想按模式取代码块时用 fs_read focus=<正则>，不必先 grep 再 block。大仓库先 fs_glob map=true focus=<关键词> 看结构，再决定搜哪里。跑 cargo/git/npm 用 fs_exec 的 argv 数组，文件复制/移动/删除/建目录用 fs_file，不要用 PowerShell 拼命令行。前台 fs_exec 保持 2 分钟内（宿主对单次工具调用有更短超时）；更长的构建/测试用 background=true 拿 job id，再用 {\"job\":N,\"wait_ms\":60000} 一次等到退出，别反复短轮询。"
+    "文件读写、搜索、编辑、元信息操作优先使用 fs_* 工具。只要 fsops 可用，不要用宿主内置 read_file/write_file/search_files 或 shell 的 cat/head/tail/grep/find/sed 处理文本；仅当 fsops 不可用、超时，或目标是图片/不支持的二进制时回退。DOCX/PDF 正文走 fs_read。局部修改用 fs_edit，不要整文件读回再 fs_write；不知道确切原文时用 pattern/replacement，改完用 diff=true 自查。同一次回复里可以并行发起多个只读调用；fs_read 的四种常用模式、fs_glob 的 repo map、fs_grep 的统计口径都写在各自描述里，发调用前先看。跑 cargo/git/npm 用 fs_exec 的 argv 数组，文件复制/移动/删除/建目录用 fs_file，不要用 PowerShell 拼命令行。前台 fs_exec 保持 2 分钟内（宿主对单次工具调用有更短超时）；更长的构建/测试用 background=true 拿 job id，再用 {\"job\":N,\"wait_ms\":60000} 一次等到退出，别反复短轮询。"
 }
 
 // 多文件响应里错误可能出现在任意一行；实现已移到 `tools::has_error_line`，
@@ -305,13 +306,34 @@ mod tests {
     fn 引导包含并行与批量读取() {
         let text = instructions();
         assert!(text.contains("并行"), "{text}");
-        assert!(text.contains("reads=["), "{text}");
-        assert!(text.contains("focus="), "{text}");
-        assert!(text.contains("map=true"), "{text}");
+        // 参数级事实（reads/focus/map）不再抄进引导，但必须指向工具描述，
+        // 否则模型既看不到又不能自己想到——实测这类能力只在参数里时不会被主动使用。
+        for pointer in [
+            "fs_read 的四种常用模式",
+            "repo map",
+            "统计口径",
+            "发调用前先看",
+        ] {
+            assert!(text.contains(pointer), "引导缺少描述指针 {pointer}: {text}");
+        }
         assert!(
             text.contains("fs_exec") && text.contains("fs_file"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn 引导不复制工具描述里的参数枚举() {
+        // P2：引导与工具描述 47% 字符重复时，两处都要每轮付费。
+        // 这里钉住“参数名只住在一处”：引导不再列 reads=/focus=/map=true，
+        // 但对应事实必须能在工具描述里找到（由 tools::tests 验证）。
+        let text = instructions();
+        for duplicated in ["reads=[", "focus=", "map=true", "block=true"] {
+            assert!(
+                !text.contains(duplicated),
+                "引导又抄回了参数枚举 {duplicated}: {text}"
+            );
+        }
     }
 
     #[test]

@@ -1,4 +1,4 @@
-# fsops bundle：把 8 个 fs_* 工具注册进 Harness。
+# fsops bundle：把 fs_* 工具注册进 Harness。
 # name 用包名解析（安装后位于 profile 的 node_modules），根导出指向 dsh/index.js。
 #
 # 可选配置（在 profile 的 cordis.patch.yml 里按 id 覆盖）：

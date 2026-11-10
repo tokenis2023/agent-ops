@@ -22,21 +22,14 @@ const RULE_BODY: &str = "## 文件操作：优先使用 fsops\n\n\
 - 覆盖或新建：`fs_write`（替代 write_file / Write）\n\
 - 元信息：`fs_stat`（替代 stat / ls / Get-Item）\n\
 - 执行命令：`fs_exec`（argv 数组，不经过 shell；替代 PowerShell 的 cmd 字符串）\n\
-- 文件管理：`fs_file`（copy/move/remove/mkdir/convert；替代 Copy-Item / Move-Item / Remove-Item / New-Item）\n\n\
+- 文件管理：`fs_file`（copy/move/remove/mkdir/convert/archive/extract）\n\n\
 规则：\n\
 - 只要 fsops 可用，就不要用宿主内置文件工具或 shell 的 cat/head/tail/grep/find/sed 处理文本。\n\
 - DOCX/PDF 正文都可以直接用 `fs_read` 读取（PDF 只读）；`fs_write` 可整体重建 DOCX。\n\
-- 读取长文件用 `start`/`end`/`ranges`；搜索用 `fs_grep` 的分页参数。\n\
-- 先用 `fs_grep` 拿行号，再 `fs_read start=N block=true` 一次拿到包含该行的整个函数/代码块，不要猜 `end`。\n\
-- 同一次回复里可以并行发起多个只读 `fs_read`/`fs_grep`；已知多个文件时用 `fs_read reads=[{path,start,end},...]` 一次读完，不要一个文件一轮。\n\
-- 只想按模式取代码块时用 `fs_read focus=<正则>`：它会把命中行展开成完整代码块，省掉 grep 再 block 两步。\n\
-- 大仓库先 `fs_glob map=true focus=<关键词>` 看结构，再决定 grep/read，避免多轮试探。\n\
+- 局部修改只用 `fs_edit`，不要整文件读回再 `fs_write`；不知道确切原文时用 `pattern`/`replacement`，改完用 `diff=true` 自查。\n\
+- 读取方式（单文件、多文件异构、按模式取块、日志末尾）、搜索分页与统计口径、repo map，都写在对应工具的描述里；发调用前先看描述，不要靠试错拼参数。\n\
+- 同一次回复里可以并行发起多个只读调用。\n\
 - 跑 cargo/git/npm/python 用 `fs_exec` 的 argv 数组，不要用 PowerShell 拼命令行；复制/移动/删除/建目录用 `fs_file`。\n\
-- 同一字面量在文件里多处出现、只想改其中几处时，用 `fs_edit` 的 `start`/`end` 限定行范围。\n\
-- 只知道文本形状、不知道确切原文时，用 `fs_edit` 的 `pattern`/`replacement` 正则替换（支持 `$1`），不要先读全文抄原文。\n\
-- 结构调整后用 `fs_edit diff=true` 自查改动片段，省掉一次全文回读。\n\
-- 统计命中数用 `fs_grep output=count`：默认完整统计；显式传 `limit` 时按命中截断并标注“本页可见”，不要当成总数。\n\
-- 局部修改只用 `fs_edit`，不要整文件读回再 `fs_write`。\n\
 - 仅当 fsops 不可用、超时，或目标是图片/不支持的二进制（旧版 `.doc`、压缩包等）时才回退。\n\
 - 如果 fsops 工具尚未出现在当前工具列表，先调用宿主的工具发现（如 tool_search）加载 fs_* schema；不要先用内置 Read/Bash 试一遍。\n\
 - 如果宿主不支持工具发现或加载失败，直接用 `fsops read/grep/glob/stat/call` CLI，仍然不要退回 cat/grep/find。\n";
@@ -909,6 +902,8 @@ mod tests {
     fn 规则正文覆盖_pdf_与正则编辑() {
         // 规则正文是 Agent 每轮都会读的短引导，必须和 initialize 同路由：
         // PDF 正文走 fs_read；正则编辑与 diff 自查要写明，否则学不到新用法。
+        // 参数级事实（reads/focus/map/count 口径）住在工具描述里；
+        // 规则正文只负责策略并指向描述，否则两处 ~3KB 文本要每轮付两次。
         assert!(RULE_BODY.contains("DOCX/PDF"), "{RULE_BODY}");
         assert!(RULE_BODY.contains("fs_read"), "{RULE_BODY}");
         assert!(
@@ -923,24 +918,36 @@ mod tests {
             RULE_BODY.contains("diff=true"),
             "缺少 diff 自查引导: {RULE_BODY}"
         );
-        assert!(
-            RULE_BODY.contains("并行") && RULE_BODY.contains("reads="),
-            "缺少并行/批量读取引导: {RULE_BODY}"
-        );
-        assert!(RULE_BODY.contains("focus="), "缺少 focus 引导: {RULE_BODY}");
-        assert!(
-            RULE_BODY.contains("map=true"),
-            "缺少 repo map 引导: {RULE_BODY}"
-        );
+        assert!(RULE_BODY.contains("并行"), "缺少并行读取引导: {RULE_BODY}");
+        // 参数事实不在规则正文重复，但必须有指向，否则模型不会主动去看描述。
+        for pointer in ["读取方式", "统计口径", "repo map", "工具的描述"] {
+            assert!(
+                RULE_BODY.contains(pointer),
+                "规则正文缺少描述指针 {pointer}: {RULE_BODY}"
+            );
+        }
         assert!(
             RULE_BODY.contains("fs_exec") && RULE_BODY.contains("fs_file"),
             "缺少执行/文件管理引导: {RULE_BODY}"
         );
-        // output=count 默认是被工具层放宽成全量统计的；写成“不受 limit 截断”会误导。
-        assert!(
-            RULE_BODY.contains("默认完整统计") && RULE_BODY.contains("本页可见"),
-            "count 规则应与实现一致: {RULE_BODY}"
-        );
+    }
+
+    #[test]
+    fn 规则正文不重复参数枚举() {
+        // P0 实测：instructions ↔ RULE_BODY 字符级重合 47%。
+        // 两份都要进上下文，参数枚举只能住一处（工具描述）。
+        for duplicated in [
+            "reads=[",
+            "focus=",
+            "map=true",
+            "block=true",
+            "默认完整统计",
+        ] {
+            assert!(
+                !RULE_BODY.contains(duplicated),
+                "规则正文又抄回了 {duplicated}: {RULE_BODY}"
+            );
+        }
     }
 
     #[test]
@@ -1043,10 +1050,7 @@ mod tests {
         let fresh = upsert_block("", target).unwrap();
         assert_eq!(check_outcome(Some(&fresh), target).unwrap().0, "ok");
 
-        let stale = fresh.replace(
-            "- 统计命中数用 `fs_grep output=count`：默认完整统计；显式传 `limit` 时按命中截断并标注“本页可见”，不要当成总数。\n",
-            "",
-        );
+        let stale = fresh.replace("- 同一次回复里可以并行发起多个只读调用。\n", "");
         assert_ne!(stale, fresh, "测试前提：正文确实被改动");
         let (label, ok) = check_outcome(Some(&stale), target).unwrap();
         assert_eq!(label, "过期");

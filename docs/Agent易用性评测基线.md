@@ -67,16 +67,42 @@ P0 的基线数字保留在上一节，便于阶段对照；以下只列变化�
 
 T13 的故障注入不是 sleep 猜时序：用 `open(path, 'rb')` 持有句柄，Windows 默认共享模式不允许 delete，原子改名必然失败，失败点确定。两次独立执行的“已写入 1/2”与磁盘完全一致。
 
+## 2.2 P2a 引导收敛后的数字（2026-11-10）
+
+本阶段只改文案与排版，不改任何工具行为。
+
+| 项 | P0 | P2a 后 | 变化 |
+|---|---:|---:|---:|
+| `initialize.instructions` | 1,262 B | **997 B** | **−21.0%** |
+| `integrate --rules` 规则块（RULE_BODY） | 2,850 B | **1,978 B** | **−30.6%** |
+| instructions ↔ RULE_BODY 字符重合 | 47.1% | **19.6%** | −27.5 pp |
+| 工具 description 合计 | 3,164 B | **3,195 B** | +31 B |
+| inputSchema 合计 | 14,225 B | 14,225 B | 0 |
+| 描述+引导常驻合计 | 17,389 B | **17,420 B** | +31 B |
+| `cargo test` | 383 | **391** | +8（含描述契约 3 项） |
+| `check.ps1 full` | 11 步 | 11 步全绿，34 s | — |
+
+如实说明：**计划 P2 验收写的「公共说明字节量减少约 25%」只对 `instructions` 单份成立（−21%，接近但未达 25%）；两份引导合计从 4,112 B 降到 2,975 B（−27.7%）。而把参数事实搬进工具描述后，描述从 3,164 涨到 3,195 B，所以“引导+描述”总常驻只减了 241 B。真正的收益是重复率下降，不是总量。**
+
+P2 的分工边界（已写成测试）：
+
+- 工具描述：参数名、互斥、默认预算、统计口径这类“不说就猜不到”的事实；
+- `instructions` / `RULE_BODY`：只用 fsops、何时回退、跨工具策略，并指向工具描述。
+
+两条防回退断言：`引导不复制工具描述里的参数枚举`（instructions 不得再出现 `reads=[`/`focus=`/`map=true`/`block=true`）、`规则正文不重复参数枚举`（RULE_BODY 不得出现上述枚举与 `默认完整统计`）。
+
 ## 3. 体积口径
 
 ### 3.1 MCP 常驻成本
 
-| 项 | 字节 | 说明 |
+| 项 | 字节（P0） | 说明 |
 |---|---:|---|
 | `initialize.instructions` | 1,262 | 694 字符，14 个分句 |
 | `tools/list` 整条响应 | 17,897 | 9 个工具的 name/description/inputSchema |
 | └ description 合计 | 3,164 | 平均 352 B |
 | └ inputSchema 合计 | 14,225 | 含类型、枚举、描述与 `additionalProperties:false` |
+
+> 本节数字是 P0 口径；P2a 后的最新值见 2.2 节。
 
 逐工具（description / inputSchema / 参数个数）：
 
@@ -215,9 +241,9 @@ grep 截断      … next_offset=3 | 续读: fs_grep offset=3 output=matches（�
 
 | 编号 | 问题 | 证据 | 归属 |
 |---|---|---|---|
-| F-1 | `instructions` 与 `RULE_BODY` 47% 字符重复，两者都进上下文 | 第 4 节 difflib 比对 | P2 |
-| F-2 | `diff=true`、`fs_file` 只在 instructions 一处；`output=count` 口径不在任何服务端引导里 | 第 4 节矩阵 | P2 |
-| F-3 | 工具数注释写「8 个」而实际 9 个：`src/tools.rs:1`、`src/cli.rs:63`、`dsh/index.js:2,36`、`cordis.patch.yml:1`、`tests/dsh_plugin_smoke.mjs:8` | 生成器只同步 README/工具参考/使用指南/package.json，这些位置不在同步范围 | P2（文档/生成物） |
+| F-1 | ~~`instructions` 与 `RULE_BODY` 47% 字符重复~~ **P2a 已处理**：现 19.6%，两份合计 4,112→2,975 B | 2.2 节 | 完成 |
+| F-2 | ~~`diff=true`/`fs_file` 只在 instructions；`output=count` 口径不在服务端引导~~ **P2a 已处理**：`diff=true` 与 count 口径已写进 `fs_edit`/`fs_grep` 描述 | `描述带上无法从参数名推断的约束` | 完成 |
+| F-3 | ~~工具数注释写「8 个」而实际 9 个~~ **P2a 已处理**：6 处文案已去数量，新增 `非生成器维护的文案不报错工具数` 钉住残留 | 单测 | 完成 |
 | F-4 | `E_STALE` 先建议「改传新 hash 重试」，`E_AMBIGUOUS` 先建议 `all=true` | 第 6 节原文 | P3 |
 | F-5 | 锁持续占用无升级路径；`E_LOCKED` 工具侧固定 3000 ms | `src/tools.rs:5713,5980`、`src/io.rs:755` | P3 |
 | F-6 | `fs_inspect` 实现读取 `time_budget_ms`/`no_ignore`，但 schema 与文档都没有；传了会被 `additionalProperties:false` 拒绝 | 实测 `E_BAD_ARGS fs_inspect.time_budget_ms 是未知字段` | P4（契约一致性） |
@@ -310,4 +336,17 @@ grep 截断      … next_offset=3 | 续读: fs_grep offset=3 output=matches（�
 1. 「接入的工具描述出现相同公共说明」不成立——重复在 `instructions` ↔ `RULE_BODY`（47% 字符），工具描述本身是局部的；P2 的收益应主要从这两份 1–3 KB 文本与 14 KB inputSchema 里找。
 2. 「续读提示需重新构造」的前提不成立——现有提示已可直接重放；P4 的真实缺口是完整性口径（offset 非快照、count 精确/部分）与静默忽略参数（F-7）。
 
-下一步：P1b 需要先确认模型/宿主/usage 口径与预算（第 9.2 节），本机尚无外部付费调用授权，到此停。P2–P5 未开始。
+### P2a 验收（描述收敛，未做真实 Agent 对照）
+
+计划 P2 的验收包含「公共说明字节量减少约 25%」与「参数误用不倒退」。本地能验的部分：
+
+- ✅ `instructions` 1,262 → 997 B（−21.0%）；两份引导合计 4,112 → 2,975 B（−27.7%）；重复率 47.1% → 19.6%；
+- ✅ **未达 −25% 单份目标**：如实记录，不为凑数字删减回退边界与 `fs_exec` 超时策略；
+- ✅ 互斥、预算、统计口径、`scan`、大文件约束全部保留在描述或参数说明里，并有测试钉住（`fs_read描述把常用路径放在前面`、`描述带上无法从参数名推断的约束`）；
+- ✅ 既有合法调用兼容：tool name、参数名、默认值、错误码均未变；391 单测 / 210 e2e / 10 基准 / 89 DSH 断言全绿；
+- ✅ DSH 定义与文档清单已重新生成，`--check` 无漂移；
+- ⚠️ **未做**「仅精简描述」与「补示例」的真实 Agent 对照（P2b），也无参数误用率数据。描述类改动对模型的实际影响未测量，不声称提升。
+
+另修正了一个既有测试缺陷：`search::tests::并行count单文件超时置位truncated` 原本断言 30ms 预算内「至少扫到一个文件」，高负载下会假失败（P2 门禁实际抖过一次）。现改为断言与时序无关的契约（必报超时+截断；若已开扫，计数不得等于完整值），连续 5 次通过。
+
+下一步：P1b 需要先确认模型/宿主/usage 口径与预算（第 9.2 节），本机尚无外部付费调用授权。P2a 已按 P0 证据完成（见 2.2 节），P2b（真实 Agent 对照确认描述不影响选对工具）依赖 P1b 的同一套授权；P3–P5 未开始。

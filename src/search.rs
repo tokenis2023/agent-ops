@@ -2028,9 +2028,20 @@ mod tests {
         )
         .unwrap();
         let _ = fs::remove_dir_all(&dir);
-        assert!(r.files_scanned >= 1, "应至少开始扫描一个文件");
+        // 超时本身与线程启动时机无关：无论是否来得及开扫，都必须报超时+截断，
+        // 不能把不完整结果当成完整结果返回。
         assert!(r.timed_out, "大文件扫描应超时");
-        assert!(r.truncated, "单文件超时后 truncated 必须置位");
+        assert!(r.truncated, "超时后 truncated 必须置位");
+        // 若已开扫，单文件数字只能是部分值，不能被读成文件总数。
+        // 不断言“至少扫到一个”：30ms 预算下线程/遍历能否启动取决于调度，
+        // 把它写成硬条件会让 CI 在忙时假失败（P2 门禁实测抖过一次）。
+        for (path, count) in &r.file_counts {
+            assert!(
+                *count < 600_000,
+                "{path} 报出了 {} 行，超时文件不能报成完整计数",
+                count
+            );
+        }
     }
 
     fn 带上下文结果() -> GrepResult {
