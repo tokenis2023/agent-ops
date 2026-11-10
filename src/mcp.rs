@@ -7,11 +7,88 @@
 use crate::tools;
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
 /// 默认并发度：同一回复里的多个只读调用可以真正并行。
 pub const DEFAULT_JOBS: usize = 4;
+
+/// 宿主断开信号：MCP 层置位后，正在跑的前台 fs_exec 结束进程树并返回 E_ABORTED。
+/// 用全局量是因为 `tools::call` 的签名被 schema 生成和 CLI 共用，不宜为一个信号加参数。
+static CANCEL: AtomicBool = AtomicBool::new(false);
+
+/// 供 fs_exec 查询的取消信号。
+pub fn cancel_flag() -> &'static AtomicBool {
+    &CANCEL
+}
+
+/// 宿主是否还连着。
+///
+/// 只靠「写响应失败」发现断开是不够的：一次长命令跑着的时候没有任何响应可写，
+/// 宿主走了我们也发现不了，进程和子进程照样活到 timeout（实测：宿主关掉输出端
+/// 40 秒后，fsops 与 ping 都还活着）。
+///
+/// 判据是「管道还能不能写」：对端关掉后写入必然失败，而 PeekNamedPipe 在
+/// **普通文件** stdout 上本来就报 ERROR_ACCESS_DENIED(5)，分不清「不是管道」和
+/// 「断了」，会误杀；另外对端关闭后 GetLastError 仍可能是 0，所以只看返回值、
+/// 不匹配错误码。
+///
+/// 探针是零长度写：对健康管道恒成功且不产生任何字节，对协议透明。
+#[cfg(windows)]
+fn host_alive() -> bool {
+    use std::ffi::c_void;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetStdHandle(which: u32) -> *mut c_void;
+        fn GetFileType(handle: *mut c_void) -> u32;
+        fn WriteFile(
+            handle: *mut c_void,
+            buffer: *const u8,
+            len: u32,
+            written: *mut u32,
+            overlapped: *mut c_void,
+        ) -> i32;
+    }
+    const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+    const FILE_TYPE_PIPE: u32 = 3;
+    let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+    if handle.is_null() {
+        return true;
+    }
+    // 非管道（重定向到文件/控制台）时没有对端可判断，交给写响应失败兜底。
+    if unsafe { GetFileType(handle) } != FILE_TYPE_PIPE {
+        return true;
+    }
+    let mut written = 0u32;
+    unsafe {
+        WriteFile(
+            handle,
+            std::ptr::null(),
+            0,
+            &mut written,
+            std::ptr::null_mut(),
+        ) != 0
+    }
+}
+
+/// 非 Windows：项目主要面向 Windows，这里保守认为宿主还在（写失败兜底）。
+#[cfg(not(windows))]
+fn host_alive() -> bool {
+    true
+}
+
+/// 宿主断开检测线程：前台命令在跑时没有响应可写，只能主动探测。
+/// 250ms 一次：宿主断开后最多这么久就收工，对命令本身的 CPU 影响可忽略。
+fn watch_host() {
+    thread::spawn(|| loop {
+        thread::sleep(std::time::Duration::from_millis(250));
+        if !host_alive() {
+            CANCEL.store(true, Ordering::Relaxed);
+            return;
+        }
+    });
+}
 
 pub fn serve() -> io::Result<()> {
     serve_with(DEFAULT_JOBS)
@@ -73,10 +150,20 @@ fn serve_parallel(jobs: usize) -> io::Result<()> {
     let (tx, rx) = mpsc::channel::<Value>();
     let rx = Arc::new(Mutex::new(rx));
     let out = Arc::new(Mutex::new(io::stdout()));
+    // 写响应时宿主可能已经断开（管道关闭 / 管道变空）。原先忽略写错误，
+    // 进程会一直读到 stdin EOF 才退；而宿主侧的超时/中断不一定关 stdin，
+    // 于是留下一批活着但没人读的 fsops 进程。写失败即视为对端已走，广播关闭。
+    //
+    // 触发条件只有「写响应失败」：那是宿主真的走了（管道关/变空）的确证。
+    // stdin EOF 不能当信号——一次性 `fsops call` 与 e2e 客户端都是写完就关 stdin，
+    // 此时排队请求仍须执行完，否则会把正常结果误判成 E_ABORTED。
+    let broken = Arc::new(AtomicBool::new(false));
+    watch_host();
     let mut workers = Vec::with_capacity(jobs);
     for _ in 0..jobs {
         let rx = Arc::clone(&rx);
         let out = Arc::clone(&out);
+        let broken = Arc::clone(&broken);
         workers.push(thread::spawn(move || loop {
             // 只在取任务时持有接收端锁；执行期间不持有，真正并行。
             let job = {
@@ -84,6 +171,9 @@ fn serve_parallel(jobs: usize) -> io::Result<()> {
                 guard.recv()
             };
             let Ok(req) = job else { break };
+            if broken.load(Ordering::Relaxed) {
+                break;
+            }
             let resp =
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dispatch(&req))) {
                     Ok(Some(resp)) => resp,
@@ -94,13 +184,19 @@ fn serve_parallel(jobs: usize) -> io::Result<()> {
                         "error": {"code": -32603, "message": "E_INTERNAL 工具执行崩溃"}
                     }),
                 };
-            let mut guard = out.lock().unwrap();
-            let _ = writeln!(&mut *guard, "{resp}");
-            let _ = guard.flush();
+            if !write_line(&out, &resp) {
+                broken.store(true, Ordering::Relaxed);
+                // 宿主已走：让正在跑的前台命令立刻收工，不必干等到自己的 timeout。
+                CANCEL.store(true, Ordering::Relaxed);
+                break;
+            }
         }));
     }
     let stdin = io::stdin();
     for line in stdin.lock().lines() {
+        if broken.load(Ordering::Relaxed) {
+            break;
+        }
         let line = match line {
             Ok(l) => l,
             Err(_) => break,
@@ -112,9 +208,10 @@ fn serve_parallel(jobs: usize) -> io::Result<()> {
             Ok(v) => v,
             Err(e) => {
                 let resp = err_resp(Value::Null, -32700, &format!("JSON 解析失败: {e}"));
-                let mut guard = out.lock().unwrap();
-                let _ = writeln!(&mut *guard, "{resp}");
-                let _ = guard.flush();
+                if !write_line(&out, &resp) {
+                    broken.store(true, Ordering::Relaxed);
+                    break;
+                }
                 continue;
             }
         };
@@ -122,17 +219,29 @@ fn serve_parallel(jobs: usize) -> io::Result<()> {
         if method == "tools/call" {
             let _ = tx.send(req);
         } else if let Some(resp) = dispatch(&req) {
-            let mut guard = out.lock().unwrap();
-            let _ = writeln!(&mut *guard, "{resp}");
-            let _ = guard.flush();
+            if !write_line(&out, &resp) {
+                broken.store(true, Ordering::Relaxed);
+                break;
+            }
         }
     }
+    // stdin EOF 本身不算宿主已走：一次性 `fsops call` 与 e2e 客户端都是写完就关，
+    // 管道里排队的请求仍然要执行完。真断开由上方的写失败分支处理。
     drop(tx);
     for worker in workers {
         let _ = worker.join();
     }
     crate::jobs::shutdown();
     Ok(())
+}
+
+/// 写一行 JSON-RPC 响应。返回 false 表示对端已断开（管道关闭或变空）。
+fn write_line(out: &Arc<Mutex<io::Stdout>>, resp: &Value) -> bool {
+    let mut guard = out.lock().unwrap();
+    if writeln!(&mut *guard, "{resp}").is_err() {
+        return false;
+    }
+    guard.flush().is_ok()
 }
 
 fn err_resp(id: Value, code: i64, msg: &str) -> Value {

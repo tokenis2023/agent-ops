@@ -6,6 +6,7 @@
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -76,7 +77,20 @@ pub fn build_command(args: &Value) -> Result<(Command, String), String> {
     Ok((command, program.to_string()))
 }
 
+/// 一次性调用（CLI）入口：没有宿主可断开，取消信号永远不置位。
 pub fn run(args: &Value) -> String {
+    let never = AtomicBool::new(false);
+    run_with_cancel(args, &never)
+}
+
+/// fs_exec 唯一入口。
+///
+/// 先处理后台任务（`{list:true}` / `{job:N}` / `background:true`）——它们不跑前台进程，
+/// 也就不需要取消信号；其余走前台执行。
+///
+/// `cancel` 被置位时结束前台进程树并返回 E_ABORTED：MCP 层在宿主断开时置位，
+/// 否则一次 2 分钟的构建会把 fsops 和子进程都留住，宿主已经走了也没人读结果。
+pub fn run_with_cancel(args: &Value, cancel: &AtomicBool) -> String {
     // 后台任务：{job:N} 轮询/终止；{list:true} 列出全部任务。
     if crate::tools::arg_bool(args, "list", false) {
         return crate::jobs::list();
@@ -133,6 +147,10 @@ pub fn run(args: &Value) -> String {
     let mut collected: [Option<(Vec<u8>, usize)>; 2] = [None, None];
     let mut exit_code: Option<i32> = None;
     let mut timed_out = false;
+    let mut aborted = false;
+    // 取消之后不再等管道排空：宿主已经走了，谁读结果不重要。
+    // 超时则仍要读空，因为结果还有人要。
+    let mut abort_deadline: Option<Instant> = None;
     let deadline = started + Duration::from_millis(timeout_ms as u64);
     loop {
         while let Ok((index, data, total)) = rx.try_recv() {
@@ -146,11 +164,20 @@ pub fn run(args: &Value) -> String {
         if exit_code.is_some() && collected.iter().all(Option::is_some) {
             break;
         }
-        if exit_code.is_none() && !timed_out && Instant::now() >= deadline {
+        if exit_code.is_none() && !aborted && cancel.load(Ordering::Relaxed) {
+            aborted = true;
+            abort_deadline = Some(Instant::now() + Duration::from_millis(200));
+            kill_tree(child.id());
+        }
+        if abort_deadline.is_some_and(|d| Instant::now() >= d) {
+            break;
+        }
+        if exit_code.is_none() && !timed_out && !aborted && Instant::now() >= deadline {
             timed_out = true;
             kill_tree(child.id());
         }
-        if timed_out && Instant::now() > deadline + Duration::from_secs(5) {
+        // 结束信号之后仍要读空管道：孙进程可能还握着句柄，等不到 EOF 会一直转
+        if (timed_out || aborted) && Instant::now() > deadline + Duration::from_secs(5) {
             break;
         }
         thread::sleep(Duration::from_millis(10));
@@ -160,6 +187,15 @@ pub fn run(args: &Value) -> String {
     let (err_bytes, err_total) = collected[1].take().unwrap_or_default();
     let out_text = crate::text::decode(&out_bytes).text;
     let err_text = crate::text::decode(&err_bytes).text;
+
+    if aborted {
+        let mut text = format!(
+            "E_ABORTED program={program} 宿主已断开，提前结束进程树（duration={elapsed}ms）\n"
+        );
+        push_stream(&mut text, "stdout", &out_text, out_bytes.len(), out_total);
+        push_stream(&mut text, "stderr", &err_text, err_bytes.len(), err_total);
+        return text;
+    }
 
     if timed_out {
         let mut text = format!(
@@ -264,6 +300,37 @@ fn quote_for_cmd(arg: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::Arc;
+
+    #[test]
+    fn 宿主断开时前台命令被提前结束() {
+        // 宿主取消/超时后不会等我们跑完；原先只能等 timeout_ms 到点，
+        // 期间 fsops 进程和子进程都活着（真实事故：20 秒的测试进程拖住整个会话回收）。
+        let flag = Arc::new(AtomicBool::new(false));
+        let watcher = Arc::clone(&flag);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            watcher.store(true, Ordering::Relaxed);
+        });
+        let began = Instant::now();
+        let out = run_with_cancel(
+            &json!({
+                "program": "cmd",
+                "args": ["/c", "ping -n 6 127.0.0.1 > nul"],
+                "timeout_ms": 30000
+            }),
+            &flag,
+        );
+        let elapsed = began.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "应在宿主断开后很快返回，实际 {elapsed:?}: {out}"
+        );
+        assert!(
+            out.contains("E_ABORTED") || out.starts_with("exit="),
+            "{out}"
+        );
+    }
 
     #[test]
     fn 捕获退出码与stdout() {

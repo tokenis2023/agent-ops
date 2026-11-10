@@ -1046,6 +1046,37 @@ check("fs_exec background 返回 job id", text.startswith("ok job="), text)
 text, _ = call("fs_exec", job=99999)
 check("fs_exec 未知 job 给出可执行错误", text.startswith("E_NO_JOB"), text)
 
+# 26. 宿主断开：正在跑的前台命令必须立刻收工，不能活到 timeout
+# 原先读线程 stdin EOF 后只是 drop(tx) 再 join，长命令会跑满 timeout_ms
+# （最长 10 分钟），宿主早就走了进程树还活着。判据是关管道后几秒内退出。
+host_proc = subprocess.Popen([str(EXE), "mcp"], stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+for req in (
+    {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+    {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+     "params": {"name": "fs_exec",
+                "arguments": {"program": "cmd",
+                              "args": ["/c", "ping", "-n", "30", "127.0.0.1"],
+                              "timeout_ms": 60000}}},
+):
+    host_proc.stdin.write((json.dumps(req) + "\n").encode("utf-8"))
+host_proc.stdin.flush()
+host_proc.stdout.readline()  # initialize 响应：确认服务已就绪，exec 请求已进队列
+time.sleep(0.5)              # 让 ping 真正跑起来
+host_proc.stdout.close()     # 宿主断开输出端（exec 仍在跑，这段时间没有响应可写）
+host_proc.stdin.close()      # 宿主也不再发送请求
+disconnected_at = time.time()
+try:
+    host_code = host_proc.wait(timeout=15)
+except subprocess.TimeoutExpired:
+    host_proc.kill()
+    host_proc.wait()
+    host_code = None
+host_elapsed = time.time() - disconnected_at
+check("宿主断开后前台命令立刻收工",
+      host_code == 0 and host_elapsed < 5,
+      f"退出耗时 {host_elapsed:.1f}s（应 < 5s）code={host_code}")
+
 passed = sum(1 for _, c, _ in results if c)
 print(f"\n{passed}/{len(results)} 通过   目录={root}")
 # 用完即清：临时夹具不留在磁盘上

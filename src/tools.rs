@@ -810,7 +810,7 @@ pub fn call(name: &str, args: &Value) -> String {
         "fs_inspect" => inspect_tool(args),
         "fs_grep" => grep_tool(args),
         "fs_stat" => stat(args),
-        "fs_exec" => crate::exec::run(args),
+        "fs_exec" => crate::exec::run_with_cancel(args, crate::mcp::cancel_flag()),
         "fs_file" => crate::fileops::run(args),
         other => format!("E_UNKNOWN_TOOL 未知工具 {other}"),
     }
