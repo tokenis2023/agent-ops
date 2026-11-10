@@ -277,6 +277,13 @@ def build_fixture(root: Path) -> dict:
         (reads_dir / f"r{i}.txt").write_text(
             "\n".join(lines) + "\n", encoding="utf-8", newline="\n")
 
+    # 场景 10（T15）：34MB 单文件，每行 1023 字节，走超大文件窗口分支。
+    huge_dir = root / "huge"
+    huge_dir.mkdir(parents=True, exist_ok=True)
+    with (huge_dir / "large.txt").open("wb") as handle:
+        for i in range(34_000):
+            handle.write(f"line-{i:05d}-".encode("ascii") + b"y" * 1012 + b"\n")
+
     return {
         "src_file": src / "app.rs",
         "files_dir": files,
@@ -461,6 +468,36 @@ def scenario_count_density(c: Ctx, fx: dict) -> None:
     c.check("本页可见" not in text, "count: 未截断时不应标注本页可见", text[:200])
 
 
+def scenario_large_window(c: Ctx, fx: dict) -> None:
+    """T15：>32 MB 文件走窗口扫描；窗口不给全文 hash，续读可重放。"""
+    path = c.p("huge", "large.txt")
+    first, err = c.call("fs_read", path=path, start=100, end=102, max_line=0, budget=4000)
+    c.check(not err, "huge: 窗口读取不应报错", first[:200])
+    c.check("窗口扫描" in first, "huge: 未标注窗口扫描", first[:160])
+    c.check("hash=" not in first, "huge: 窗口模式不应伪造全文 hash", first[:160])
+    c.check("34000行" not in first, "huge: 窗口模式不应声称总行数", first[:160])
+    for n in (100, 101, 102):
+        c.check(f"{n}|line-{n - 1:05d}-" in first, f"huge: 缺第 {n} 行", first[:200])
+
+    m = re.search(r"续读: start=(\d+) end=(\d+)", first)
+    if not c.check(m is not None, "huge: 窗口尾部应有可重放的续读区间", first[-200:]):
+        return
+    nxt_from, nxt_to = int(m.group(1)), int(m.group(2))
+    c.check(nxt_from == 103, "huge: 续读应从第 103 行接着读", f"实际 start={nxt_from}")
+    second, err = c.call("fs_read", path=path, start=nxt_from, end=nxt_to,
+                         max_line=0, budget=4000)
+    c.check(not err, "huge: 续读不应报错", second[:200])
+    c.check(f"{nxt_from}|line-{nxt_from - 1:05d}-" in second,
+            "huge: 续读首行与上一窗口不连续", second[:200])
+    c.check("hash=" not in second, "huge: 续读仍是窗口模式", second[:160])
+
+    full, err = c.call("fs_read", path=path, start=100, end=102, max_line=0,
+                       budget=4000, scan="full")
+    c.check(not err, "huge: scan=full 不应报错", full[:200])
+    c.check("34000行" in full and "hash=" in full and "全文件扫描" in full,
+            "huge: scan=full 应给精确总行数与 hash", full[:200])
+
+
 def scenario_multi_file_reads(c: Ctx, fx: dict) -> None:
     """多文件异构区间：5 次单读 vs 1 次 reads，内容必须等价。"""
     files = [c.p("reads", f"r{i}.txt") for i in range(5)]
@@ -546,6 +583,7 @@ SCENARIOS = [
     ("正则编辑 dry_run+diff", scenario_regex_edit),
     ("count 高密度", scenario_count_density),
     ("多文件异构 reads", scenario_multi_file_reads),
+    (">32MB 窗口续读", scenario_large_window),
     ("重复读不短路", scenario_repeat_read),
     ("repo map 排序", scenario_repo_map),
     ("后台任务轮询", scenario_background_job),

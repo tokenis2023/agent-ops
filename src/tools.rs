@@ -2459,6 +2459,115 @@ mod tests {
     }
 
     #[test]
+    fn 行范围限定只改同函数内的两处相同字面量() {
+        // T05：同一函数里两处相同字面量要一起改，且不能波及同文件的其他函数。
+        let dir = 临时目录("edit-dup-literal");
+        let path = dir.join("a.rs");
+        fs::write(
+            &path,
+            "fn a() {\n    let x = limit;\n    let y = limit;\n}\n\nfn b() {\n    let z = limit;\n}\n",
+        )
+        .unwrap();
+        let output = edit_tool(&json!({
+            "path": path.to_string_lossy(),
+            "edits": [{"old": "limit", "new": "cap", "all": true, "start": 1, "end": 4}]
+        }));
+        let body = fs::read_to_string(&path).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+
+        assert!(output.starts_with("ok 2 处修改"), "{output}");
+        assert_eq!(
+            body,
+            "fn a() {\n    let x = cap;\n    let y = cap;\n}\n\nfn b() {\n    let z = limit;\n}\n"
+        );
+    }
+
+    #[test]
+    fn 锁短暂占用时等待后写入成功() {
+        // T10 前半：另一线程短时间持有写锁，工具层有限等待后继续写入。
+        // 锁必须由另一条线程获取并在同一线程释放（Windows 命名互斥量按线程归属）。
+        let dir = 临时目录("lock-brief");
+        let path = dir.join("a.txt");
+        fs::write(&path, "alpha\n").unwrap();
+        let held_fp = FsPath::parse(path.to_str().unwrap()).unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _lock = io::lock_path(&held_fp, 1000).expect("持有写锁");
+            ready_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("持锁线程未就绪");
+
+        let output = edit_tool(&json!({
+            "path": path.to_string_lossy(),
+            "edits": [{"old": "alpha", "new": "beta"}]
+        }));
+        holder.join().unwrap();
+        let body = fs::read_to_string(&path).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+
+        assert!(
+            output.starts_with("ok 1 处修改"),
+            "等待后应写入成功: {output}"
+        );
+        assert_eq!(body, "beta\n");
+    }
+
+    #[test]
+    fn 锁持续占用时报出等待时长且不写入() {
+        // T10 后半：锁一直被占时，工具层等满 3000ms 后如实报告，磁盘不变；
+        // 锁释放后原参数直接重试能成功（有限等待 + 可重试，不是盲重试）。
+        let dir = 临时目录("lock-held");
+        let path = dir.join("a.txt");
+        fs::write(&path, "alpha\n").unwrap();
+        let held_fp = FsPath::parse(path.to_str().unwrap()).unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _lock = io::lock_path(&held_fp, 1000).expect("持有写锁");
+            ready_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(60));
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("持锁线程未就绪");
+
+        let started = std::time::Instant::now();
+        let output = edit_tool(&json!({
+            "path": path.to_string_lossy(),
+            "edits": [{"old": "alpha", "new": "beta"}]
+        }));
+        let waited = started.elapsed();
+        let body_while_locked = fs::read_to_string(&path).unwrap();
+
+        assert!(output.starts_with("E_LOCKED"), "{output}");
+        assert!(output.contains("3000ms"), "应说明已等多久: {output}");
+        assert!(
+            output.contains("本次未写入任何内容"),
+            "应声明未写入: {output}"
+        );
+        assert!(
+            waited >= std::time::Duration::from_millis(2900),
+            "应真的等满锁超时，实际 {waited:?}"
+        );
+        assert_eq!(body_while_locked, "alpha\n", "锁冲突时磁盘被改了");
+
+        drop(release_tx);
+        holder.join().unwrap();
+        let retry = edit_tool(&json!({
+            "path": path.to_string_lossy(),
+            "edits": [{"old": "alpha", "new": "beta"}]
+        }));
+        let body = fs::read_to_string(&path).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+
+        assert!(retry.starts_with("ok 1 处修改"), "释放后重试失败: {retry}");
+        assert_eq!(body, "beta\n");
+    }
+
+    #[test]
     fn 参数类型错误给出可执行提示() {
         // 类型写错时旧实现会静默退回默认值，模型以为生效却得到别的行为。
         let path = 临时文本文件("a\nb\n");

@@ -1077,6 +1077,191 @@ check("宿主断开后前台命令立刻收工",
       host_code == 0 and host_elapsed < 5,
       f"退出耗时 {host_elapsed:.1f}s（应 < 5s）code={host_code}")
 
+# 27. T06：三文件批量编辑，三种编码与换行都要逐字节保持
+# 已有用 2 文件证明“全部预检后一次写入”；这里补“跨编码批量”这个组合。
+batch3_gbk = os.path.join(root, "batch3-gbk.txt")
+batch3_u16 = os.path.join(root, "batch3-u16.txt")
+batch3_lf = os.path.join(root, "batch3-lf.txt")
+open(batch3_gbk, "wb").write("第一行\r\n第二行\r\n".encode("gbk"))
+open(batch3_u16, "wb").write(b"\xff\xfe" + "alpha\r\nbeta\r\n".encode("utf-16-le"))
+open(batch3_lf, "wb").write("one\ntwo\n".encode("utf-8"))
+text, err = call("fs_edit", files=[
+    {"path": posix(batch3_gbk), "edits": [{"old": "第二行", "new": "改过的行"}]},
+    {"path": posix(batch3_u16), "edits": [{"old": "beta", "new": "GAMMA"}]},
+    {"path": posix(batch3_lf), "edits": [{"old": "two", "new": "TWO"}]},
+])
+check("三文件批量编辑一次写入",
+      not err and text.startswith("ok 3 个文件"), text[:200])
+check("批量编辑保持 GBK+CRLF",
+      open(batch3_gbk, "rb").read() == "第一行\r\n改过的行\r\n".encode("gbk"),
+      repr(open(batch3_gbk, "rb").read()))
+check("批量编辑保持 UTF-16LE+BOM",
+      open(batch3_u16, "rb").read() == b"\xff\xfe" + "alpha\r\nGAMMA\r\n".encode("utf-16-le"),
+      repr(open(batch3_u16, "rb").read()[:12]))
+check("批量编辑保持 LF",
+      open(batch3_lf, "rb").read() == "one\nTWO\n".encode("utf-8"),
+      repr(open(batch3_lf, "rb").read()))
+
+# 28. T07：歧义报错后按提示恢复，最终只改目标位置
+# 只断言“报错且磁盘未变”是不够的：要证明限制范围后能一次改对、且不遗漏同函数内应改的那处。
+recov = os.path.join(root, "recover-ambig.rs")
+open(recov, "w", encoding="utf-8", newline="\n").write(
+    "fn a() {\n    let x = limit;\n    let y = limit;\n}\n\nfn b() {\n    let z = limit;\n}\n")
+text, err = call("fs_edit", path=posix(recov),
+                 edits=[{"old": "limit", "new": "cap"}])
+check("歧义后首次调用被拒绝",
+      err is True and text.startswith("E_AMBIGUOUS"), text[:200])
+check("歧义被拒绝时磁盘未变",
+      "limit" in open(recov, encoding="utf-8").read())
+text, err = call("fs_edit", path=posix(recov),
+                 edits=[{"old": "limit", "new": "cap", "all": True, "start": 2, "end": 3}])
+body = open(recov, encoding="utf-8").read()
+check("歧义后按提示限定范围一次改对",
+      not err and text.startswith("ok 2 处修改")
+      and body == "fn a() {\n    let x = cap;\n    let y = cap;\n}\n\nfn b() {\n    let z = limit;\n}\n",
+      text[:200] + " | " + body.replace("\n", " / "))
+
+# 29. T08：未命中后按提示给出的实际内容恢复，不重复失败
+nomatch = os.path.join(root, "recover-nomatch.rs")
+open(nomatch, "w", encoding="utf-8", newline="\n").write(
+    "fn main() {\n    let total = 0;\n    println!();\n}\n")
+text, err = call("fs_edit", path=posix(nomatch),
+                 edits=[{"old": "let cnt = 0;", "new": "let cnt = 1;"}])
+check("未命中给出可用的实际内容",
+      err is True and text.startswith("E_NO_MATCH") and "let total = 0;" in text,
+      text[:300])
+candidates = re.findall(r"^\d+\|(.*)$", text, re.M)
+check("未命中候选可直接用作 old", bool(candidates), text[:300])
+if candidates:
+    text, err = call("fs_edit", path=posix(nomatch),
+                     edits=[{"old": candidates[0], "new": "    let cnt = 1;"}])
+    check("按候选行重试成功",
+          not err and text.startswith("ok 1 处修改")
+          and "let cnt = 1;" in open(nomatch, encoding="utf-8").read(),
+          text[:200])
+
+# 30. T09：外部修改造成 hash 陈旧后，重新核对再改，外部修改必须保留
+stale2 = os.path.join(root, "recover-stale.txt")
+open(stale2, "w", encoding="utf-8", newline="\n").write("alpha\n")
+st, _ = call("fs_stat", path=posix(stale2), detail="hash")
+stale_hash = st.split("hash=")[-1].strip()
+open(stale2, "w", encoding="utf-8", newline="\n").write("alpha\nexternal\n")
+text, err = call("fs_edit", path=posix(stale2), expect_hash=stale_hash,
+                 edits=[{"old": "alpha", "new": "mine"}])
+check("外部修改后 hash 陈旧被拒绝",
+      err is True and text.startswith("E_STALE"), text[:200])
+check("陈旧拒绝时外部修改仍在",
+      open(stale2, encoding="utf-8").read() == "alpha\nexternal\n")
+reread, _ = call("fs_read", path=posix(stale2))
+check("E_STALE 提示要求重新核对正文",
+      "fs_read" in text, text[:200])
+new_hash = reread.split("hash=")[-1].split()[0]
+text, err = call("fs_edit", path=posix(stale2), expect_hash=new_hash,
+                 edits=[{"old": "alpha", "new": "mine"}])
+body = open(stale2, encoding="utf-8").read()
+check("重新核对后用新 hash 改对且保留外部行",
+      not err and body == "mine\nexternal\n", text[:200] + " | " + body.replace("\n", " / "))
+
+# 31. T13：提交中途失败的故障注入（用占用句柄模拟锁定），完成清单必须与磁盘一致
+# 用 open(..., 'rb') 持有句柄：Windows 默认共享模式不允许 delete，原子改名会失败。
+# 不用 sleep 猜时序，失败点是确定的。
+part_a = os.path.join(root, "partial-a.txt")
+part_b = os.path.join(root, "partial-b.txt")
+open(part_a, "w", encoding="utf-8", newline="\n").write("alpha\n")
+open(part_b, "w", encoding="utf-8", newline="\n").write("beta\n")
+if sys.platform == "win32":
+    held = open(part_b, "rb")
+    try:
+        text, err = call("fs_edit", files=[
+            {"path": posix(part_a), "edits": [{"old": "alpha", "new": "A2"}]},
+            {"path": posix(part_b), "edits": [{"old": "beta", "new": "B2"}]},
+        ])
+    finally:
+        held.close()
+    a_body = open(part_a, encoding="utf-8").read()
+    b_body = open(part_b, encoding="utf-8").read()
+    check("中途失败报 E_BATCH_PARTIAL",
+          err is True and text.startswith("E_BATCH_PARTIAL"), text[:300])
+    check("中途失败报告“已写入 1/2”", "已写入 1/2" in text, text[:300])
+    check("中途失败时已写清单与实际一致",
+          "partial-a.txt" in text and a_body == "A2\n" and b_body == "beta\n",
+          f"a={a_body!r} b={b_body!r} | {text[:200]}")
+    check("中途失败提示只重发剩余文件",
+          "仅对剩余文件重发" in text, text[:300])
+    retry_hash, _ = call("fs_stat", path=posix(part_b), detail="hash")
+    retry_hash = retry_hash.split("hash=")[-1].strip()
+    retry, retry_err = call("fs_edit", files=[
+        {"path": posix(part_b), "expect_hash": retry_hash,
+         "edits": [{"old": "beta", "new": "B2"}]},
+    ])
+    check("只对剩余文件重试成功",
+          not retry_err and retry.startswith("ok 1 处修改")
+          and open(part_b, encoding="utf-8").read() == "B2\n", retry[:200])
+
+    # fs_write files 走另一条提交路径，报告形状也必须是“已写入 N/M”（P0 文档 F-8 旁边的差异）
+    wpart_a = os.path.join(root, "wpartial-a.txt")
+    wpart_b = os.path.join(root, "wpartial-b.txt")
+    open(wpart_a, "w", encoding="utf-8", newline="\n").write("old-a\n")
+    open(wpart_b, "w", encoding="utf-8", newline="\n").write("old-b\n")
+    held = open(wpart_b, "rb")
+    try:
+        wtext, werr = call("fs_write", files=[
+            {"path": posix(wpart_a), "content": "new-a\n"},
+            {"path": posix(wpart_b), "content": "new-b\n"},
+        ])
+    finally:
+        held.close()
+    check("fs_write 中途失败报告已写入数量",
+          werr is True and "已写入 1/2" in wtext, wtext[:300])
+    check("fs_write 中途失败时磁盘与报告一致",
+          open(wpart_a, encoding="utf-8").read() == "new-a\n"
+          and open(wpart_b, encoding="utf-8").read() == "old-b\n",
+          wtext[:300])
+else:
+    print("SKIP T13（非 Windows：故障注入依赖共享模式语义）")
+
+# 32. T16：长任务运行中只读调用不被阻塞，且任务状态可查
+# 用持久会话：先起后台长任务，再在同一连接上读多个文件；读必须亚秒返回。
+long_proc = subprocess.Popen([str(EXE), "mcp"], stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+def _sess_roundtrip(rid, name, arguments):
+    long_proc.stdin.write((json.dumps({
+        "jsonrpc": "2.0", "id": rid, "method": "tools/call",
+        "params": {"name": name, "arguments": arguments}}) + "\n").encode("utf-8"))
+    long_proc.stdin.flush()
+    while True:
+        line = long_proc.stdout.readline()
+        if not line:
+            raise RuntimeError("持久会话提前退出")
+        msg = json.loads(line.decode("utf-8"))
+        if msg.get("id") == rid:
+            return msg["result"]["content"][0]["text"]
+
+long_proc.stdin.write((json.dumps({
+    "jsonrpc": "2.0", "id": 1, "method": "initialize",
+    "params": {"protocolVersion": "2025-06-18", "capabilities": {}}}) + "\n").encode("utf-8"))
+long_proc.stdin.flush()
+long_proc.stdout.readline()
+started = _sess_roundtrip(2, "fs_exec", {
+    "program": "cmd", "args": ["/c", "ping", "-n", "8", "127.0.0.1"],
+    "background": True})
+check("长任务已启动", started.startswith("ok job="), started[:160])
+read_started = time.time()
+concurrent = _sess_roundtrip(3, "fs_read", {"paths": [posix(part_a)] * 3})
+read_elapsed = time.time() - read_started
+listed = _sess_roundtrip(4, "fs_exec", {"list": True})
+# 阈值取 2s：本机实测 ~1ms，但共享 runner 会慢；这里验的是「不排在长任务后面」，
+# 不是性能门禁（仓库约定不在共享 runner 上卡延迟）。
+check("长任务运行中只读调用不被阻塞",
+      "1|A2" in concurrent and read_elapsed < 2.0,
+      f"{read_elapsed:.2f}s | {concurrent[:80]}")
+check("长任务仍在运行且状态可查",
+      "running" in listed, listed[:160])
+long_proc.stdin.close()
+long_proc.terminate()
+long_proc.wait(timeout=15)
+
 passed = sum(1 for _, c, _ in results if c)
 print(f"\n{passed}/{len(results)} 通过   目录={root}")
 # 用完即清：临时夹具不留在磁盘上

@@ -1,0 +1,313 @@
+# fsops Agent 易用性评测基线（P0）
+
+> 编写日期：2026-11-10。对应计划：`docs/Agent易用性优化计划.md` 的 P0。
+> 本文只记录**已实测**的现状与缺口，不含产品改动。所有数字都是字符/字节口径，
+> 不是模型 token；没有指定 tokenizer 的地方不换算 token。
+
+## 1. 基线冻结
+
+| 项 | 值 |
+|---|---|
+| Git 提交 | `cf5eee2` `chore(release): 0.10.0`（2026-11-10 09:28 +0800） |
+| 工作区 | 无已跟踪文件改动；2 个未跟踪文档：`docs/Agent易用性优化计划.md`、本文 |
+| 版本 | 0.10.0；`python scripts/release.py check` 通过（Cargo.toml / Cargo.lock / package.json / CHANGELOG / 工具参考 / 使用指南 / 发布正文一致） |
+| 工具链 | rustc 1.99.1（2026-10-13）、cargo 1.99.1、Python 3.13.15、Node v24.22.0 |
+| 平台 | Windows 10.0.19045 x64 |
+| 被测二进制（debug） | `target/debug/fsops.exe` 89,358,425 B，sha256 `bbb3e1d21ee12cd6767e000be9c50ac8cac2aebf9f50ccc999e63fef4dafdac5`，构建于 2026-11-10 09:26:11 |
+| 被测二进制（release） | `target/release/fsops.exe` 3,495,936 B，sha256 `6ffa2dffd37fd023342b3ac4bcacdee7037e6715b0b28d072c09a085f706f55c` |
+
+二进制与源码的对应关系有两条证据，不是「看着像」：
+
+1. 两个二进制 `fsops schema` 输出逐字节相同（25,855 B，sha256 `be248b0652018fe2…`），说明 debug/release 工具定义一致；
+2. 冻结后再跑 `cargo build` 输出 `Finished dev profile … in 0.13s`（无重编译），说明 debug 二进制就是当前 HEAD 源码构建的产物。
+
+> 本机 `%LOCALAPPDATA%\fsops\fsops.exe`（宿主实际加载的副本）未纳入本次基线；
+> P1b 真实评测前必须重新核对它的版本与 hash，禁止用陈旧副本当候选。
+
+## 2. 复跑命令与基线结果
+
+| 命令 | 结果 |
+|---|---|
+| `cargo test` | 383 通过 / 0 失败，7.85 s |
+| `python tests/windows_semantics.py` | 186 / 186 通过，9.4 s |
+| `python tests/task_bench.py --exe target/debug/fsops.exe` | 9 场景全 PASS；66 次调用，入参 6,694 字符，输出 44,010 字符，2.34 s |
+| `node tests/dsh_plugin_smoke.mjs --exe target/debug/fsops.exe` | 89 项断言全通过，2.7 s |
+| `node scripts/gen_dsh_specs.mjs --check` / `gen_docs_tools.mjs --check` | 均无漂移 |
+| `python tests/bench.py` | 内置 fixture：3610 → 879（按该脚本的折算口径）；6 个子项 |
+| `python tests/release_tooling.py` | 21 / 21 通过 |
+| `powershell -File scripts/check.ps1 full` | 11 步全绿，36 s（含上述 e2e / 基准 / 生成物 / 冒烟） |
+
+### 任务基准逐场景基线（4 次复跑）
+
+calls 与 out 字符在 4 次复跑中完全一致；只有「后台任务轮询」的 calls 在 22–23 之间浮动（轮询节奏），因此合计 calls 为 65–66。
+
+| 场景 | calls | out 字符 | ms |
+|---|---:|---:|---:|
+| files 高密度分页 | 20 | 1,711 | 146 |
+| grep→block→续读 | 4 | 915 | 5 |
+| glob 预算分页 | 7 | 4,407 | 41 |
+| 正则编辑 dry_run+diff | 2 | 2,064 | 12 |
+| count 高密度 | 1 | 31 | 3 |
+| 多文件异构 reads | 6 | 1,372 | 4 |
+| 重复读不短路 | 2 | 31,224 | 3 |
+| repo map 排序 | 1 | 412 | 3 |
+| 后台任务轮询 | 22–23 | 1,874 | ~2,100 |
+| 合计 | 65–66 | 44,010 | ~2,340 |
+
+## 2.1 P1a 回归补缺后的数字（2026-11-10）
+
+P0 的基线数字保留在上一节，便于阶段对照；以下只列变化。
+
+| 命令 | P0 | P1a 后 | 变化 |
+|---|---|---|---|
+| `cargo test` | 383 | **386** | +3（T05 1、T10 2） |
+| `python tests/windows_semantics.py` | 186 | **210** | +24（T06 4、T07 3、T08 3、T09 4、T13 8、T16 2） |
+| `python tests/task_bench.py` | 9 场景 / 66 调用 / 44,010 字符 | **10 场景 / 69 调用 / 约 53.8k 字符** | +T15；+3 调用来自新场景，原 9 场景的 calls 与输出逐字不变；新场景输出随临时目录路径长度浮动（实测 53,795 / 53,817） |
+| `check.ps1 full` | 11 步 | **11 步全绿**，47 s | e2e 增加约 5 s（T10 单测另占 3 s） |
+
+T13 的故障注入不是 sleep 猜时序：用 `open(path, 'rb')` 持有句柄，Windows 默认共享模式不允许 delete，原子改名必然失败，失败点确定。两次独立执行的“已写入 1/2”与磁盘完全一致。
+
+## 3. 体积口径
+
+### 3.1 MCP 常驻成本
+
+| 项 | 字节 | 说明 |
+|---|---:|---|
+| `initialize.instructions` | 1,262 | 694 字符，14 个分句 |
+| `tools/list` 整条响应 | 17,897 | 9 个工具的 name/description/inputSchema |
+| └ description 合计 | 3,164 | 平均 352 B |
+| └ inputSchema 合计 | 14,225 | 含类型、枚举、描述与 `additionalProperties:false` |
+
+逐工具（description / inputSchema / 参数个数）：
+
+| 工具 | desc | schema | 参数数 |
+|---|---:|---:|---:|
+| fs_read | 660 | 3,252 | 14 |
+| fs_grep | 191 | 2,611 | 16 |
+| fs_edit | 518 | 2,370 | 7 |
+| fs_exec | 370 | 1,726 | 14 |
+| fs_glob | 279 | 1,456 | 12 |
+| fs_file | 338 | 904 | 10 |
+| fs_write | 275 | 911 | 6 |
+| fs_inspect | 268 | 591 | 5 |
+| fs_stat | 265 | 404 | 3 |
+
+这两个数字解释了两件事：
+
+- 常驻体积的 **80% 在 inputSchema**（14,225 / 17,389），不在单工具 description；只精简 description 的收益上限约 3.1 KB。
+- 描述里可省的部分很小：7 个工具的「优先(用本工具)替代 …」句合计 229 B（fs_read 66、fs_glob 36、fs_edit 35、fs_grep 34、fs_write 29、fs_stat 29）。
+
+### 3.2 其它投影
+
+| 产物 | 字节 | 备注 |
+|---|---:|---|
+| `initialize.instructions` | 1,262 | 服务端系统级引导 |
+| `integrate --rules` 写入的规则块（`RULE_BODY`） | 2,850 | 1,666 字符，34 条 |
+| 本仓库自己的 `AGENTS.md` | 3,567 | 2,041 字符，人工维护 |
+| `dsh/tool-specs.generated.js` | 23,169 | desc 3,318 + params 13,161；fs_exec 描述被 patch 到 524 B |
+| `docs/工具参考.md` | 36,931 | 人读文档 |
+
+## 4. 描述与引导流向（计划假设的修正）
+
+真源链是单向的，已逐层核对：
+
+```text
+src/tools.rs::build_tool_defs  ──fsops schema──►  scripts/gen_dsh_specs.mjs ──► dsh/tool-specs.generated.js
+        │                                                    ▲
+        │                                     dsh/excluded.js（EXCLUDED / DESCRIPTION_PATCHES）
+        └──fsops schema──► scripts/gen_docs_tools.mjs ──► README / 工具参考 / 使用指南 / package.json
+
+src/mcp.rs::instructions()      ──initialize──► 宿主
+src/adopt.rs::RULE_BODY         ──integrate──►  AGENTS.md / CLAUDE.md / .cursor 等
+```
+
+由此得到三点**修正**：
+
+1. **重复不在工具描述内部。** 逐工具 description 与 instructions 的分句重合数是 0/14；每个工具描述只讲自己的参数与局部约束。
+2. **真正的重复是 instructions ↔ RULE_BODY。** 用 difflib 做字符级比对，instructions 有 **47.1% 的字符**能在 RULE_BODY 里找到连续匹配（≥6 字符块）；最大块是「或 shell 的 cat/head/tail/grep/find/sed 处理文本」。两者都是 1–3 KB 级、每轮都会进上下文的文字，这才是 P2 该收敛的对象。
+3. **宿主侧还有第三份。** 仓库 `AGENTS.md` 由人维护，与上面两份**语义重叠但文案不同**（例如「2 分钟」「output=count」「工具发现」只在 AGENTS.md 里有）。P2 应先定义「哪份是权威、哪份是投影」，再谈删减，否则会把唯一入口删掉。
+
+### 事实分布矩阵（Y=有，.=无）
+
+| 事实 | instructions | RULE_BODY | 仓库 AGENTS.md | 工具描述 |
+|---|---|---|---|---|
+| 禁用 cat/head/tail/grep | Y | Y | Y | Y（fs_read） |
+| DOCX/PDF 走 fs_read | Y | Y | . | Y |
+| pattern/replacement | Y | Y | . | Y |
+| diff=true | Y | . | . | . |
+| reads=[…] | Y | Y | . | . |
+| focus= | Y | Y | . | . |
+| block=true | Y | Y | . | . |
+| map=true | Y | Y | . | Y |
+| 并行只读 | Y | Y | Y | . |
+| fs_exec argv | Y | Y | Y | . |
+| fs_file | Y | . | . | . |
+| output=count 统计口径 | . | Y | Y | . |
+| 回退边界 | Y | Y | . | . |
+| 前台 2 分钟 | Y | . | Y | . |
+
+缺口很明确：`diff=true` 只出现在 instructions；`fs_file` 在 RULE_BODY 与 AGENTS.md 里都没有；`output=count` 的「默认完整统计 / 本页可见」只在不进服务端的 RULE_BODY 与 AGENTS.md 里——宿主若忽略 instructions 也读不到 AGENTS.md，这条就没入口。
+
+## 5. fs_read 契约盘点
+
+### 5.1 模式与互斥（实测行为，不是读注释）
+
+| 组合 | 实际行为 |
+|---|---|
+| `path` + `paths` | 并集，一次读多个，共用 start/end（文档已说明，非冲突） |
+| `reads` + `path`/`paths`/`ranges`/`start`/`end`/`block`/`summary`/`focus` | `E_BAD_ARGS reads 不能与 {key} 同时使用` |
+| `tail` + `start`/`end`/`ranges`/`block`/`summary`/`focus`/`paths` | `E_BAD_ARGS tail 与 … 互斥` |
+| `summary` + `ranges`/`block`/`end` | `E_BAD_ARGS … summary=true 不能与 … 同时使用` |
+| `focus` + `paths`/`ranges`/`start`/`end`/`block`/`summary` | `E_BAD_ARGS focus 只能用于单文件 path…` |
+| `reads` + `tail` / `max_line` / `scan` | **静默忽略**（exit 0，按 reads 读，顶层参数无效果） |
+| `block` + `ranges` | **静默按 ranges 处理**（exit 0，返回区间内容） |
+
+后两行是本次盘点的**新发现**：它们是「无效调用但不报错」，属于 P4 的审计输入，不是 P0 要改的行为。
+
+### 5.2 预算与截断
+
+| 项 | 默认 / 规则 |
+|---|---|
+| fs_read budget | 32,768 B；单文件 ≤32 KB 且未显式给 budget 时自动读全文 |
+| 显式 start/end 或 ranges 且未给 budget | 按请求行数估算放宽，上限 64 KB |
+| paths 多文件 | 按文件大小分配；某文件分到的预算 <120 B 时 `E_BUDGET … 放不下文件头` |
+| reads | 顶层预算按项均分；每项 <120 B 时 `E_BUDGET … N 项只有 … 字节预算` |
+| max_line | 240 字符；`0` 不截断 |
+| >32 MB 文件 | `scan=window`（默认）只读到区间末尾，**不给全文 hash/总行数**；`scan=full` 全扫 |
+| fs_grep / fs_glob / fs_inspect budget | 均为 16,384 B |
+| 遍历时间预算 | grep 5,000 ms；glob 5,000 ms；inspect 3,000 ms（后两者实现里有 `time_budget_ms`/`no_ignore`，但 schema 未声明，见第 7 节） |
+
+### 5.3 续读提示（逐字实测）
+
+```text
+read 截断      … 1-41/400 行 | 续读: fs_read 同 path start=42
+read 多文件    … a-b/N 行 | 续读: fs_read path=<p> start=…
+read ranges    … 续读: fs_read 同 path ranges=[[a,b],…]
+glob 截断      … next_offset=2 | 续读: fs_glob offset=2（单位：匹配条目）
+grep 截断      … next_offset=3 | 续读: fs_grep offset=3 output=matches（单位：命中）
+```
+
+长行另有可重放命令：`… 有长行被截断（行 a-b）；最长截断行约 N 字节；重读该行: fs_read path=… start=a end=b max_line=0 budget≈N+200`。
+
+结论：**「续读提示可直接构造成下一次合法调用」这一条现在已基本满足**，P4 剩下的是覆盖完整性与「截断 vs 空结果」的区分，不是重造提示。尚未写成契约的有两点：
+
+- offset 不是快照（并发变化的目录不承诺无遗漏/无重复）——`docs/` 里找不到这句；
+- count 的精确数 vs 本页可见数，只有 `本页可见` 标记，没有集中说明。
+
+## 6. 错误恢复现状审计
+
+均用 `fsops call` 实测取真实返回。
+
+| 错误 | 现状文案（要点） | 事实是否齐全 | 缺口 |
+|---|---|---|---|
+| `E_AMBIGUOUS` | 命中数 + 行/列 + 每处上下文片段；建议顺序为「加更多上下文 → `all: true` → `start`/`end`」 | 齐 | **把 `all=true` 摆在限定范围之前**；计划 P3 明确要求「不得把 all=true 当默认答案」 |
+| `E_NO_MATCH` | 最接近的行（≤5）或全文首 3 行 + 总行数；「以上是实际内容；…直接用其中一行作为 old 重试」；范围限定模式额外给其他位置处数 | 齐 | 无；已可直接修正目标 |
+| `E_STALE` | `当前 hash=<h>；若改动仍适用，原样重试并改传 expect_hash=<h>；否则 fs_read 重新取正文` | 齐 | 「原样重试并改传 hash」写在最前，正好诱导跳过内容核对；P3 要调整**顺序与条件** |
+| `E_LOCKED` | `正被其他进程修改；已自动等待 3000ms，本次未写入任何内容，参数不变直接重试即可` | 等待时长、未写入 | 锁被**持续**占用时没有「停止重试并报告」的升级路径；工具侧固定 3000 ms，模型只能反复重试 |
+| `E_MIXED_EOL` | 主风格 + 显式 `normalize_eol=true` 的影响 | 齐 | 无；与 `E_STALE` 同现时已优先报陈旧并一次说清（有单测） |
+| `E_ENCODING_LOSS` | 码位 + 字符 + 行号 + `fs_file op=convert` 建议 + 「文件未修改」 | 齐 | 无 |
+| `E_BATCH`（预检失败） | `E_BATCH <path>: <内层错误>`；实测两文件均未改动 | 齐 | 无 |
+| `E_BATCH_PARTIAL`（提交中途失败） | `已写入 N/M；已写 a,b；失败 c: <err>；仅对剩余文件重发…` | 齐 | 只有函数级单测，**没有真实故障注入**；`fs_write files` 的中途失败用的是另一种文案（`E_BATCH …（已写入 N/M 个文件，其余未动）`），两处报告形状不一致 |
+
+磁盘保护实测：外部改动后 `E_STALE`，磁盘内容保持外部版本；批量预检失败后两个文件都未变。
+
+## 7. 已确认的产品问题（P2/P3/P4 的输入）
+
+| 编号 | 问题 | 证据 | 归属 |
+|---|---|---|---|
+| F-1 | `instructions` 与 `RULE_BODY` 47% 字符重复，两者都进上下文 | 第 4 节 difflib 比对 | P2 |
+| F-2 | `diff=true`、`fs_file` 只在 instructions 一处；`output=count` 口径不在任何服务端引导里 | 第 4 节矩阵 | P2 |
+| F-3 | 工具数注释写「8 个」而实际 9 个：`src/tools.rs:1`、`src/cli.rs:63`、`dsh/index.js:2,36`、`cordis.patch.yml:1`、`tests/dsh_plugin_smoke.mjs:8` | 生成器只同步 README/工具参考/使用指南/package.json，这些位置不在同步范围 | P2（文档/生成物） |
+| F-4 | `E_STALE` 先建议「改传新 hash 重试」，`E_AMBIGUOUS` 先建议 `all=true` | 第 6 节原文 | P3 |
+| F-5 | 锁持续占用无升级路径；`E_LOCKED` 工具侧固定 3000 ms | `src/tools.rs:5713,5980`、`src/io.rs:755` | P3 |
+| F-6 | `fs_inspect` 实现读取 `time_budget_ms`/`no_ignore`，但 schema 与文档都没有；传了会被 `additionalProperties:false` 拒绝 | 实测 `E_BAD_ARGS fs_inspect.time_budget_ms 是未知字段` | P4（契约一致性） |
+| F-7 | `reads` + `tail`/`max_line`/`scan`、`block` + `ranges` 静默忽略 | 第 5.1 节实测 | P4 |
+| F-8 | `docs/工具参考.md` 的 `E_LOCKED` 仍写「稍后重试」，与实际文案「参数不变直接重试」不一致 | 工具参考第 577 行 vs `src/io.rs:757` | P5（文档） |
+| F-9 | offset 不是快照、count 精确/部分口径没有任何成文契约 | 第 5.3 节 | P4 |
+
+## 8. 覆盖矩阵（计划第 5 节 T01–T16）
+
+判定口径：有确定性断言且校验磁盘/输出内容 = 覆盖；有断言但缺关键环节 = 部分；无断言 = 缺失。
+
+| 编号 | 任务 | 判定 | 证据 / 缺口 |
+|---|---|---|---|
+| T01 | 陌生小仓库定位并回答 | 部分 | `tests/bench.py` 内置 fixture；缺真实 Agent 侧 |
+| T02 | 大仓库按文件和符号缩范围 | 覆盖（确定性） | `map::tests::*`、`glob_map*`、`search::tests::默认跳过依赖目录…`、`walk::tests::glob_limit…`；大仓库规模本身未覆盖 |
+| T03 | 多文件不同范围读取 | 覆盖 | `tools::roundtrip_tests::reads*`、e2e「reads 一次读三文件」、task_bench「多文件异构 reads」 |
+| T04 | focus / block 定位上下文 | 覆盖 | `focus*` 6 项、`block*` 6 项、e2e「block=true 从函数内部展开」「focus 一次取回两个命中代码块」 |
+| T05 | 函数内两处重复文本 | 覆盖 | 新增 `tools::tests::行范围限定只改同函数内的两处相同字面量`：两处同改、同文件其他函数不动 |
+| T06 | 三文件批量修改 | 覆盖 | 新增 e2e「三文件批量编辑一次写入」：GBK+CRLF / UTF-16LE+BOM / UTF-8+LF 逐字节比对 |
+| T07 | 歧义后恢复 | 覆盖 | 新增 e2e 三项：首次 `E_AMBIGUOUS` → 磁盘未变 → 限定范围后一次改对且不波及同文件其他函数 |
+| T08 | 目标不匹配后恢复 | 覆盖 | 新增 e2e 三项：候选行可解析 → 直接用作 old 重试成功 |
+| T09 | 外部修改造成 hash 陈旧 | 覆盖 | 新增 e2e 四项：陈旧拒绝 → 外部修改仍在 → 重读拿新 hash → 改对且保留外部行 |
+| T10 | 锁短暂 / 持续占用 | 覆盖 | 新增 `锁短暂占用时等待后写入成功`（250ms 后成功）与 `锁持续占用时报出等待时长且不写入`（≥2900ms、E_LOCKED 含 3000ms、磁盘不变、释放后原参数重试成功） |
+| T11 | GBK / UTF-16 / BOM / CRLF | 覆盖 | e2e 6 项字节级断言 + `text::tests::*` |
+| T12 | 不可编码字符 / 混合换行拒绝 | 覆盖 | e2e 8 项 + `text::tests::编码损失…` |
+| T13 | 批量预检失败 / 提交中途失败 | 覆盖 | 预检：单测 + e2e（一个都不变）；中途失败：新增故障注入（占用句柄使 rename 失败）→ `E_BATCH_PARTIAL 已写入 1/2`、已写清单与磁盘一致、只重发剩余文件成功；`fs_write files` 同路径也验证 |
+| T14 | grep / glob 多页遍历 | 覆盖 | task_bench 2 场景、`grep_*`/`glob_*` 系列、e2e next_offset 重放 |
+| T15 | 长行 / >32 MB 窗口续读 | 覆盖 | 单测 `超大文件*` 8 项；新增 task_bench「>32MB 窗口续读」：窗口不伪造 hash/总行数、续读区间连续、`scan=full` 给精确值 |
+| T16 | 后台构建 + 并发只读 | 覆盖 | e2e background、`jobs::tests::*`、DSH 冒烟；新增 e2e「长任务运行中只读调用不被阻塞」：持久会话内起 8 次 ping，同连接 fs_read <2s 返回且 `list` 报 running |
+
+## 9. 评测资源口径与未确定项
+
+### 9.1 已确定
+
+- 真源与投影链（第 4 节），候选版本改动必须从 Rust 真源生成 DSH 与文档清单；
+- 确定性回归入口：`tests/task_bench.py`、`tests/windows_semantics.py`、`tests/dsh_plugin_smoke.mjs`，统一由 `scripts/check.ps1 full` 调用；
+- 现有 DSH subagent 流程能承载真实 Agent 对照（`docs/轮次实测.md` 用过）；
+- 夹具用 `TemporaryDirectory`/随机前缀，默认不留在仓库；README 已声明凭据不入库。
+
+### 9.2 未确定（P1b 前必须定）
+
+| 项 | 现状 | 需要的决定 |
+|---|---|---|
+| 模型与推理配置 | 未定 | 两侧同模型同配置；记录模型名与版本字符串 |
+| 宿主与工具发现 | 候选为 DSH subagent；MCP 直连也可复现 | 选一个主宿主，并记录两侧实际可见的描述 |
+| usage 获取 | DSH 调用日志可得调用次数/时间；token usage 是否可得未验证 | 若不可得，报告标「不可获取」，不猜 |
+| 预算 | 未授权外部付费调用 | 先 6 任务 × 3 次排查评测；正式 16 任务 × 5 次需另行授权 |
+| 版本矩阵 | 1.88+ / Windows 原生 | 只承诺 Windows；不扩 Linux |
+| 原生工具组 | 需禁用 fsops 并去掉「必须用 fsops」引导 | 两侧任务书与内容安全约束保持一致 |
+
+### 9.3 默认建议与成本估计
+
+建议顺序：**P1a（确定性补缺）→ 6×3 小规模真实对照 → P1b 正式规模**。理由：T10/T13/T16 的缺失可在零模型成本下补齐，先把「评测本身有 bug」的概率压掉，再花钱。
+
+成本用公式表达，不假装已测得：
+
+```text
+输入 token ≈ 运行数 × 平均调用轮次 × (常驻 schema/引导 + 累积上下文)
+运行数    = 任务数 × 每任务次数 × 2 侧
+```
+
+按 `docs/轮次实测.md` 的「约 6.5k 常驻 token、单任务 40 轮量级」做**假设**（不是新测量）：6×3×2=36 次运行、每次约 40 轮 × 平均 30k 输入 token ≈ 43M 输入 token；16×5×2=160 次运行 ≈ 190M。二者相差 4 倍以上，所以先用 6×3 校准「每次运行的实际 token 与轮次」，再决定正式规模。缓存命中率未知，账单不能由上下文长度直接推算。
+
+## 10. 结论
+
+### P0 验收
+
+- ✅ 每条优化输入都有实测证据或明确标为待验证（第 7 节 F-1…F-9）；
+- ✅ 基线可复跑，原始命令与数字在第 2 节；
+- ✅ 实际二进制与源码对应（第 1 节两条证据）；
+- ✅ 既有失败：0 项。`check.ps1 full` 11 步全绿，没有需要区分的环境问题。
+
+### P1a 验收
+
+计划 P1a 的验收是「确定性用例稳定通过」。现状：
+
+- ✅ 计划点名的 T05、T06、T07、T08、T09、T10、T13、T15、T16 全部由「部分/缺失」转为**有断言且校验磁盘的覆盖**（第 8 节矩阵已更新）；
+- ✅ 新增断言均为确定性，无 `sleep` 猜时序：锁用持锁线程 + 通道同步，部分写入用占用句柄制造确定的 rename 失败，长任务用持久会话 + 同连接回读；
+- ✅ `check.ps1 full` 仍 11 步全绿；原 9 个基准场景的 calls/输出与 P0 逐字一致，无回归；
+- ✅ **未修改任何产品代码**：本轮只动 `src/tools.rs` 的 `#[cfg(test)]` 模块与两个测试脚本。P1a 是测量能力补缺，不是行为变更。
+
+仍未覆盖（属 P1b 或后续阶段，不在 P1a 范围）：
+
+- T01 的真实 Agent 侧（命令行工具的确定性部分已覆盖）；
+- T02 的「大仓库规模」（目前 fixture 为小仓库，`map`/`walk` 有符号级断言但无限量级压测）；
+- T14 的「offset 在并发变化目录上的边界」——这属于 P4 的契约问题（F-9），不是断言缺口。
+
+对计划的两处修正应在 P2/P3 执行前生效：
+
+1. 「接入的工具描述出现相同公共说明」不成立——重复在 `instructions` ↔ `RULE_BODY`（47% 字符），工具描述本身是局部的；P2 的收益应主要从这两份 1–3 KB 文本与 14 KB inputSchema 里找。
+2. 「续读提示需重新构造」的前提不成立——现有提示已可直接重放；P4 的真实缺口是完整性口径（offset 非快照、count 精确/部分）与静默忽略参数（F-7）。
+
+下一步：P1b 需要先确认模型/宿主/usage 口径与预算（第 9.2 节），本机尚无外部付费调用授权，到此停。P2–P5 未开始。
