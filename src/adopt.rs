@@ -29,6 +29,8 @@ const RULE_BODY: &str = "## 文件操作：优先使用 fsops\n\n\
 - 局部修改只用 `fs_edit`，不要整文件读回再 `fs_write`；不知道确切原文时用 `pattern`/`replacement`，改完用 `diff=true` 自查。\n\
 - 读取方式（单文件、多文件异构、按模式取块、日志末尾）、搜索分页与统计口径、repo map，都写在对应工具的描述里；发调用前先看描述，不要靠试错拼参数。\n\
 - 同一次回复里可以并行发起多个只读调用。\n\
+- 陌生仓库先 fs_inspect（大仓库可用 repo map）建立上下文，再搜索定位、精准读取、批量修改并运行相关测试；不要靠反复全仓扫描或整文件回读推进。\n\
+- 多步骤任务跟踪进度；长构建/测试用 fs_exec 后台任务，完成前核对改动范围、测试结果和剩余风险。\n\
 - 跑 cargo/git/npm/python 用 `fs_exec` 的 argv 数组，不要用 PowerShell 拼命令行；复制/移动/删除/建目录用 `fs_file`。\n\
 - 仅当 fsops 不可用、超时，或目标是图片/不支持的二进制（旧版 `.doc`、压缩包等）时才回退。\n\
 - 如果 fsops 工具尚未出现在当前工具列表，先调用宿主的工具发现（如 tool_search）加载 fs_* schema；不要先用内置 Read/Bash 试一遍。\n\
