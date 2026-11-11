@@ -220,14 +220,16 @@ fsops harden claude --remove
 
 `harden` 安装 `PreToolUse` hook，拦截文本文件、DOCX 和 PDF 的 `Read/Grep/Glob`；图片、旧版 `.doc`、压缩包等二进制仍放行内置 `Read`。默认写项目 `.claude/settings.json`，加 `--user` 写用户级配置。
 
-详细规则见 [AGENTS.md](AGENTS.md)。推荐链路：
+详细规则见 [AGENTS.md](AGENTS.md)。默认开发闭环：
 
 ```text
-fs_inspect（陌生仓库；大仓库可用 repo map）
-  → fs_grep output=files / snippets
+fs_inspect（陌生仓库：规模、命中分布与样例）
+  → fs_glob map=true（大仓库按符号与引用优先级建立结构）
+  → fs_grep output=files 初筛 → output=snippets 定位
   → fs_read ranges / reads（DOCX/PDF 正文同样走 fs_read）
-  → fs_edit edits/files + expect_hash + diff=true
+  → fs_edit edits/files + expect_hash
      └ 只知道文本形状：pattern/replacement 正则替换，不必先抄原文
+  → 按需 fs_edit diff=true 自查（省一次全文回读）
   → 相关测试（长构建/测试用 fs_exec 后台任务）
   → 项目规定的最终检查
 ```
