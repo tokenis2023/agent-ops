@@ -323,6 +323,14 @@ mod tests {
     }
 
     #[test]
+    fn 引导包含开发闭环与进度跟踪() {
+        let text = instructions();
+        for needle in ["陌生仓库", "fs_inspect", "相关测试", "跟踪进度"] {
+            assert!(text.contains(needle), "引导缺少 {needle}: {text}");
+        }
+    }
+
+    #[test]
     fn 引导不复制工具描述里的参数枚举() {
         // P2：引导与工具描述 47% 字符重复时，两处都要每轮付费。
         // 这里钉住“参数名只住在一处”：引导不再列 reads=/focus=/map=true，

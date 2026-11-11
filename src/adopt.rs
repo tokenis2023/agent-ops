@@ -933,6 +933,14 @@ mod tests {
     }
 
     #[test]
+    fn 引导包含开发闭环与进度跟踪() {
+        let text = RULE_BODY;
+        for needle in ["陌生仓库", "fs_inspect", "相关测试", "跟踪进度"] {
+            assert!(text.contains(needle), "规则缺少 {needle}: {text}");
+        }
+    }
+
+    #[test]
     fn 规则正文不重复参数枚举() {
         // P0 实测：instructions ↔ RULE_BODY 字符级重合 47%。
         // 两份都要进上下文，参数枚举只能住一处（工具描述）。
