@@ -223,12 +223,13 @@ fsops harden claude --remove
 详细规则见 [AGENTS.md](AGENTS.md)。推荐链路：
 
 ```text
-fs_grep output=files
-  → fs_grep output=snippets
-  → fs_read ranges（DOCX/PDF 正文同样走 fs_read）
-  → fs_edit edits/files + expect_hash
+fs_inspect（陌生仓库；大仓库可用 repo map）
+  → fs_grep output=files / snippets
+  → fs_read ranges / reads（DOCX/PDF 正文同样走 fs_read）
+  → fs_edit edits/files + expect_hash + diff=true
      └ 只知道文本形状：pattern/replacement 正则替换，不必先抄原文
-  → fs_edit diff=true 自查改动（省一次全文回读）
+  → 相关测试（长构建/测试用 fs_exec 后台任务）
+  → 项目规定的最终检查
 ```
 
 关键规则：
