@@ -54,7 +54,7 @@ export const TOOL_SPECS = [
         }
       },
       "reads": {
-        "description": "一次读多个文件的不同区间，每项 {path,start?,end?,ranges?,block?,max_line?,scan?,budget?,focus?}；与 path/paths/ranges/start/end/block/summary/focus 互斥，预算按项均分",
+        "description": "一次读多个文件的不同区间，每项 {path,start?,end?,ranges?,block?,max_line?,scan?,budget?,focus?}；与 path/paths/ranges/start/end/block/summary/focus 互斥，预算按需分配（小文件先读满）",
         "type": "array",
         "items": {
           "type": "object",
@@ -64,7 +64,7 @@ export const TOOL_SPECS = [
               "type": "boolean"
             },
             "budget": {
-              "description": "该项独立预算；未给时与其他项均分顶层 budget",
+              "description": "该项独立预算；未给时按需分配顶层 budget（小文件先读满，剩余给大文件）",
               "type": "integer"
             },
             "end": {

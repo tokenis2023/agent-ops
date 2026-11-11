@@ -39,7 +39,7 @@ fn build_tool_defs() -> Vec<Value> {
                     "reads": {
                         "type": "array",
                         "maxItems": 20,
-                        "description": "一次读多个文件的不同区间，每项 {path,start?,end?,ranges?,block?,max_line?,scan?,budget?,focus?}；与 path/paths/ranges/start/end/block/summary/focus 互斥，预算按项均分",
+                        "description": "一次读多个文件的不同区间，每项 {path,start?,end?,ranges?,block?,max_line?,scan?,budget?,focus?}；与 path/paths/ranges/start/end/block/summary/focus 互斥，预算按需分配（小文件先读满）",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -50,7 +50,7 @@ fn build_tool_defs() -> Vec<Value> {
                                 "block": {"type": "boolean"},
                                 "max_line": {"type": "integer"},
                                 "scan": {"type": "string", "enum": ["window", "full"]},
-                                "budget": {"type": "integer", "description": "该项独立预算；未给时与其他项均分顶层 budget"},
+                                "budget": {"type": "integer", "description": "该项独立预算；未给时按需分配顶层 budget（小文件先读满，剩余给大文件）"},
                                 "focus": {"type": "string", "description": "该项只返回命中所在的完整代码块"}
                             },
                             "required": ["path"]
@@ -372,19 +372,26 @@ fn line_need_bytes(text: &str, line_no: usize) -> usize {
 
 /// 找到包含 `start` 行的整个代码块，返回 (起始行, 结束行)，均 1 基。
 ///
-/// 两种情形：
-/// - `start` 行自己开启一个跨行块 → 就是它本身（保持原有行为）
-/// - `start` 行在块内部（grep 的典型输出）→ 向前找最近的未闭合 `{` 所在行
+/// 三种情形：
+/// - `start` 行自己开启一个跨行块 → 从它开始（保持原有行为）
+/// - `start` 行是多行签名的首行（`{` 在后续行）→ 向后找到主体再配平
+/// - `start` 行在块内部（grep 的典型输出）→ 向前找最近的未闭合 `{` 所在行，
+///   再把起点向上扩到多行签名的首行
 ///
 /// 找不到时不猜测，调用方退回普通 start/end 语义。
 fn enclosing_block(lines: &[&str], start: usize) -> Option<(usize, usize)> {
     // 情形一：本行开启跨行块。单行内自平衡（如字符串里有 `{hash}`）不算开启。
     if let Some(end) = block_end(lines, start) {
         if end > start {
-            return Some((start, end));
+            return Some((extend_over_signature(lines, start), end));
         }
     }
-    // 情形二：向前扫描。反向统计花括号，第一个"未闭合的 {" 就是块起始行。
+    // 情形二：多行签名。`export function drawWave(` 这一行没有 `{`，主体在几行之后；
+    // 不先处理它，反向扫描只能拿到签名那一行，或卷进外层 class。
+    if let Some(range) = signature_block(lines, start) {
+        return Some(range);
+    }
+    // 情形三：向前扫描。反向统计花括号，第一个"未闭合的 {" 就是块起始行。
     let idx = start.checked_sub(1)?;
     if idx == 0 {
         return None;
@@ -411,7 +418,153 @@ fn enclosing_block(lines: &[&str], start: usize) -> Option<(usize, usize)> {
     if to < start {
         return None;
     }
-    Some((from, to))
+    // `) {` 开启的块属于上方的参数列表：只按花括号找起点会把整个签名切掉。
+    Some((extend_over_signature(lines, from), to))
+}
+
+/// 多行签名：`start` 行是声明头，主体 `{` 在后续行。
+///
+/// 只对「看起来没写完」的行生效（括号未闭合，或以 `(`/`,` 结尾、含声明关键字），
+/// 并要求签名闭合后紧跟 `{`：普通语句不会因此被扩成大块。
+fn signature_block(lines: &[&str], start: usize) -> Option<(usize, usize)> {
+    let first = lines.get(start.checked_sub(1)?)?;
+    let trimmed = first.trim();
+    // 以 `;` 结尾是一条完整语句，`}` 结尾是块的收尾，都不可能再开出代码块。
+    if trimmed.is_empty() || trimmed.ends_with(';') || trimmed.ends_with('}') {
+        return None;
+    }
+    let mut depth = paren_delta(trimmed);
+    if depth <= 0 && !declaration_head(trimmed) {
+        return None;
+    }
+    // 签名很少超过几十行；超出说明判断不可靠，不猜。
+    let limit = start.saturating_add(40).min(lines.len());
+    // 括号配平后还允许继续找主体的行数：覆盖 `where` 子句与 Allman 风格。
+    let mut flat = 0usize;
+    for line_no in start + 1..=limit {
+        let raw = lines[line_no - 1];
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            // 括号里允许空行（参数列表排版）；配平后的空行说明声明已经结束。
+            if depth <= 0 {
+                return None;
+            }
+            continue;
+        }
+        let mut opens = false;
+        for ch in raw.chars() {
+            match ch {
+                '(' | '[' => depth += 1,
+                ')' | ']' => depth -= 1,
+                '{' if depth <= 0 => opens = true,
+                _ => {}
+            }
+        }
+        if opens {
+            let end = block_end(lines, line_no)?;
+            return Some((start, end.max(start)));
+        }
+        if depth <= 0 {
+            flat += 1;
+            // 签名已配平：再给几行找主体（`where` 子句、Allman 风格），
+            // 碰到语句结束符就停，避免把下一段代码当成同一声明。
+            if trimmed.ends_with(';') || trimmed.ends_with('}') || trimmed.starts_with('}') {
+                return None;
+            }
+            if flat > 8 {
+                return None;
+            }
+        }
+    }
+    None
+}
+
+/// 判断一行是不是「块的声明头」：函数/类型定义或控制语句的参数列表跨行时，
+/// 这一行本身没有 `{`，主体在后面几行。
+fn declaration_head(line: &str) -> bool {
+    const KEYWORDS: &[&str] = &[
+        "fn",
+        "func",
+        "function",
+        "def",
+        "class",
+        "struct",
+        "enum",
+        "impl",
+        "trait",
+        "interface",
+        "namespace",
+        "module",
+        "record",
+        "if",
+        "for",
+        "while",
+        "switch",
+        "match",
+        "catch",
+        "else",
+        "loop",
+        "do",
+        "try",
+    ];
+    let trimmed = line.trim_end();
+    // 行尾的 `(` / `,` / `->` / `=>` 已经说明这一行没写完。
+    if trimmed.ends_with('(')
+        || trimmed.ends_with(',')
+        || trimmed.ends_with("->")
+        || trimmed.ends_with("=>")
+    {
+        return true;
+    }
+    trimmed
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .any(|word| KEYWORDS.contains(&word))
+}
+
+/// 把块起点向上扩到多行签名的首行。
+///
+/// `) {` 这种开启块的行属于上方的参数列表；只按花括号找起点会把整个签名切掉。
+fn extend_over_signature(lines: &[&str], from: usize) -> usize {
+    let mut top = from;
+    let mut steps = 0;
+    while top > 1 && steps < 40 {
+        steps += 1;
+        let prev = lines[top - 2].trim_end();
+        // 上一行已经结束了一条语句/一个块：签名不会跨过它。
+        if prev.is_empty() || prev.ends_with(';') || prev.ends_with('}') {
+            break;
+        }
+        // 只看有限窗口：签名不会横跨上百行，扫全前缀在大文件上是白花时间。
+        let floor = top.saturating_sub(40).max(1);
+        let open_above: i64 = lines[floor - 1..top - 1]
+            .iter()
+            .map(|line| paren_delta(line))
+            .sum();
+        let cur = lines[top - 1].trim_start();
+        let continues = open_above > 0
+            || cur.starts_with(')')
+            || cur.starts_with(',')
+            || cur.starts_with(']')
+            || (cur.starts_with('{') && (prev.ends_with(')') || prev.ends_with(']')));
+        if !continues {
+            break;
+        }
+        top -= 1;
+    }
+    top
+}
+
+/// `(`/`[` 记 +1，`)`/`]` 记 -1；字符串里的括号会算错，够用的近似。
+fn paren_delta(line: &str) -> i64 {
+    let mut delta = 0i64;
+    for ch in line.chars() {
+        match ch {
+            '(' | '[' => delta += 1,
+            ')' | ']' => delta -= 1,
+            _ => {}
+        }
+    }
+    delta
 }
 
 /// 把 grep 命中行展开成它所在的完整代码块（供 `fs_grep expand=block`）。
@@ -902,7 +1055,7 @@ fn render_summary(
     out
 }
 
-/// fs_read reads=[...]：把每项展开成一次独立读取，预算按项均分。
+/// fs_read reads=[...]：把每项展开成一次独立读取，预算按需分配（小文件先读满，剩余给大文件）。
 ///
 /// 递归复用单文件路径，编码/EOL/block/ranges 等语义全部自动继承；
 /// 某一项失败只影响该项，其余照常输出（整体由 MCP 层标记 isError）。
@@ -936,8 +1089,14 @@ fn read_items(args: &Value) -> String {
     ];
     let budget = arg_usize(args, "budget", render::DEFAULT_BUDGET);
     let force = arg_bool(args, "force", false);
-    // 预算按项均分；连文件头都放不下时明确拒绝，
-    // 避免 20 项各拿 256B 后总输出反超 budget。
+    // 预算按需分配：小文件先读满（它们再续读一轮更贵），剩下的按体积给大文件。
+    // 固定均分会让 28B 的小文件占着上千字节用不完，2.4KB 的文件只读到一半。
+    let need: Vec<usize> = items.iter().map(reads_item_need).collect();
+    let small_total: usize = need.iter().filter(|n| **n <= 1024).sum();
+    let big_total: usize = need.iter().filter(|n| **n > 1024).sum();
+    // 文件头、分隔与续读尾注要留余量，否则各项预算之和正好等于 budget。
+    let alloc_budget = budget.saturating_sub(64 + 40 * items.len());
+    // 连文件头都放不下时明确拒绝，避免 20 项各拿 256B 后总输出反超 budget。
     let per_item = budget / items.len();
     if per_item < 120 {
         return format!(
@@ -952,12 +1111,15 @@ fn read_items(args: &Value) -> String {
             out.push_str(&format!(
                 "E_BAD_ARGS reads[{index}] 必须是对象 {{path,start,end,...}}\n"
             ));
+            // 校验失败也是失败：否则头部统计会把被拒的项算成成功。
+            failed += 1;
             continue;
         };
         if obj.get("path").and_then(Value::as_str).is_none() {
             out.push_str(&format!(
                 "E_BAD_ARGS reads[{index}] 缺少字符串类型的 path\n"
             ));
+            failed += 1;
             continue;
         }
         let unknown: Vec<&str> = obj
@@ -970,12 +1132,26 @@ fn read_items(args: &Value) -> String {
                 "E_BAD_ARGS reads[{index}] 未知字段 {}；可用 path/start/end/ranges/block/max_line/scan/budget/focus\n",
                 unknown.join(",")
             ));
+            failed += 1;
             continue;
         }
         let mut single = obj.clone();
-        // 项内 budget 优先：大文件可以多要一点，小文件把额度让出来。
+        // 项内 budget 优先：显式额度不参与再分配。
         if obj.get("budget").is_none() {
-            single.insert("budget".to_string(), json!(per_item));
+            let share = if small_total * 2 <= alloc_budget {
+                if need[index] <= 1024 {
+                    need[index]
+                } else {
+                    alloc_budget
+                        .saturating_sub(small_total)
+                        .saturating_mul(need[index])
+                        / big_total.max(1)
+                }
+            } else {
+                // 小文件总量已吃掉一半以上预算：按需要比例分，保证总和 ≤ budget。
+                alloc_budget.saturating_mul(need[index]) / (small_total + big_total).max(1)
+            };
+            single.insert("budget".to_string(), json!(share.max(256)));
         }
         // 顶层 max_line / scan 对每一项都成立，传播而不是静默丢弃；
         // 项内显式值优先（允许单个超长行文件单独设 max_line=0）。
@@ -1024,6 +1200,55 @@ fn read_items(args: &Value) -> String {
     summary.push('\n');
     summary.push_str(out.trim_end());
     summary
+}
+
+/// `reads` 某一项读全需要的字节数：文件体积 + 文件头/行号/尾注余量。
+///
+/// 显式区间的项按行数估算上限，避免「1MB 文件只读 1 行」按体积把预算全占走。
+fn reads_item_need(item: &Value) -> usize {
+    let Some(path) = item.get("path").and_then(Value::as_str) else {
+        return 256;
+    };
+    let size = FsPath::parse(path)
+        .ok()
+        .and_then(|fp| io::meta(&fp).ok())
+        .map(|m| m.size as usize)
+        .unwrap_or(0);
+    let full = size.saturating_add(320);
+    let requested = reads_item_lines(item);
+    if requested == 0 {
+        full
+    } else {
+        requested.saturating_mul(160).saturating_add(320).min(full)
+    }
+}
+
+/// `reads` 项显式请求的行数；没给区间时返回 0（表示整个文件）。
+fn reads_item_lines(item: &Value) -> usize {
+    if let Some(ranges) = item.get("ranges").and_then(Value::as_array) {
+        let mut total = 0usize;
+        for pair in ranges.iter().filter_map(Value::as_array) {
+            let (Some(from), Some(to)) = (
+                pair.first().and_then(Value::as_u64),
+                pair.get(1).and_then(Value::as_u64),
+            ) else {
+                continue;
+            };
+            if from >= 1 && to >= from {
+                total = total.saturating_add((to - from + 1) as usize);
+            }
+        }
+        return total;
+    }
+    let start = item
+        .get("start")
+        .and_then(Value::as_u64)
+        .unwrap_or(1)
+        .max(1);
+    match item.get("end").and_then(Value::as_u64) {
+        Some(end) if end >= start => (end - start + 1) as usize,
+        _ => 0,
+    }
 }
 
 /// focus 最多返回的代码块数；再多应该用 fs_grep 缩小范围。
@@ -7317,7 +7542,7 @@ mod roundtrip_tests {
     }
 
     #[test]
-    fn reads预算按项均分且两项都有输出() {
+    fn reads预算拮据时两项都有输出() {
         let dir = 目录("reads-budget");
         let a = dir.join("a.txt");
         let b = dir.join("b.txt");
@@ -7480,6 +7705,179 @@ mod roundtrip_tests {
         let _ = fs::remove_dir_all(&dir);
         assert!(out.contains("仅显示前 12 处"), "{out}");
         assert!(out.contains("命中 20 处"), "{out}");
+    }
+
+    /// 多行签名的函数：命中行本身没有 `{`，主体在后续行。
+    /// 只返回签名那一行等于告诉模型「函数只有一行」，必须给出参数与函数体。
+    const 多行签名样例: &str = concat!(
+        "export function before() {}\n",
+        "\nexport function drawWave(\n",
+        "  points,\n",
+        "  color = '#fff',\n",
+        ") {\n",
+        "  const ctx = 1;\n",
+        "  return ctx;\n",
+        "}\n",
+    );
+
+    #[test]
+    fn focus命中多行函数签名时包含参数与函数体() {
+        let dir = 目录("focus-multiline-sig");
+        let path = dir.join("wave.js");
+        fs::write(&path, 多行签名样例).unwrap();
+        let posix = path.to_string_lossy().replace('\\', "/");
+        let out = call(
+            "fs_read",
+            &json!({"path": posix, "focus": "function drawWave"}),
+        );
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            out.contains("3|export function drawWave("),
+            "应包含签名首行: {out}"
+        );
+        assert!(out.contains("4|  points,"), "应包含多行参数: {out}");
+        assert!(out.contains("8|  return ctx;"), "应包含函数体: {out}");
+        assert!(out.contains("9|}"), "应包含函数结束括号: {out}");
+        assert!(!out.contains("before"), "不应卷进上一个函数: {out}");
+    }
+
+    #[test]
+    fn block在多行签名首行上包含参数与函数体() {
+        let dir = 目录("block-multiline-sig");
+        let path = dir.join("wave.js");
+        fs::write(&path, 多行签名样例).unwrap();
+        let posix = path.to_string_lossy().replace('\\', "/");
+        let out = call(
+            "fs_read",
+            &json!({"path": posix, "block": true, "start": 3}),
+        );
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            out.contains("3|export function drawWave("),
+            "应包含签名首行: {out}"
+        );
+        assert!(out.contains("4|  points,"), "应包含多行参数: {out}");
+        assert!(out.contains("9|}"), "应包含函数结束括号: {out}");
+    }
+
+    #[test]
+    fn focus命中函数体时块回到多行签名首行() {
+        let dir = 目录("focus-multiline-body");
+        let path = dir.join("wave.js");
+        fs::write(&path, 多行签名样例).unwrap();
+        let posix = path.to_string_lossy().replace('\\', "/");
+        let out = call("fs_read", &json!({"path": posix, "focus": "return ctx"}));
+        let _ = fs::remove_dir_all(&dir);
+        // 只按 `{` 找起点会从 `) {` 那行开始，参数列表就丢了。
+        assert!(
+            out.contains("3|export function drawWave("),
+            "块应从签名首行开始: {out}"
+        );
+        assert!(out.contains("4|  points,"), "应包含多行参数: {out}");
+    }
+
+    #[test]
+    fn focus命中类中多行方法时不会卷进整个类() {
+        let dir = 目录("focus-method-sig");
+        let path = dir.join("a.ts");
+        fs::write(
+            &path,
+            "class Wave {\n  other() {\n    return 1;\n  }\n\n  draw(\n    points,\n  ) {\n    return points;\n  }\n}\n",
+        )
+        .unwrap();
+        let posix = path.to_string_lossy().replace('\\', "/");
+        let out = call("fs_read", &json!({"path": posix, "focus": "draw"}));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(out.contains("6|  draw("), "应包含方法签名: {out}");
+        assert!(out.contains("7|    points,"), "应包含多行参数: {out}");
+        assert!(out.contains("9|    return points;"), "应包含方法体: {out}");
+        assert!(!out.contains("other"), "不应卷进同类里的其他方法: {out}");
+    }
+
+    #[test]
+    fn focus命中带where子句的签名时包含签名与主体() {
+        let dir = 目录("focus-where-sig");
+        let path = dir.join("a.rs");
+        fs::write(
+            &path,
+            "fn make<T>(value: T) -> Option<T>\nwhere\n    T: Clone,\n{\n    Some(value)\n}\n",
+        )
+        .unwrap();
+        let posix = path.to_string_lossy().replace('\\', "/");
+        let out = call("fs_read", &json!({"path": posix, "focus": "fn make"}));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(out.contains("1|fn make<T>"), "应包含签名首行: {out}");
+        assert!(out.contains("3|    T: Clone,"), "应包含 where 子句: {out}");
+        assert!(out.contains("5|    Some(value)"), "应包含函数体: {out}");
+    }
+
+    #[test]
+    fn focus不把多行调用扩成后面的大块() {
+        let dir = 目录("focus-call-not-block");
+        let path = dir.join("a.rs");
+        fs::write(
+            &path,
+            "fn f() {\n    let x = foo(\n        1,\n    );\n}\n\nfn g() {\n    let y = 2;\n}\n",
+        )
+        .unwrap();
+        let posix = path.to_string_lossy().replace('\\', "/");
+        let out = call("fs_read", &json!({"path": posix, "focus": "foo"}));
+        let _ = fs::remove_dir_all(&dir);
+        // 调用语句没有块，块边界仍是它所在的函数。
+        assert!(out.contains("1|fn f() {"), "应回到所在函数: {out}");
+        assert!(out.contains("4|    );"), "{out}");
+        assert!(!out.contains("fn g()"), "不应扩到后面的函数: {out}");
+    }
+
+    #[test]
+    fn reads校验失败的项计入失败数() {
+        let dir = 目录("reads-bad-item-stat");
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        fs::write(&a, "a1\n").unwrap();
+        fs::write(&b, "b1\n").unwrap();
+        let out = call(
+            "fs_read",
+            &json!({"reads": [
+                {"path": a.to_string_lossy().replace('\\', "/")},
+                {"path": b.to_string_lossy().replace('\\', "/"), "summary": true}
+            ]}),
+        );
+        let _ = fs::remove_dir_all(&dir);
+        // 头部统计必须与正文里的 E_ 行一致：被拒的项不能算成功。
+        assert!(
+            out.starts_with("ok reads 2 项：1 成功，1 失败"),
+            "统计应与错误项一致: {out}"
+        );
+        assert!(out.contains("E_BAD_ARGS"), "{out}");
+    }
+
+    #[test]
+    fn reads预算按需分配不浪费在小文件上() {
+        let dir = 目录("reads-budget-need");
+        let small = dir.join("small.txt");
+        let big = dir.join("big.txt");
+        fs::write(&small, "tiny\n").unwrap();
+        // 29 行、约 2.7KB：均分预算时大文件读不完。
+        let body: String = (1..=29)
+            .map(|i| {
+                format!("line{i:02} 这里是一行接近九十字节的正文，用来把单个文件做到两KB以上。\n")
+            })
+            .collect();
+        fs::write(&big, &body).unwrap();
+        let out = call(
+            "fs_read",
+            &json!({"reads": [
+                {"path": small.to_string_lossy().replace('\\', "/")},
+                {"path": big.to_string_lossy().replace('\\', "/")}
+            ], "budget": 4000}),
+        );
+        let _ = fs::remove_dir_all(&dir);
+        assert!(out.contains("tiny"), "{out}");
+        assert!(
+            out.contains("29|line29"),
+            "小文件用不完的预算应让给大文件: {out}"
+        );
     }
     #[test]
     fn 第二次同区间读返回未变更摘要() {

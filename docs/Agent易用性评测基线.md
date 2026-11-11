@@ -208,7 +208,7 @@ src/adopt.rs::RULE_BODY         ──integrate──►  AGENTS.md / CLAUDE.md 
 | fs_read budget | 32,768 B；单文件 ≤32 KB 且未显式给 budget 时自动读全文 |
 | 显式 start/end 或 ranges 且未给 budget | 按请求行数估算放宽，上限 64 KB |
 | paths 多文件 | 按文件大小分配；某文件分到的预算 <120 B 时 `E_BUDGET … 放不下文件头` |
-| reads | 顶层预算按项均分；每项 <120 B 时 `E_BUDGET … N 项只有 … 字节预算` |
+| reads | 顶层预算按需分配（小文件先读满，剩余按体积给大文件）；顶层预算/项数 <120 B 时 `E_BUDGET … N 项只有 … 字节预算` |
 | max_line | 240 字符；`0` 不截断 |
 | >32 MB 文件 | `scan=window`（默认）只读到区间末尾，**不给全文 hash/总行数**；`scan=full` 全扫 |
 | fs_grep / fs_glob / fs_inspect budget | 均为 16,384 B |
