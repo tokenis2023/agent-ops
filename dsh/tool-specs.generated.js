@@ -126,7 +126,7 @@ export const TOOL_SPECS = [
   },
   {
     "name": "fs_edit",
-    "description": "精确替换文本（old→new）或正则替换（pattern→replacement）：不知道确切原文时用 pattern，省掉为抄原文而做的一次 fs_read。两套参数必须二选一：old+new 或 pattern+replacement；同时给会报 E_BAD_EDIT。优先替代 patch/Edit/apply_patch。同文件多处用 edits，多文件用 files；全部预检通过才写入。结构调整后用 diff=true 自查改动片段，省一次全文回读。自动处理 CRLF/LF 并保留原编码；DOCX 不支持精确替换，请用 fs_write 整体重建。",
+    "description": "精确替换文本（old→new）或正则替换（pattern→replacement）：不知道确切原文时用 pattern，省掉为抄原文而做的一次 fs_read。两套参数必须二选一：old+new 或 pattern+replacement；同时给会报 E_BAD_EDIT。优先替代 patch/Edit/apply_patch。同文件多处用 edits，多文件用 files；全部预检通过才写入。最小形状：{path, edits:[{old, new}]}。结构调整后用 diff=true 自查改动片段，省一次全文回读。自动处理 CRLF/LF 并保留原编码；DOCX 不支持精确替换，请用 fs_write 整体重建。",
     "parameters": {
       "diff": {
         "description": "附带被替换的原文/新文片段（`@@ 行号` + `-原文` / `+新文`）；默认关闭，改结构后想自查时打开，可省一次 fs_read",
@@ -377,7 +377,7 @@ export const TOOL_SPECS = [
   {
     "name": "fs_grep",
     "readOnly": true,
-    "description": "正则流式搜索，优先替代 grep/rg/Select-String。按文件分组，支持 DOCX/PDF，output=files/count/matches/snippets；截断返回 next_offset。count 默认完整统计；显式给 limit 时按命中截断并标“本页可见”，不是总数。",
+    "description": "正则流式搜索，优先替代 grep/rg/Select-String。按文件分组，支持 DOCX/PDF，output=files/count/matches/snippets；截断返回 next_offset。count 默认完整统计；显式给 limit 时按命中截断并标“本页可见”，不是总数。最小形状：{pattern, path}；分页参数是 output/limit/offset。",
     "parameters": {
       "budget": {
         "description": "最终响应最多字节数，默认 16384",
@@ -482,7 +482,7 @@ export const TOOL_SPECS = [
   },
   {
     "name": "fs_exec",
-    "description": "执行程序（argv 数组，不经过 shell）。替代 PowerShell 跑 cargo/git/npm/python：没有引号/插值、2>&1、ErrorRecord、$LASTEXITCODE 问题。非零退出不是错误（前缀写 exit=N 非零，要当失败使用 check=true）；超时会结束整个进程树。启动任务必须给 program。DSH 插件形态支持后台任务（background/job/list/wait_ms/kill）：长命令用 background=true 立即拿 job，再用 job=<id> wait_ms=<毫秒> 一次等到退出，期间可以继续做别的调用。",
+    "description": "执行程序（program + args 数组，不经过 shell；参数名是 args，不是 argv）。替代 PowerShell 跑 cargo/git/npm/python：没有引号/插值、2>&1、ErrorRecord、$LASTEXITCODE 问题。非零退出不是错误（前缀写 exit=N 非零，要当失败使用 check=true）；超时会结束整个进程树。启动任务必须给 program。DSH 插件形态支持后台任务（background/job/list/wait_ms/kill）：长命令用 background=true 立即拿 job，再用 job=<id> wait_ms=<毫秒> 一次等到退出，期间可以继续做别的调用。",
     "parameters": {
       "args": {
         "description": "参数数组，每个参数独立，不拼字符串",
@@ -547,7 +547,7 @@ export const TOOL_SPECS = [
   },
   {
     "name": "fs_file",
-    "description": "文件管理：copy/move/remove/mkdir/convert/archive/extract。替代 PowerShell 的 Copy-Item/Move-Item/Remove-Item/New-Item 与压缩解压。必填映射：copy/move/archive/extract 要 src+dst；remove/mkdir/convert 要 path；remove 必须再给 confirm=true。convert 需 encoding；只改换行也要给 encoding（如 utf-8）。",
+    "description": "文件管理：copy/move/remove/mkdir/convert/archive/extract。替代 PowerShell 的 Copy-Item/Move-Item/Remove-Item/New-Item 与压缩解压。必填映射：copy/move/archive/extract 要 src+dst；remove/mkdir/convert 要 path；remove 必须再给 confirm=true。最小形状：{op:\"copy\", src, dst}；参数名是 op，不是 operation。convert 需 encoding；只改换行也要给 encoding（如 utf-8）。",
     "parameters": {
       "confirm": {
         "description": "remove 必须显式传 true",

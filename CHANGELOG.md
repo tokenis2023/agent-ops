@@ -2,6 +2,32 @@
 
 本项目使用语义化版本。日期为发布日。
 
+## [0.11.3] - 2026-11-14
+
+本版按真实会话取证（255 次 fsops 调用、4 次参数校验错、1 次仓库本地 CLI 假启动）修 Agent 易用性，不改 schema 字段、错误码与文件写入行为。
+
+### 描述误导与参数形状
+
+- `fs_exec` 描述原写「argv 数组」而参数名是 `args`，实测造成模型首调校验失败；改为「program + args 数组」并点明参数名，adopt 引导文案同步。
+- `fs_edit` / `fs_file` / `fs_grep` 描述补最小形状：`{path, edits:[{old, new}]}`、`{op:"copy", src, dst}`、`{pattern, path}`，对应实测的顶层 old/new、`operation`、宿主 `output_mode` 三类误用。描述净增约 160 字符，是换失败往返的有意交换。
+
+### fs_exec 解析仓库本地 CLI
+
+- 从 cwd 向上各级 `node_modules/.bin` 前置进 PATH（nearest 优先），electron-vite / vitest / tsc 等不必写绝对路径；用户显式 `env.PATH` 仍在其后覆盖。
+
+### diff 截断给续读落点
+
+- `fs_edit diff=true` 超 60 行时标注「自 N 行起未显示；用 fs_read 该区间核对剩余改动」，不再只说「已截断」让模型整文件回读。
+
+### 测试
+
+- 新增 2 条单测（PATH 探针、截断落点）；414 单测、`scripts/check.ps1 full` 11 项全绿（含真实 MCP e2e、任务级基准、版本一致性、生成物无漂移）。
+
+### 升级注意
+
+- PATH 前置会让原本 E_NOT_FOUND 的仓库本地命令变为可执行，属修复；其余返回格式不变。
+- 未做真实模型对照，不声称调用次数或成功率提升。
+
 ## [0.11.2] - 2026-11-12
 
 本版修复 `fs_read` 的两处实测问题：多行函数签名只能取到一行，`reads` 的成功统计与预算分配和实际结果矛盾。

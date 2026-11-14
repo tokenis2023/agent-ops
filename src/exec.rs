@@ -15,6 +15,38 @@ const DEFAULT_TIMEOUT_MS: usize = 120_000;
 const MAX_TIMEOUT_MS: usize = 600_000;
 const DEFAULT_MAX_OUTPUT: usize = 32 * 1024;
 
+/// 把 cwd（缺省为进程 cwd）向上各级的 node_modules/.bin 接进 PATH，nearest 优先。
+/// 仓库本地 CLI（electron-vite、vitest、tsc 等）因此不必写绝对路径；
+/// 用户显式给的 env.PATH 仍在其后覆盖，保持原有控制权。
+fn prepend_repo_bin(command: &mut Command, args: &Value) {
+    let start = match crate::tools::arg_str(args, "cwd") {
+        Some(dir) => match crate::paths::FsPath::parse(dir) {
+            Ok(p) => p.native().to_path_buf(),
+            Err(_) => return,
+        },
+        None => match std::env::current_dir() {
+            Ok(p) => p,
+            Err(_) => return,
+        },
+    };
+    let sep = if cfg!(windows) { ";" } else { ":" };
+    let mut prefix = String::new();
+    for dir in start.ancestors() {
+        let bin = dir.join("node_modules").join(".bin");
+        if bin.is_dir() {
+            if !prefix.is_empty() {
+                prefix.push_str(sep);
+            }
+            prefix.push_str(&bin.to_string_lossy());
+        }
+    }
+    if prefix.is_empty() {
+        return;
+    }
+    let existing = std::env::var("PATH").unwrap_or_default();
+    command.env("PATH", format!("{prefix}{sep}{existing}"));
+}
+
 /// 构建 Command：前台与后台任务共用同一套参数解析。
 pub fn build_command(args: &Value) -> Result<(Command, String), String> {
     let Some(program) = crate::tools::arg_str(args, "program") else {
@@ -59,6 +91,7 @@ pub fn build_command(args: &Value) -> Result<(Command, String), String> {
         }
         command.current_dir(cwd.wide());
     }
+    prepend_repo_bin(&mut command, args);
     if let Some(env) = args.get("env").and_then(Value::as_object) {
         for (key, value) in env {
             if let Some(text) = value.as_str() {
@@ -446,6 +479,23 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cwd向上各级的node_modules_bin进path() {
+        let root = std::env::temp_dir().join(format!("fsops-repo-bin-{}", std::process::id()));
+        let bin = root.join("node_modules").join(".bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("fsops-probe.exe"), b"").unwrap();
+        let nested = root.join("packages").join("app");
+        std::fs::create_dir_all(&nested).unwrap();
+        let out = run(&json!({
+            "program": "where.exe",
+            "args": ["fsops-probe.exe"],
+            "cwd": nested.to_string_lossy(),
+        }));
+        assert!(out.contains(".bin"), "{out}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

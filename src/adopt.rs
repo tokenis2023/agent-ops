@@ -21,7 +21,7 @@ const RULE_BODY: &str = "## 文件操作：优先使用 fsops\n\n\
 - 修改：`fs_edit`（替代 patch / Edit / apply_patch）\n\
 - 覆盖或新建：`fs_write`（替代 write_file / Write）\n\
 - 元信息：`fs_stat`（替代 stat / ls / Get-Item）\n\
-- 执行命令：`fs_exec`（argv 数组，不经过 shell；替代 PowerShell 的 cmd 字符串）\n\
+- 执行命令：`fs_exec`（args 数组，不经过 shell；替代 PowerShell 的 cmd 字符串）\n\
 - 文件管理：`fs_file`（copy/move/remove/mkdir/convert/archive/extract）\n\n\
 规则：\n\
 - 只要 fsops 可用，就不要用宿主内置文件工具或 shell 的 cat/head/tail/grep/find/sed 处理文本。\n\
@@ -31,7 +31,7 @@ const RULE_BODY: &str = "## 文件操作：优先使用 fsops\n\n\
 - 同一次回复里可以并行发起多个只读调用。\n\
 - 陌生仓库先 fs_inspect（大仓库可用 fs_glob 的 repo map）建立上下文，再搜索定位、精准读取、批量修改并运行相关测试；不要靠反复全仓扫描或整文件回读推进。\n\
 - 多步骤任务跟踪进度；长构建/测试用 fs_exec 后台任务，完成前核对改动范围、测试结果和剩余风险。\n\
-- 跑 cargo/git/npm/python 用 `fs_exec` 的 argv 数组，不要用 PowerShell 拼命令行；复制/移动/删除/建目录用 `fs_file`。\n\
+- 跑 cargo/git/npm/python 用 `fs_exec` 的 args 数组，不要用 PowerShell 拼命令行；复制/移动/删除/建目录用 `fs_file`。\n\
 - 仅当 fsops 不可用、超时，或目标是图片/不支持的二进制（旧版 `.doc`、压缩包等）时才回退。\n\
 - 如果 fsops 工具尚未出现在当前工具列表，先调用宿主的工具发现（如 tool_search）加载 fs_* schema；不要先用内置 Read/Bash 试一遍。\n\
 - 如果宿主不支持工具发现或加载失败，直接用 `fsops read/grep/glob/stat/call` CLI，仍然不要退回 cat/grep/find。\n";

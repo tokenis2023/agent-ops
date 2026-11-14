@@ -86,7 +86,7 @@ fn build_tool_defs() -> Vec<Value> {
         }),
         json!({
             "name": "fs_edit",
-            "description": "精确替换文本（old→new）或正则替换（pattern→replacement）：不知道确切原文时用 pattern，省掉为抄原文而做的一次 fs_read。两套参数必须二选一：old+new 或 pattern+replacement；同时给会报 E_BAD_EDIT。优先替代 patch/Edit/apply_patch。同文件多处用 edits，多文件用 files；全部预检通过才写入。结构调整后用 diff=true 自查改动片段，省一次全文回读。自动处理 CRLF/LF 并保留原编码；DOCX 不支持精确替换，请用 fs_write 整体重建。",
+            "description": "精确替换文本（old→new）或正则替换（pattern→replacement）：不知道确切原文时用 pattern，省掉为抄原文而做的一次 fs_read。两套参数必须二选一：old+new 或 pattern+replacement；同时给会报 E_BAD_EDIT。优先替代 patch/Edit/apply_patch。同文件多处用 edits，多文件用 files；全部预检通过才写入。最小形状：{path, edits:[{old, new}]}。结构调整后用 diff=true 自查改动片段，省一次全文回读。自动处理 CRLF/LF 并保留原编码；DOCX 不支持精确替换，请用 fs_write 整体重建。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -188,7 +188,7 @@ fn build_tool_defs() -> Vec<Value> {
         }),
         json!({
             "name": "fs_grep",
-            "description": "正则流式搜索，优先替代 grep/rg/Select-String。按文件分组，支持 DOCX/PDF，output=files/count/matches/snippets；截断返回 next_offset。count 默认完整统计；显式给 limit 时按命中截断并标“本页可见”，不是总数。",
+            "description": "正则流式搜索，优先替代 grep/rg/Select-String。按文件分组，支持 DOCX/PDF，output=files/count/matches/snippets；截断返回 next_offset。count 默认完整统计；显式给 limit 时按命中截断并标“本页可见”，不是总数。最小形状：{pattern, path}；分页参数是 output/limit/offset。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -239,7 +239,7 @@ fn build_tool_defs() -> Vec<Value> {
         }),
         json!({
             "name": "fs_exec",
-            "description": "执行程序（argv 数组，不经过 shell）。替代 PowerShell 跑 cargo/git/npm/python：没有引号/插值、2>&1、ErrorRecord、$LASTEXITCODE 问题。非零退出不是错误（前缀写 exit=N 非零，要当失败使用 check=true）；超时会结束整个进程树。启动任务必须给 program；只轮询/终止用 job=<id>，列任务用 list=true。",
+            "description": "执行程序（program + args 数组，不经过 shell；参数名是 args，不是 argv）。替代 PowerShell 跑 cargo/git/npm/python：没有引号/插值、2>&1、ErrorRecord、$LASTEXITCODE 问题。非零退出不是错误（前缀写 exit=N 非零，要当失败使用 check=true）；超时会结束整个进程树。启动任务必须给 program；只轮询/终止用 job=<id>，列任务用 list=true。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -263,7 +263,7 @@ fn build_tool_defs() -> Vec<Value> {
         }),
         json!({
             "name": "fs_file",
-            "description": "文件管理：copy/move/remove/mkdir/convert/archive/extract。替代 PowerShell 的 Copy-Item/Move-Item/Remove-Item/New-Item 与压缩解压。必填映射：copy/move/archive/extract 要 src+dst；remove/mkdir/convert 要 path；remove 必须再给 confirm=true。convert 需 encoding；只改换行也要给 encoding（如 utf-8）。",
+            "description": "文件管理：copy/move/remove/mkdir/convert/archive/extract。替代 PowerShell 的 Copy-Item/Move-Item/Remove-Item/New-Item 与压缩解压。必填映射：copy/move/archive/extract 要 src+dst；remove/mkdir/convert 要 path；remove 必须再给 confirm=true。最小形状：{op:\"copy\", src, dst}；参数名是 op，不是 operation。convert 需 encoding；只改换行也要给 encoding（如 utf-8）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2377,6 +2377,25 @@ mod tests {
         assert!(desc("fs_file").contains("src") && desc("fs_file").contains("confirm"));
         assert!(desc("fs_exec").contains("program") && desc("fs_exec").contains("job"));
         assert!(desc("fs_stat").contains("path") && desc("fs_stat").contains("paths"));
+        // 参数形状要写在描述里：实测模型会拿宿主工具的参数名套（argv/operation/output_mode）。
+        assert!(desc("fs_exec").contains("args 数组") && !desc("fs_exec").contains("argv 数组"));
+        assert!(desc("fs_edit").contains("最小形状"));
+        assert!(desc("fs_file").contains("最小形状"));
+        assert!(desc("fs_grep").contains("最小形状"));
+    }
+
+    #[test]
+    fn diff截断给出续读落点() {
+        let hunks: Vec<crate::edit::Hunk> = (1..=80)
+            .map(|i| crate::edit::Hunk {
+                line: i,
+                old: format!("old{i}"),
+                new: format!("new{i}"),
+            })
+            .collect();
+        let out = render_hunks(&hunks);
+        assert!(out.contains("diff 已截断"), "{out}");
+        assert!(out.contains("自 31 行起"), "{out}");
     }
 
     #[test]
@@ -6321,8 +6340,10 @@ fn render_hunks(hunks: &[crate::edit::Hunk]) -> String {
     const MAX_LINES: usize = 60;
     let mut out = String::new();
     let mut shown = 0usize;
+    let mut omitted_line: Option<usize> = None;
     for h in hunks {
         if shown >= MAX_LINES {
+            omitted_line = Some(h.line);
             break;
         }
         out.push_str(&format!("\n@@ {}", h.line));
@@ -6342,7 +6363,13 @@ fn render_hunks(hunks: &[crate::edit::Hunk]) -> String {
         }
     }
     if shown >= MAX_LINES {
-        out.push_str("\n… diff 已截断");
+        // 截断要给续读落点：否则模型只能整文件回读，diff 省下的那一轮又赔回去。
+        match omitted_line {
+            Some(line) => out.push_str(&format!(
+                "\n… diff 已截断（自 {line} 行起未显示；用 fs_read 该区间核对剩余改动）"
+            )),
+            None => out.push_str("\n… diff 已截断"),
+        }
     }
     out
 }
