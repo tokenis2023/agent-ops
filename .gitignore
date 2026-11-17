@@ -6,3 +6,4 @@ node_modules/
 __pycache__/
 *.pyc
 *.fsops-tmp-*
+tests/agent_bench_out/

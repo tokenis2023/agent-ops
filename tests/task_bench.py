@@ -76,9 +76,10 @@ def pick_exe(explicit: str | None) -> Path:
 class Mcp:
     """持久 MCP 客户端：initialize 一次，之后顺序调用，逐条读响应。"""
 
-    def __init__(self, exe: Path):
+    def __init__(self, exe: Path, cwd: Path | None = None):
         self.proc = subprocess.Popen(
             [str(exe), "mcp"],
+            cwd=str(cwd) if cwd else None,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
