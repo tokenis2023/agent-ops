@@ -254,8 +254,25 @@ fn err_resp(id: Value, code: i64, msg: &str) -> Value {
 /// 参数级事实（参数名、互斥、默认预算、统计口径）写在 `tools.rs` 的工具描述里，
 /// 宿主忽略本字段时也能靠 tools/list 拼出合法调用。
 /// 与 `adopt::RULE_BODY` 分工相同：本字段是短路由，RULE_BODY 是项目规则文件。
-pub fn instructions() -> &'static str {
-    "文件读写、搜索、编辑、元信息操作优先使用 fs_* 工具。只要 fsops 可用，不要用宿主内置 read_file/write_file/search_files 或 shell 的 cat/head/tail/grep/find/sed 处理文本；仅当 fsops 不可用、超时，或目标是图片/不支持的二进制时回退。DOCX/PDF 正文走 fs_read。局部修改用 fs_edit，不要整文件读回再 fs_write；不知道确切原文时用 pattern/replacement，改完用 diff=true 自查。同一次回复里可以并行发起多个只读调用；fs_read 的四种常用模式、fs_glob 的 repo map、fs_grep 的统计口径都写在各自描述里，发调用前先看。跑 cargo/git/npm 用 fs_exec 的 argv 数组，文件复制/移动/删除/建目录用 fs_file，不要用 PowerShell 拼命令行。前台 fs_exec 保持 2 分钟内（宿主对单次工具调用有更短超时）；更长的构建/测试用 background=true 拿 job id，再用 {\"job\":N,\"wait_ms\":60000} 一次等到退出，别反复短轮询。陌生仓库先 fs_inspect（大仓库可用），开发任务按定位→精准读取→批量修改→相关测试推进，多步骤任务跟踪进度。"
+const INSTRUCTIONS_BODY: &str = "文件读写、搜索、编辑、元信息操作优先使用 fs_* 工具。只要 fsops 可用，不要用宿主内置 read_file/write_file/search_files 或 shell 的 cat/head/tail/grep/find/sed 处理文本；仅当 fsops 不可用、超时，或目标是图片/不支持的二进制时回退。DOCX/PDF 正文走 fs_read。局部修改用 fs_edit，不要整文件读回再 fs_write；不知道确切原文时用 pattern/replacement，改完用 diff=true 自查。同一次回复里可以并行发起多个只读调用；fs_read 的四种常用模式、fs_glob 的 repo map、fs_grep 的统计口径都写在各自描述里，发调用前先看。跑 cargo/git/npm 用 fs_exec 的 argv 数组，文件复制/移动/删除/建目录用 fs_file，不要用 PowerShell 拼命令行。前台 fs_exec 保持 2 分钟内（宿主对单次工具调用有更短超时）；更长的构建/测试用 background=true 拿 job id，再用 {\"job\":N,\"wait_ms\":60000} 一次等到退出，别反复短轮询。陌生仓库先 fs_inspect（大仓库可用），开发任务按定位→精准读取→批量修改→相关测试推进，多步骤任务跟踪进度。";
+
+/// 当前目录的 POSIX 显示；取不到时给 `?`，不阻断 initialize。
+pub fn cwd_display() -> String {
+    std::env::current_dir()
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| "?".to_string())
+}
+
+/// 引导尾部带上服务端当前目录。
+///
+/// MCP 服务进程可能被宿主以任意 cwd 启动，而工具的相对路径按它解析。
+/// 不告诉模型就会静默读错目录——实测宿主 cwd 是用户主目录时，`fs_read Cargo.toml`
+/// 读到的是 `C:\Users\Administrator\Cargo.toml`，模型试了三次才换绝对路径。
+pub fn instructions() -> String {
+    format!(
+        "{INSTRUCTIONS_BODY}当前目录：{}（相对路径按它解析；fs_stat detail=server 也可确认）。",
+        cwd_display()
+    )
 }
 
 // 多文件响应里错误可能出现在任意一行；实现已移到 `tools::has_error_line`，
