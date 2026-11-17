@@ -12,6 +12,7 @@ use crate::render::{self, RenderOpts};
 use crate::search::{self, GrepOpts, GrepOutput};
 use crate::walk::{self, WalkOpts};
 use serde_json::{json, Value};
+use std::borrow::Cow;
 
 /// 工具定义（schema）的缓存。
 ///
@@ -35,11 +36,11 @@ fn build_tool_defs() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "文件路径，如 /d/repo/app/src/main.rs"},
-                    "paths": {"type": "array", "items": {"type": "string"}, "maxItems": 20, "description": "一次读多个文件（最多 20 个），所有文件共用 start/end"},
+                    "paths": {"type": "array", "items": {"type": "string"}, "maxItems": 20, "description": "多文件、共用 start/end，最多 20 个"},
                     "reads": {
                         "type": "array",
                         "maxItems": 20,
-                        "description": "一次读多个文件的不同区间，每项 {path,start?,end?,ranges?,block?,max_line?,scan?,budget?,focus?}；与 path/paths/ranges/start/end/block/summary/focus 互斥，预算按需分配（小文件先读满）",
+                        "description": "多文件异构批量：项内支持 path/start/end/ranges/block/max_line/scan/budget/focus（语义同顶层）；与顶层 path/paths/ranges/start/end/block/summary/focus 互斥",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -50,18 +51,18 @@ fn build_tool_defs() -> Vec<Value> {
                                 "block": {"type": "boolean"},
                                 "max_line": {"type": "integer"},
                                 "scan": {"type": "string", "enum": ["window", "full"]},
-                                "budget": {"type": "integer", "description": "该项独立预算；未给时按需分配顶层 budget（小文件先读满，剩余给大文件）"},
-                                "focus": {"type": "string", "description": "该项只返回命中所在的完整代码块"}
+                                "budget": {"type": "integer"},
+                                "focus": {"type": "string"}
                             },
                             "required": ["path"]
                         }
                     },
                     "start": {"type": "integer", "description": "起始行（1 基）"},
                     "end": {"type": "integer", "description": "结束行（含）；用 block=true 时可省略"},
-                    "block": {"type": "boolean", "description": "返回包含 start 行的整个代码块（自动向前找块起始、向后配平结束）；配合 fs_grep 的行号用，命中行在函数内部也能展开"},
+                    "block": {"type": "boolean", "description": "展开包含 start 行的整个代码块（配合 fs_grep 行号）"},
                     "ranges": {
                         "type": "array",
-                        "description": "单文件多段行区间，如 [[1,2],[8,9]]；优先于 start/end",
+                        "description": "单文件多段区间，如 [[1,2],[8,9]]；优先于 start/end",
                         "items": {
                             "type": "array",
                             "items": {"type": "integer", "minimum": 1},
@@ -69,36 +70,36 @@ fn build_tool_defs() -> Vec<Value> {
                             "maxItems": 2
                         }
                     },
-                    "budget": {"type": "integer", "description": "最多返回字节数，默认 32768（约 8K token）；文件 ≤32KB 且未显式指定时自动读全文"},
-                    "max_line": {"type": "integer", "description": "每行最多字符数，默认 240；0 表示不截断长行"},
+                    "budget": {"type": "integer", "description": "最多返回字节，默认 32768；≤32KB 且未指定时读全文"},
+                    "max_line": {"type": "integer", "description": "每行最多字符，默认 240；0 不截断"},
                     "scan": {
                         "type": "string",
                         "enum": ["window", "full"],
-                        "description": "仅对 >32MB 文件生效：window（默认）只读到请求区间末尾并探测是否还有内容，毫秒级返回，但不给全文 hash/总行数；full 全文件扫描，给精确 hash 与总行数"
+                        "description": ">32MB 专用：window 默认只读区间并探测是否还有内容（不给全文 hash/行数）；full 全扫给精确值"
                     },
-                    "summary": {"type": "boolean", "description": "只输出结构摘要：声明行 + 行号，不展开函数体；行号可直接接 block=true 读实现。与 ranges/block/end 互斥，数据文件与超大文件不支持"},
-                    "tail": {"type": "integer", "minimum": 1, "description": "只读最后 N 行（日志场景）：与 start/end/ranges/block/summary/focus/paths 互斥，文件不足 N 行时读全部；免去先 fs_stat 拿总行数那一步"},
-                    "focus": {"type": "string", "description": "只返回匹配该正则的完整代码块（含上下文），替代「先 fs_grep 再 block=true」两步。数据文件（JSON/YAML/Markdown 等）没有代码块，只给命中行 ±2 行。仅单文件，与 paths/reads/ranges/start/end/block/summary 互斥。JSON 字符串里反斜杠需双写"},
-                    "force": {"type": "boolean", "description": "读取缓存默认关闭；仅当 FSOPS_MCP_CACHE=1 开启后，用本参数绕过未变更摘要、强制返回正文。默认部署重复读直接返回全文，无需传"}
+                    "summary": {"type": "boolean", "description": "结构摘要：声明行+行号，不展开函数体；数据文件与超大文件不支持"},
+                    "tail": {"type": "integer", "minimum": 1, "description": "只读最后 N 行（日志场景）；不足 N 行读全部"},
+                    "focus": {"type": "string", "description": "只返回命中所在的完整代码块；数据文件只给命中行 ±2 行；JSON 里反斜杠双写"},
+                    "force": {"type": "boolean", "description": "读取缓存默认关闭；开启（FSOPS_MCP_CACHE=1）时用本参数强制返回正文"}
                 },
                 "required": []
             }
         }),
         json!({
             "name": "fs_edit",
-            "description": "精确替换文本（old→new）或正则替换（pattern→replacement）：不知道确切原文时用 pattern，省掉为抄原文而做的一次 fs_read。两套参数必须二选一：old+new 或 pattern+replacement；同时给会报 E_BAD_EDIT。优先替代 patch/Edit/apply_patch。同文件多处用 edits，多文件用 files；全部预检通过才写入。最小形状：{path, edits:[{old, new}]}。结构调整后用 diff=true 自查改动片段，省一次全文回读。自动处理 CRLF/LF 并保留原编码；DOCX 不支持精确替换，请用 fs_write 整体重建。",
+            "description": "精确替换（old→new）或正则替换（pattern→replacement）：不知道原文时用 pattern，省一次 fs_read。两套二选一，同时给会报 E_BAD_EDIT。替代 patch/Edit/apply_patch。同文件多处用 edits，多文件用 files；预检通过才写。最小形状 {path, edits:[{old, new}]}；结构改动用 diff=true 自查。自动处理 CRLF/LF 并保留原编码；DOCX 不支持精确替换，改用 fs_write。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "单文件路径；批量时改用 files"},
+                    "path": {"type": "string", "description": "单文件路径；批量用 files"},
                     "edits": {
                         "type": "array",
-                        "description": "单文件的修改列表",
+                        "description": "单文件修改列表",
                         "items": edit_item_schema(false)
                     },
                     "files": {
                         "type": "array",
-                        "description": "多文件批量编辑；全部文件预检成功后逐文件原子写入，最多 50 个",
+                        "description": "多文件批量；预检通过才写，最多 50",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -111,9 +112,9 @@ fn build_tool_defs() -> Vec<Value> {
                         }
                     },
                     "dry_run": {"type": "boolean", "description": "只校验不落盘"},
-                    "diff": {"type": "boolean", "description": "附带被替换的原文/新文片段（`@@ 行号` + `-原文` / `+新文`）；默认关闭，改结构后想自查时打开，可省一次 fs_read"},
-                    "normalize_eol": {"type": "boolean", "description": "混合换行时显式归一为主换行风格（多数行使用的风格，平局取 LF）"},
-                    "expect_hash": {"type": "string", "description": "单文件并发保护：文件已变则拒绝写入"}
+                    "diff": {"type": "boolean", "description": "附带改动片段（@@ 行号 -原文 +新文）；省一次回读"},
+                    "normalize_eol": {"type": "boolean", "description": "混合换行时显式归一为主风格（平局取 LF）"},
+                    "expect_hash": {"type": "string", "description": "并发保护：文件已变则拒绝"}
                 },
                 "required": []
             }
@@ -128,7 +129,7 @@ fn build_tool_defs() -> Vec<Value> {
                     "content": {"type": "string"},
                     "files": {
                         "type": "array",
-                        "description": "多文件批量写入（一次建 10 个文件不再 10 轮）；全部预检通过才写入，最多 50 个；与 path/content 互斥",
+                        "description": "多文件批量；预检通过才写，最多 50；与 path/content 互斥",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -140,7 +141,7 @@ fn build_tool_defs() -> Vec<Value> {
                             "required": ["path", "content"]
                         }
                     },
-                    "normalize_eol": {"type": "boolean", "description": "新文件或原文件为混合换行时，显式归一为主换行风格（多数行使用的风格，平局取 LF）；已有稳定文件始终沿用原换行"},
+                    "normalize_eol": {"type": "boolean", "description": "显式归一换行风格；已有稳定文件始终沿用原风格"},
                     "expect_hash": {"type": "string", "description": "并发保护：文件已变则拒绝覆盖"},
                     "dry_run": {"type": "boolean", "description": "只做路径/编码/换行/hash 预检，不创建也不覆盖文件"}
                 },
@@ -156,15 +157,15 @@ fn build_tool_defs() -> Vec<Value> {
                     "path": {"type": "string", "description": "搜索根目录，默认当前目录"},
                     "pattern": {"type": "string", "description": "如 **/*.rs，多个用逗号分隔；省略表示全部"},
                     "dirs": {"type": "boolean", "description": "是否包含目录"},
-                    "detail": {"type": "boolean", "description": "是否附大小与修改时间（默认只给路径，省 token）"},
-                    "limit": {"type": "integer", "description": "最多返回条数，默认 200；达到后提前停止"},
-                    "offset": {"type": "integer", "description": "跳过前 N 个匹配条目，用于 next_offset 续页"},
-                    "time_budget_ms": {"type": "integer", "description": "目录遍历时间预算，默认 5000 毫秒；超时返回已找到结果并标注"},
+                    "detail": {"type": "boolean", "description": "附大小与修改时间"},
+                    "limit": {"type": "integer", "description": "最多返回条数，默认 200"},
+                    "offset": {"type": "integer", "description": "跳过前 N 条，用于续页"},
+                    "time_budget_ms": {"type": "integer", "description": "遍历时间预算，默认 5000 毫秒"},
                     "no_ignore": {"type": "boolean", "description": "忽略 .gitignore 与 node_modules/target 等默认跳过项；只在明确要查依赖源码或构建产物时用"},
-                    "budget": {"type": "integer", "description": "最终响应最多字节数，默认 16384"},
-                    "map": {"type": "boolean", "description": "输出 repo map：按符号被引用程度、入口点和 focus 排序的文件与符号，一次调用回答先看哪些文件"},
-                    "focus": {"type": "string", "description": "map=true 时的关注词，空格分隔；文件名或符号命中会加权"},
-                    "max_files": {"type": "integer", "description": "map=true 时最多扫描的文件数，默认 2000"}
+                    "budget": {"type": "integer", "description": "响应最多字节，默认 16384"},
+                    "map": {"type": "boolean", "description": "输出 repo map（按符号引用重要性排序）"},
+                    "focus": {"type": "string", "description": "map 的关注词，空格分隔"},
+                    "max_files": {"type": "integer", "description": "map 最多扫描的文件数，默认 2000"}
                 },
                 "required": []
             }
@@ -176,11 +177,11 @@ fn build_tool_defs() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "根目录，默认当前目录"},
-                    "pattern": {"type": "string", "description": "可选 Rust 正则：给了就附带命中分布与前几条命中样例"},
-                    "focus": {"type": "string", "description": "可选关键词（空格分隔）：影响「最相关文件」的排序，命中文件名或路径的优先"},
+                    "pattern": {"type": "string", "description": "可选正则：附带命中分布与样例"},
+                    "focus": {"type": "string", "description": "可选关注词（空格分隔）：影响最相关文件排序"},
                     "limit": {"type": "integer", "description": "列出的文件数，默认 15"},
                     "budget": {"type": "integer", "description": "响应字节上限，默认 16384"},
-                    "time_budget_ms": {"type": "integer", "description": "目录遍历时间预算，默认 3000 毫秒；超时返回已扫到的部分并标注"},
+                    "time_budget_ms": {"type": "integer", "description": "遍历时间预算，默认 3000 毫秒；超时返回已扫到的部分"},
                     "no_ignore": {"type": "boolean", "description": "忽略 .gitignore 与 node_modules/target 等默认跳过项；只在明确要统计依赖源码时用"}
                 },
                 "required": []
@@ -192,29 +193,29 @@ fn build_tool_defs() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "pattern": {"type": "string", "description": "Rust regex 语法（不支持 lookaround 与反向引用，与 PCRE 不同）；JSON 字符串里反斜杠需双写"},
+                    "pattern": {"type": "string", "description": "Rust regex（不支持 lookaround/反向引用）；JSON 里反斜杠双写"},
                     "path": {"type": "string", "description": "搜索根目录，默认当前目录"},
                     "glob": {"type": "string", "description": "只看匹配的文件，如 **/*.ts"},
                     "ignore_case": {"type": "boolean"},
                     "output": {
                         "type": "string",
                         "enum": ["files", "count", "matches", "snippets"],
-                        "description": "files 每个匹配文件只给路径；count 给路径和真实行命中数（默认完整统计）；matches 给命中行；snippets 默认带 2 行上下文"
+                        "description": "files 只给路径；count 给每文件命中数；matches 给命中行；snippets 带 2 行上下文"
                     },
                     "context": {"type": "integer", "description": "上下文行数（最多 5）；matches 默认 0，snippets 默认 2"},
                     "expand": {
                         "type": "string",
                         "enum": ["block"],
-                        "description": "expand=block：把每条命中展开成它所在的完整代码块（花括号配平）。省掉「grep 拿行号 → fs_read block=true 再读一遍」那一轮；只在 matches/snippets 生效，预算不足时降级为普通命中行"
+                        "description": "expand=block：把命中展开成完整代码块（配平花括号），省掉再 fs_read 一轮"
                     },
-                    "limit": {"type": "integer", "description": "本页上限：files 按文件，matches/snippets 按命中，count 显式设置时按命中；默认 200（count 省略时完整统计），必须大于 0；预算才是真正的输出上限"},
-                    "max_per_file": {"type": "integer", "description": "每个文件最多返回的命中数，默认不限制；省略部分会在尾注说明"},
-                    "max_line": {"type": "integer", "description": "命中行最多显示字符数，默认 240（与 fs_read 一致）；0 表示不截断，一次拿到完整长行，省掉再 fs_read 一轮"},
-                    "offset": {"type": "integer", "description": "files 跳过前 N 个匹配文件，其他模式跳过前 N 个命中；用于 next_offset 续取"},
-                    "parallel": {"type": "boolean", "description": "并行扫描；省略时自动按仓库规模选择：小仓库串行，大仓库并行；true 强制并行，false 强制串行；输出与串行一致"},
-                    "budget": {"type": "integer", "description": "最终响应最多字节数，默认 16384"},
-                    "time_budget_ms": {"type": "integer", "description": "文件与目录遍历总时间预算，默认 5000 毫秒"},
-                    "max_file_size": {"type": "integer", "description": "只搜索不超过该字节数的文件，默认 8388608（8 MiB）；0 表示不限制。被跳过的文件会在尾注报告"},
+                    "limit": {"type": "integer", "description": "本页上限（files 按文件，其他按命中），默认 200；count 省略时完整统计"},
+                    "max_per_file": {"type": "integer", "description": "每文件命中上限，默认不限；省略部分在尾注说明"},
+                    "max_line": {"type": "integer", "description": "命中行最多字符，默认 240；0 不截断"},
+                    "offset": {"type": "integer", "description": "跳过前 N 项（files 按文件，其他按命中），用于续页"},
+                    "parallel": {"type": "boolean", "description": "并行扫描；省略时按仓库规模自动选择"},
+                    "budget": {"type": "integer", "description": "响应最多字节，默认 16384"},
+                    "time_budget_ms": {"type": "integer", "description": "遍历总时间预算，默认 5000 毫秒"},
+                    "max_file_size": {"type": "integer", "description": "只搜不超过该字节数的文件，默认 8 MiB；0 不限制"},
                     "no_ignore": {"type": "boolean", "description": "忽略 .gitignore 与 node_modules/target 等默认跳过项；只在明确要搜依赖源码时用"}
                 },
                 "required": ["pattern"]
@@ -222,7 +223,7 @@ fn build_tool_defs() -> Vec<Value> {
         }),
         json!({
             "name": "fs_stat",
-            "description": "查看路径元信息。优先替代 stat/ls/Get-Item。返回类型、大小、修改时间、换行风格、编码、内容指纹。path 或 paths 至少给一个；detail=server 是不带路径的自检，用来确认宿主连上的服务端版本与工具数。",
+            "description": "查看路径元信息。优先替代 stat/ls/Get-Item。返回类型、大小、修改时间、换行风格、编码、内容指纹。path 或 paths 至少给一个；detail=server 是不带路径的自检：服务端版本、工具数与当前目录。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -239,37 +240,37 @@ fn build_tool_defs() -> Vec<Value> {
         }),
         json!({
             "name": "fs_exec",
-            "description": "执行程序（program + args 数组，不经过 shell；参数名是 args，不是 argv）。替代 PowerShell 跑 cargo/git/npm/python：没有引号/插值、2>&1、ErrorRecord、$LASTEXITCODE 问题。非零退出不是错误（前缀写 exit=N 非零，要当失败使用 check=true）；超时会结束整个进程树。启动任务必须给 program；只轮询/终止用 job=<id>，列任务用 list=true。",
+            "description": "执行程序（program + args 数组，不经过 shell；参数名是 args）。替代 PowerShell 跑 cargo/git/npm/python：无引号/插值/2>&1 问题。非零退出不算错误（要当失败用 check=true）；超时结束进程树。启动任务必须给 program；轮询/终止用 job，列任务用 list=true。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "program": {"type": "string", "description": "可执行文件，如 cargo、git、python；走 PATH。启动新任务时必填，只轮询/终止 job 时可省略"},
+                    "program": {"type": "string", "description": "可执行文件（PATH 名或绝对路径）；启动任务时必填"},
                     "args": {"type": "array", "items": {"type": "string"}, "description": "参数数组，每个参数独立，不拼字符串"},
                     "cwd": {"type": "string", "description": "工作目录，默认当前目录"},
-                    "timeout_ms": {"type": "integer", "description": "超时毫秒，默认 120000，最大 600000；超时结束进程树"},
+                    "timeout_ms": {"type": "integer", "description": "超时毫秒，默认 120000，上限 600000"},
                     "stdin": {"type": "string", "description": "传给进程的标准输入"},
-                    "env": {"type": "object", "description": "追加/覆盖环境变量，如 {\"RUST_BACKTRACE\":\"1\"}"},
-                    "shell": {"type": "boolean", "description": "显式走 cmd /c（需要管道/重定向时才用，会回到文本解析）"},
+                    "env": {"type": "object", "description": "追加/覆盖环境变量"},
+                    "shell": {"type": "boolean", "description": "走 cmd /c（管道/重定向时用）"},
                     "max_output": {"type": "integer", "description": "每条流最多保留字节，默认 32768"},
-                    "check": {"type": "boolean", "description": "非零退出按 E_EXIT 错误返回；默认 false，非零仍是 ok"},
-                    "background": {"type": "boolean", "description": "会话内后台任务：立即返回 job id，用 job=<id> 轮询输出，list=true 列出全部；进程随 MCP 会话结束"},
-                    "job": {"type": "integer", "description": "轮询/终止后台任务：传启动时返回的 job id"},
-                    "list": {"type": "boolean", "description": "列出当前会话的全部后台任务（id/pid/状态/时长）"},
-                    "wait_ms": {"type": "integer", "description": "配合 job：最多等待 N 毫秒直到任务退出再返回（上限 60000）；超时仍运行则返回增量输出"},
-                    "kill": {"type": "boolean", "description": "配合 job 使用：结束该任务的整个进程树"}
+                    "check": {"type": "boolean", "description": "非零退出按 E_EXIT 报错；默认 false"},
+                    "background": {"type": "boolean", "description": "后台任务：返回 job id，用 job 轮询；随会话结束"},
+                    "job": {"type": "integer", "description": "轮询/终止 job：传 job id"},
+                    "list": {"type": "boolean", "description": "列出会话内全部后台任务"},
+                    "wait_ms": {"type": "integer", "description": "配合 job：最多等 N 毫秒（上限 60000）"},
+                    "kill": {"type": "boolean", "description": "结束 job 的整个进程树"}
                 },
                 "required": []
             }
         }),
         json!({
             "name": "fs_file",
-            "description": "文件管理：copy/move/remove/mkdir/convert/archive/extract。替代 PowerShell 的 Copy-Item/Move-Item/Remove-Item/New-Item 与压缩解压。必填映射：copy/move/archive/extract 要 src+dst；remove/mkdir/convert 要 path；remove 必须再给 confirm=true。最小形状：{op:\"copy\", src, dst}；参数名是 op，不是 operation。convert 需 encoding；只改换行也要给 encoding（如 utf-8）。",
+            "description": "文件管理：copy/move/remove/mkdir/convert/archive/extract。替代 PowerShell 的 Copy-Item/Move-Item/Remove-Item 与压缩解压。copy/move/archive/extract 要 src+dst；remove/mkdir/convert 要 path；remove 必须 confirm=true。最小形状 {op:\"copy\", src, dst}；参数名是 op 不是 operation。convert 需 encoding（只改换行也要给 encoding）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "op": {"type": "string", "enum": ["copy", "move", "remove", "mkdir", "convert", "archive", "extract"], "description": "操作类型"},
                     "src": {"type": "string", "description": "copy/move 的源"},
-                    "dst": {"type": "string", "description": "copy/move 的目标；可以是目录"},
+                    "dst": {"type": "string", "description": "copy/move 目标，可为目录"},
                     "path": {"type": "string", "description": "remove/mkdir/convert 的目标"},
                     "recursive": {"type": "boolean", "description": "remove 删除目录时必须为 true"},
                     "confirm": {"type": "boolean", "description": "remove 必须显式传 true"},
@@ -700,13 +701,13 @@ fn edit_item_schema(compact: bool) -> serde_json::Value {
     json!({
         "type": "object",
         "properties": {
-            "old": {"type": "string", "description": "原文片段（需唯一，除非 all=true）；与 pattern 二选一"},
-            "new": {"type": "string", "description": "替换内容，空串表示删除；与 replacement 二选一"},
-            "pattern": {"type": "string", "description": "正则模式：替换范围内所有匹配，可用 $1 引用捕获组；不知道确切原文时用它，省掉为抄原文而做的一次 fs_read"},
-            "replacement": {"type": "string", "description": "正则替换内容，与 pattern 配套"},
+            "old": {"type": "string", "description": "原文（需唯一，除非 all=true）；与 pattern 二选一"},
+            "new": {"type": "string", "description": "替换内容，空串删除；与 replacement 二选一"},
+            "pattern": {"type": "string", "description": "正则：替换所有匹配，$1 引用捕获组；不知道原文时用它"},
+            "replacement": {"type": "string", "description": "正则替换内容"},
             "all": {"type": "boolean", "description": "替换全部出现位置"},
-            "start": {"type": "integer", "minimum": 1, "description": "限定替换只发生在第 start..=end 行内（1 基）；配合 all=true 只改某个函数内的重复字面量"},
-            "end": {"type": "integer", "minimum": 1, "description": "行范围结束行（含）；省略表示到文件末尾"}
+            "start": {"type": "integer", "minimum": 1, "description": "只改第 start..=end 行（1 基）；配合 all 限定函数内"},
+            "end": {"type": "integer", "minimum": 1, "description": "结束行（含）；省略到末尾"}
         },
         "required": []
     })
@@ -952,7 +953,75 @@ pub(crate) fn has_error_line(text: &str) -> bool {
     })
 }
 
+/// 宿主通用工具的参数名 -> fsops 参数名。
+///
+/// 实测：模型把宿主搜索工具的 `output_mode` 带进 `fs_grep`，0.11.3 把最小形状写进
+/// 描述后仍会复发（P1b 复跑 3 次里出现 1 次）。报错能教对，但要多花一轮；
+/// 这里直接归一，schema 不暴露别名（模型看不到就不会依赖它）。
+type AliasPairs = &'static [(&'static str, &'static str)];
+
+const ARG_ALIASES: &[(&str, AliasPairs)] = &[("fs_grep", &[("output_mode", "output")])];
+
+/// 宿主枚举值 -> fsops 枚举值。
+///
+/// 只映射键名不够：宿主的 output_mode 值是 `content` / `files_with_matches`，
+/// 与 fsops 的 `matches` / `files` 不同。实测 R06/R08 各出现一次，
+/// 键已归一却仍被 enum 拒绝——值必须一起映射。
+const VALUE_ALIASES: &[(&str, &str, AliasPairs)] = &[(
+    "fs_grep",
+    "output",
+    &[
+        ("content", "matches"),
+        ("files_with_matches", "files"),
+        ("file_paths", "files"),
+    ],
+)];
+
+fn normalize_args<'a>(name: &str, args: &'a Value) -> Cow<'a, Value> {
+    let keys = ARG_ALIASES
+        .iter()
+        .find(|(tool, _)| *tool == name)
+        .map(|(_, pairs)| *pairs);
+    let values = VALUE_ALIASES
+        .iter()
+        .find(|(tool, _, _)| *tool == name)
+        .map(|(_, key, pairs)| (*key, *pairs));
+    if keys.is_none() && values.is_none() {
+        return Cow::Borrowed(args);
+    }
+    let Some(obj) = args.as_object() else {
+        return Cow::Borrowed(args);
+    };
+    let mut changed = false;
+    let mut out = obj.clone();
+    for (from, to) in keys.unwrap_or(&[]) {
+        if let Some(value) = out.remove(*from) {
+            // 正式参数优先：别名只是兜底，不能覆盖显式给对的键。
+            if !out.contains_key(*to) {
+                out.insert((*to).to_string(), value);
+            }
+            changed = true;
+        }
+    }
+    if let Some((key, pairs)) = values {
+        if let Some(current) = out.get(key).and_then(Value::as_str) {
+            if let Some((_, mapped)) = pairs.iter().find(|(from, _)| *from == current) {
+                out.insert(key.to_string(), json!(mapped));
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        Cow::Owned(Value::Object(out))
+    } else {
+        Cow::Borrowed(args)
+    }
+}
+
 pub fn call(name: &str, args: &Value) -> String {
+    // 别名先归一，再走 schema 校验；未知字段保护不变。
+    let args = normalize_args(name, args);
+    let args = args.as_ref();
     // 参数类型写错必须报错，不能静默退回默认值。
     if let Some(err) = validate_args(name, args) {
         return err;
@@ -4491,6 +4560,44 @@ fn next_fn() {
     }
 
     #[test]
+    fn fs_grep接受宿主参数别名output_mode() {
+        // 实测误用：模型传宿主的 output_mode，0.11.3 的描述修正挡不住。
+        // 别名归一后必须与正式参数同结果，且不能覆盖显式给对的 output。
+        let path = 临时文本文件("alpha\nTODO beta\n");
+        let posix = path.to_string_lossy().replace('\\', "/");
+        let alias = call(
+            "fs_grep",
+            &json!({"pattern": "TODO", "output_mode": "files", "path": posix}),
+        );
+        let formal = call(
+            "fs_grep",
+            &json!({"pattern": "TODO", "output": "files", "path": posix}),
+        );
+        let both = call(
+            "fs_grep",
+            &json!({"pattern": "TODO", "output": "count", "output_mode": "files", "path": posix}),
+        );
+        let count = call(
+            "fs_grep",
+            &json!({"pattern": "TODO", "output": "count", "path": posix}),
+        );
+        // 值也要映射：宿主的 output_mode="content" 等价 fsops 的 matches。
+        let host_value = call(
+            "fs_grep",
+            &json!({"pattern": "TODO", "output_mode": "content", "path": posix}),
+        );
+        let matches = call(
+            "fs_grep",
+            &json!({"pattern": "TODO", "output": "matches", "path": posix}),
+        );
+        let _ = fs::remove_file(path);
+        assert!(!alias.starts_with("E_BAD_ARGS"), "{alias}");
+        assert_eq!(alias, formal, "别名与正式参数必须同结果");
+        assert_eq!(both, count, "正式参数优先，别名不得覆盖");
+        assert_eq!(host_value, matches, "宿主枚举值必须映射到 fsops 枚举值");
+    }
+
+    #[test]
     fn fs_grep_schema暴露max_line() {
         let defs = tool_defs();
         let grep = defs.iter().find(|d| d["name"] == "fs_grep").unwrap();
@@ -4607,6 +4714,26 @@ fn next_fn() {
         assert!(desc.contains("模式表"), "缺少模式表: {desc}");
         assert!(desc.contains("并集"), "应说明 path+paths 是并集: {desc}");
         assert!(desc.contains("summary"), "缺少 summary 的限制说明: {desc}");
+    }
+
+    #[test]
+    fn fs_read_schema控制在体积预算内() {
+        // 工具 schema 每轮都进上下文。P1b 实测 9 个工具 schema 26.6KB，
+        // 其中 fs_read 一个占 5.3KB；压缩只能动描述与嵌套重复，
+        // 不能删能力：reads 项必须仍声明与顶层同名的 9 个字段。
+        let defs = tool_defs();
+        let read = defs.iter().find(|d| d["name"] == "fs_read").unwrap();
+        let bytes = serde_json::to_string(read).unwrap().len();
+        assert!(
+            bytes <= 3200,
+            "fs_read 工具定义 {bytes} 字节，超出 3200 预算；压缩描述而不是删参数"
+        );
+        let item = &read["inputSchema"]["properties"]["reads"]["items"]["properties"];
+        for field in [
+            "path", "start", "end", "ranges", "block", "max_line", "scan", "budget", "focus",
+        ] {
+            assert!(item.get(field).is_some(), "reads 项缺少字段 {field}");
+        }
     }
 
     #[test]
@@ -5789,6 +5916,38 @@ fn next_fn() {
     }
 
     #[test]
+    fn glob超时说明遍历未完成而不是不存在() {
+        // 实测：time_budget_ms=0 时文件确实存在，旧文案却说「未找到匹配」，
+        // 模型会据此断定文件不存在。超时只能说「没扫完」。
+        let dir = 临时目录("glob-timeout-msg");
+        fs::write(dir.join("a.txt"), "x\n").unwrap();
+        let posix_dir = dir.to_string_lossy().replace('\\', "/");
+        let out = call(
+            "fs_glob",
+            &json!({"path": posix_dir, "pattern": "**/*.txt", "time_budget_ms": 0}),
+        );
+        let _ = fs::remove_dir_all(&dir);
+        assert!(out.starts_with("E_TIMEOUT"), "{out}");
+        assert!(out.contains("遍历未完成"), "超时必须说明没扫完: {out}");
+        assert!(
+            out.contains("不能断定不存在"),
+            "不能与真的不存在混淆: {out}"
+        );
+        assert!(!out.contains("未找到匹配"), "措辞不得暗示不存在: {out}");
+    }
+
+    #[test]
+    fn 自检与引导报告服务端当前目录() {
+        // 宿主可能以任意 cwd 启动 MCP 服务；相对路径按它解析，不说就会静默读错目录。
+        let cwd = crate::mcp::cwd_display();
+        let server = call("fs_stat", &json!({"detail": "server"}));
+        assert!(server.contains(&format!("cwd={cwd}")), "{server}");
+        let text = crate::mcp::instructions();
+        assert!(text.contains(&cwd), "引导缺当前目录: {text}");
+        assert!(text.contains("相对路径按它解析"), "{text}");
+    }
+
+    #[test]
     fn 读取失败返回错误码前缀() {
         let missing = std::env::temp_dir().join("fsops-does-not-exist-读取测试.txt");
         let output = read(&json!({"path": missing.to_string_lossy()}));
@@ -6840,8 +6999,8 @@ fn glob_tool(args: &Value) -> String {
             if entries.is_empty() {
                 if timed_out {
                     format!(
-                        "E_TIMEOUT 遍历 {} 用尽 {}ms 时间预算（已访问 {} 项），未找到匹配；\
-                         缩小 path 或加更具体的 pattern 再试",
+                        "E_TIMEOUT 遍历 {} 用尽 {}ms 时间预算（已访问 {} 项，遍历未完成）：\
+                         不能断定不存在；加大 time_budget_ms、缩小 path 或加更具体的 pattern 再试",
                         root.display(),
                         opts.time_budget_ms,
                         report.entries_visited
@@ -7154,7 +7313,12 @@ fn stat(args: &Value) -> String {
     let detail = arg_str(args, "detail").unwrap_or("full");
     if detail == "server" {
         // 版本自检：宿主重载后模型一条调用就能确认连的是哪版、几个工具。
-        return format!("fsops {} tools={}", crate::VERSION, tool_defs().len());
+        return format!(
+            "fsops {} tools={} cwd={}",
+            crate::VERSION,
+            tool_defs().len(),
+            crate::mcp::cwd_display()
+        );
     }
     if !matches!(detail, "meta" | "hash" | "full") {
         return "E_BAD_ARGS detail 仅支持 meta/hash/full/server".into();
